@@ -39,6 +39,9 @@ struct GeneralView: View {
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
             Toggle("Notify me when the box disconnects or the daemon fails", isOn: Binding(get: { model.status?.config.notifyLink ?? true }, set: { model.setNotifyLink($0) }))
                 .disabled(model.status == nil)
+            // ADR-0012: the Relay carries the box's messages through VibeBuddy's server, so it can be turned off.
+            Toggle("Reach the box through the VibeBuddy Relay when it's away from this computer", isOn: Binding(get: { model.status?.config.relay ?? true }, set: { model.setRelay($0) }))
+                .disabled(model.status == nil)
             Section("Updates") {
                 Toggle("Check for updates", isOn: Binding(get: { model.status?.config.checkUpdates ?? model.updates?.enabled ?? false }, set: { model.setCheckUpdates($0) }))
                     .disabled(model.status == nil)

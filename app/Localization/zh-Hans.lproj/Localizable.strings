@@ -293,3 +293,4 @@
 "Take over" = "接管";
 "Relay" = "中转";
 "Taking the box over was rejected (%lld)" = "接管盒子被拒绝（%lld）";
+"Reach the box through the VibeBuddy Relay when it's away from this computer" = "盒子不在本机旁边时，通过 VibeBuddy 中转连接它";

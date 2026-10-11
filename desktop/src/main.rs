@@ -85,6 +85,7 @@ enum Message {
     Tab(Tab),
     NotifyLink(bool),
     CheckUpdates(bool),
+    Relay(bool),
     CheckForUpdatesNow,
     OpenReleases,
     ReportProblem,
@@ -407,6 +408,11 @@ impl App {
             Message::NotifyLink(enabled) => {
                 let mut config = self.status.as_ref().map(|status| status.config.clone()).unwrap_or_default();
                 config.notify_link = enabled;
+                return Task::perform(client::put_config(config), Message::ConfigSaved);
+            }
+            Message::Relay(enabled) => {
+                let mut config = self.status.as_ref().map(|status| status.config.clone()).unwrap_or_default();
+                config.relay = enabled;
                 return Task::perform(client::put_config(config), Message::ConfigSaved);
             }
             Message::CheckUpdates(enabled) => {
@@ -757,6 +763,12 @@ impl App {
                 toggler(notify)
                     .label(tr("Notify me when the box disconnects or the daemon fails", &[]))
                     .on_toggle_maybe(self.status.is_some().then_some(Message::NotifyLink)),
+            )
+            // ADR-0012: the Relay carries the box's messages through VibeBuddy's server, so it can be turned off.
+            .push(
+                toggler(self.status.as_ref().is_none_or(|status| status.config.relay))
+                    .label(tr("Reach the box through the VibeBuddy Relay when it's away from this computer", &[]))
+                    .on_toggle_maybe(self.status.is_some().then_some(Message::Relay)),
             )
             .push(
                 toggler(check)

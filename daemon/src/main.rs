@@ -228,6 +228,7 @@ async fn main() {
         SessionTitles::from_home(),
         config::config_file(),
     );
+    serial_transport.set_relay_enabled(state.config.lock().await.relay);
     state.serial = Some(serial_transport);
     if let Some(identity) = &identity {
         state.device.lock().await.computer_key = Some(identity.public_key());
@@ -567,6 +568,9 @@ async fn post_check_updates(State(state): State<AppState>) -> (StatusCode, Json<
 }
 
 async fn put_config(State(state): State<AppState>, Json(config): Json<Config>) -> Json<Config> {
+    if let Some(serial) = &state.serial {
+        serial.set_relay_enabled(config.relay);
+    }
     state.save_config(|current| *current = config).await;
     Json(state.config.lock().await.clone())
 }
@@ -1392,7 +1396,7 @@ mod tests {
             SessionTitles::disabled(),
             Some(path.clone()),
         );
-        let wanted = Config { voice: Some("hsiaochen".to_owned()), notify_link: false, check_updates: Some(true) };
+        let wanted = Config { voice: Some("hsiaochen".to_owned()), notify_link: false, check_updates: Some(true), relay: false };
         let Json(returned) = put_config(State(state.clone()), Json(wanted.clone())).await;
         assert_eq!(returned, wanted);
         assert_eq!(Config::load(&path), wanted);

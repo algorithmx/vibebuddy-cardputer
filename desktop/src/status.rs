@@ -230,11 +230,13 @@ pub struct Config {
     pub notify_link: bool,
     /// None follows the build: on in releases CI makes, off when built from source.
     pub check_updates: Option<bool>,
+    /// Reach the box through the Relay when nothing closer does (ADR-0012); on unless turned off.
+    pub relay: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { voice: None, notify_link: true, check_updates: None }
+        Self { voice: None, notify_link: true, check_updates: None, relay: true }
     }
 }
 

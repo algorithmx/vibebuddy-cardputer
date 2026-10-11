@@ -170,6 +170,12 @@ final class AppModel: ObservableObject {
         run { _ = try await self.client.putConfig(config) }
     }
 
+    func setRelay(_ enabled: Bool) {
+        guard var config = status?.config else { return }
+        config.relay = enabled
+        run { _ = try await self.client.putConfig(config) }
+    }
+
     func setCheckUpdates(_ enabled: Bool) {
         guard var config = status?.config else { return }
         config.checkUpdates = enabled

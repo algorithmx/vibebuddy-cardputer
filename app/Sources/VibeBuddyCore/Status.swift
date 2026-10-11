@@ -151,9 +151,11 @@ public struct DaemonConfig: Codable, Equatable {
     public var notifyLink: Bool
     /// nil follows the build: on in releases CI makes, off when built from source.
     public var checkUpdates: Bool?
-    enum CodingKeys: String, CodingKey { case voice, notifyLink = "notify_link", checkUpdates = "check_updates" }
-    public init(voice: String? = nil, notifyLink: Bool = true, checkUpdates: Bool? = nil) {
-        self.voice = voice; self.notifyLink = notifyLink; self.checkUpdates = checkUpdates
+    /// Reach the box through the Relay when nothing closer does (ADR-0012); nil, from an older daemon, means on.
+    public var relay: Bool?
+    enum CodingKeys: String, CodingKey { case voice, notifyLink = "notify_link", checkUpdates = "check_updates", relay }
+    public init(voice: String? = nil, notifyLink: Bool = true, checkUpdates: Bool? = nil, relay: Bool? = nil) {
+        self.voice = voice; self.notifyLink = notifyLink; self.checkUpdates = checkUpdates; self.relay = relay
     }
 }
 

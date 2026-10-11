@@ -22,8 +22,9 @@ use tracing::{debug, info, warn};
 
 use crate::identity::Identity;
 
-/// Where the Relay is when nothing overrides it.
-pub const DEFAULT_URL: &str = "wss://relay.korekore.ai";
+/// Where the Relay is when nothing overrides it. Staging while builds are internal; production
+/// (`wss://relay.korekore.ai`) once it is deployed.
+pub const DEFAULT_URL: &str = "wss://relay-staging.korekore.ai";
 /// Pings go out this often, and a Relay silent this long is taken for gone (docs/relay-protocol.md).
 const PING_EVERY: Duration = Duration::from_secs(30);
 const DEAD_AFTER: Duration = Duration::from_secs(75);

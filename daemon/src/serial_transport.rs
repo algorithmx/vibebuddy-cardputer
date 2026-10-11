@@ -104,6 +104,8 @@ pub struct SerialConfig {
     relay: Option<RelayConfig>,
     /// The user asked to take the box from whoever has it: the next network or Relay attempt says takeover.
     takeover: Arc<AtomicBool>,
+    /// The user's Relay switch (config `relay`); off, the Relay isn't tried and a link through it ends.
+    relay_enabled: Arc<AtomicBool>,
 }
 
 impl SerialConfig {
@@ -115,6 +117,7 @@ impl SerialConfig {
             lan: None,
             relay: None,
             takeover: Arc::new(AtomicBool::new(false)),
+            relay_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -165,6 +168,7 @@ pub struct SerialTransport {
     sender: mpsc::Sender<Vec<u8>>,
     suspend: watch::Sender<bool>,
     takeover: Arc<AtomicBool>,
+    relay_enabled: Arc<AtomicBool>,
 }
 
 impl SerialTransport {
@@ -173,8 +177,14 @@ impl SerialTransport {
         let (device_sender, device_receiver) = mpsc::channel(DEVICE_EVENT_CAPACITY);
         let (suspend, suspend_receiver) = watch::channel(false);
         let takeover = config.takeover.clone();
+        let relay_enabled = config.relay_enabled.clone();
         tokio::spawn(serial_worker(config, receiver, device_sender, suspend_receiver));
-        (Self { sender, suspend, takeover }, device_receiver)
+        (Self { sender, suspend, takeover, relay_enabled }, device_receiver)
+    }
+
+    /// The user's Relay switch; turned off, a link through the Relay ends within a couple of seconds.
+    pub fn set_relay_enabled(&self, enabled: bool) {
+        self.relay_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// The user chose to take the box from the computer that has it (ADR-0011).
@@ -276,6 +286,7 @@ async fn serial_worker(
                             Firmware::Ours,
                             Some(&config),
                             None,
+                            None,
                             &mut pending,
                             &mut receiver,
                             &device_event_sender,
@@ -296,6 +307,7 @@ async fn serial_worker(
             // A box that answered busy on the local network is busy on the Relay too.
             let box_key = config.lan.as_ref().and_then(|lan| lan.box_key());
             if busy.is_none()
+                && config.relay_enabled.load(Ordering::Relaxed)
                 && let (Some(relay_config), Some(box_key)) = (&config.relay, box_key)
                 && (takeover || relay_retry.is_none_or(|at| Instant::now() >= at))
             {
@@ -316,6 +328,7 @@ async fn serial_worker(
                             Firmware::Ours,
                             Some(&config),
                             probe.as_deref(),
+                            Some(&config.relay_enabled),
                             &mut pending,
                             &mut receiver,
                             &device_event_sender,
@@ -376,6 +389,7 @@ async fn serial_worker(
             &port_name,
             paced,
             Firmware::Listening { since: Instant::now() },
+            None,
             None,
             None,
             &mut pending,
@@ -499,6 +513,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
     mut firmware: Firmware,
     watch_cable: Option<&SerialConfig>,
     probe_lan: Option<&str>,
+    relay_switch: Option<&AtomicBool>,
     pending: &mut VecDeque<Vec<u8>>,
     receiver: &mut mpsc::Receiver<Vec<u8>>,
     device_event_sender: &mpsc::Sender<DeviceMessage>,
@@ -579,6 +594,10 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
             _ = cable_check.tick(), if watch_cable.is_some() => {
                 if watch_cable.is_some_and(|config| matches!(find_port(config), Ok(Found::One(_)))) {
                     return SessionEnd::Usb;
+                }
+                if relay_switch.is_some_and(|enabled| !enabled.load(Ordering::Relaxed)) {
+                    info!("the Relay was turned off, leaving it");
+                    return SessionEnd::Reconnect;
                 }
             }
             result = port.read(&mut read_buffer) => {
@@ -921,7 +940,7 @@ mod tests {
         let (device_sender, _device_receiver) = mpsc::channel(1);
         let (suspend_sender, mut suspend) = watch::channel(false);
 
-        let session = run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend);
+        let session = run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend);
         let release = async {
             tokio::time::sleep(LISTEN_FIRST + Duration::from_millis(50)).await;
             suspend_sender.send(true).unwrap();
@@ -969,7 +988,7 @@ mod tests {
         frames.send(heartbeat_frame()).await.unwrap();
         let task = tokio::spawn(async move {
             let mut pending = VecDeque::new();
-            run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend).await
+            run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend).await
         });
         Session { peer, frames, device, _suspend: suspend_sender, task }
     }
