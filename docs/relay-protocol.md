@@ -50,12 +50,16 @@ After welcome the Relay sends `{"t":"status","box":<online>,"owner":{"key","name
 
 A linked computer gets `{"t":"unlinked","reason":"takeover"|"moved"|"unpaired"}` when it loses the box; `moved` means it linked to the same box another way.
 
+A computer linked through the Relay must send something at least every 75 s; the daemon's `device.heartbeat` every 5 s covers it. One that stays silent longer, such as a laptop gone to sleep, counts as gone: the grace period starts, the box gets `unlinked` with reason `gone`, and the socket is closed with 4004 `silent`. The daemon treats that as any other drop: it reconnects and asks to link again, which succeeds unless another computer linked in the meantime.
+
+When the box reconnects to the Relay while a computer is linked through it, that computer gets `{"t":"linked"}` again. It means the box came back, perhaps after a restart: the computer starts its session over, as on a new cable connection, by sending `device.hello`.
+
 ## The daemon
 
 The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`). Failed tries back off: 2 s when unreachable, 10 s when busy, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes. The Relay's address is `wss://relay.korekore.ai` unless `VIBEBUDDY_RELAY_URL` says otherwise. The update manifest's optional `relay` field moves it from the next connection on, but only to a `wss://` address and never over the variable.
 
-The simulator plays the box on the Relay with `tools/simulate-device.py --relay ws://127.0.0.1:8787`, against `wrangler dev` in vibebuddy-cloud.
+The simulator plays the box on the Relay with `tools/simulate-device.py --relay ws://127.0.0.1:8787`, against `wrangler dev` in vibebuddy-cloud; `npx wrangler dev --var GRACE_MS:5000` shortens the grace period for such tests (production never sets it).
 
 ## Not decided yet
 
-Resuming large writes after a drop. Noticing a computer that went away without closing its socket (a laptop asleep): the Relay keeps it as the owner, so the grace period never starts and another computer can only take over.
+Resuming large writes after a drop. Noticing a box that lost power without closing its socket: the Relay shows it online until the edge notices.
