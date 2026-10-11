@@ -209,8 +209,12 @@ impl Lan {
             Some(owner) => owner.key == key || owner.gone_since.is_some_and(|since| now.wrapping_sub(since) >= GRACE_MS),
         };
         if usb_in_use || !(free || takeover) {
-            let reason = if usb_in_use { "usb" } else { "linked" };
-            let busy = alloc::format!(r#"{{"version":1,"event":"link.busy","reason":"{reason}"}}"#);
+            let (reason, owner) = match self.owner {
+                _ if usb_in_use => ("usb", ""),
+                Some(owner) => ("linked", link.paired.iter().find(|paired| paired.key == owner.key).map_or("", |paired| paired.name.as_str())),
+                None => ("linked", ""),
+            };
+            let busy = serde_json::to_string(&serde_json::json!({"version": 1, "event": "link.busy", "reason": reason, "owner": owner})).unwrap_or_default();
             return self.refused(conn, alloc::vec![Output::Send(conn, busy), Output::Close(conn)]);
         }
 
@@ -375,6 +379,7 @@ mod tests {
         connect(&mut lan, &link, 1, &a, false, 0);
         let out = connect(&mut lan, &link, 2, &b, false, 1000);
         assert_eq!(event(&sent(&out, 2)[0]), "link.busy");
+        assert!(sent(&out, 2)[0].contains(r#""owner":"a""#), "names who has the box");
 
         let out = connect(&mut lan, &link, 3, &b, true, 2000);
         assert_eq!(sent(&out, 1), [unlinked("takeover")]);

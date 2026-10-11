@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vibebuddy_protocol::Event;
@@ -12,6 +13,7 @@ use tokio_serial::{ClearBuffer, SerialPort, SerialPortBuilderExt, SerialPortType
 use tracing::{debug, info, warn};
 
 use crate::lan::{self, LanConfig, LinkError};
+use crate::relay::{self, RelayConfig, RelayError};
 
 const ESPRESSIF_VID: u16 = 0x303a;
 const USB_SERIAL_JTAG_PID: u16 = 0x1001;
@@ -25,6 +27,8 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const CONNECT_SETTLE_DELAY: Duration = Duration::from_millis(1_500);
 /// While linked over the network, how often to look for the box on the cable.
 const CABLE_CHECK_EVERY: Duration = Duration::from_secs(2);
+/// While linked through the Relay, how often to see whether the box answers on the local network.
+const LAN_CHECK_EVERY: Duration = Duration::from_secs(30);
 /// The BOX's CH343 UART bridge can't swallow a whole line: push more than one or two hundred bytes at once and
 /// its buffer gets flushed, dropping 32 bytes every 384 and repeating the next 32, so the length stays right but
 /// the content shifts. A control experiment polling the FIFO directly on the device cleared the device side. Over the bridge,
@@ -54,6 +58,11 @@ pub enum DeviceMessage {
     /// Linked over the local network, to the box at this address (ADR-0012). Moving between this and the cable
     /// is not a drop: no Disconnected comes in between.
     ConnectedNetwork { address: String },
+    /// Linked through the Relay at this address (ADR-0012); like ConnectedNetwork, moving to or from it is no drop.
+    ConnectedRelay { url: String },
+    /// The box is linked to another computer, by name when known; `reason` is `usb` or `linked`. Sent when it
+    /// changes, while this computer isn't linked.
+    Busy { owner: String, reason: String },
     /// The box runs other firmware (see [`Firmware::Foreign`]): it's there, but gets nothing written.
     ForeignFirmware,
     /// Several devices could be the box and none is the one remembered, so none is connected until the user picks
@@ -91,6 +100,10 @@ pub struct SerialConfig {
     known_box: Option<PathBuf>,
     /// How to reach the box without the cable; None when this computer has no pairing key.
     lan: Option<Arc<LanConfig>>,
+    /// The Relay, tried when neither the cable nor the local network reaches the box.
+    relay: Option<RelayConfig>,
+    /// The user asked to take the box from whoever has it: the next network or Relay attempt says takeover.
+    takeover: Arc<AtomicBool>,
 }
 
 impl SerialConfig {
@@ -100,7 +113,15 @@ impl SerialConfig {
             usb_serial: env::var("VIBEBUDDY_USB_SERIAL").ok(),
             known_box,
             lan: None,
+            relay: None,
+            takeover: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Lets the worker reach the box through the Relay when nothing closer does.
+    pub fn with_relay(mut self, relay: RelayConfig) -> Self {
+        self.relay = Some(relay);
+        self
     }
 
     /// Lets the worker fall back to the local network when no box is on the cable.
@@ -143,6 +164,7 @@ pub enum TransportError {
 pub struct SerialTransport {
     sender: mpsc::Sender<Vec<u8>>,
     suspend: watch::Sender<bool>,
+    takeover: Arc<AtomicBool>,
 }
 
 impl SerialTransport {
@@ -150,8 +172,14 @@ impl SerialTransport {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         let (device_sender, device_receiver) = mpsc::channel(DEVICE_EVENT_CAPACITY);
         let (suspend, suspend_receiver) = watch::channel(false);
+        let takeover = config.takeover.clone();
         tokio::spawn(serial_worker(config, receiver, device_sender, suspend_receiver));
-        (Self { sender, suspend }, device_receiver)
+        (Self { sender, suspend, takeover }, device_receiver)
+    }
+
+    /// The user chose to take the box from the computer that has it (ADR-0011).
+    pub fn request_takeover(&self) {
+        self.takeover.store(true, Ordering::Relaxed);
     }
 
     /// Hands the serial port to the flasher: the worker closes the port and stops reconnecting until released.
@@ -182,6 +210,9 @@ async fn serial_worker(
     // cable nor the network brings the box back, so moving from one to the other isn't a drop.
     let mut linked = false;
     let mut busy_logged: Option<String> = None;
+    // When the Relay may be tried again, and how many tries in a row have failed.
+    let mut relay_retry: Option<Instant> = None;
+    let mut relay_attempts = 0_u32;
 
     loop {
         if *suspend.borrow() {
@@ -226,11 +257,13 @@ async fn serial_worker(
             }
         };
         let Some(PortChoice { name: port_name, paced, usb_serial }) = choice else {
-            // No box on the cable: try the network, if this computer is paired and knows where the box is.
+            // No box on the cable: try the local network, then the Relay, if this computer is paired with a box.
+            let takeover = config.takeover.swap(false, Ordering::Relaxed);
+            let mut busy = None;
             if let Some(lan) = &config.lan
                 && let Some(target) = lan.target()
             {
-                match lan::connect(&target, &lan.identity, false).await {
+                match lan::connect(&target, &lan.identity, takeover).await {
                     Ok(mut stream) => {
                         info!(address = %target.address, "linked over the local network");
                         busy_logged = None;
@@ -242,6 +275,7 @@ async fn serial_worker(
                             false,
                             Firmware::Ours,
                             Some(&config),
+                            None,
                             &mut pending,
                             &mut receiver,
                             &device_event_sender,
@@ -251,17 +285,67 @@ async fn serial_worker(
                         match end {
                             SessionEnd::Shutdown => return,
                             SessionEnd::Usb => info!("the box is on the cable, leaving the local network link"),
-                            SessionEnd::Reconnect | SessionEnd::Released => {}
+                            _ => {}
                         }
                         continue;
                     }
-                    Err(LinkError::Busy(reason)) if busy_logged.as_ref() != Some(&reason) => {
-                        info!(%reason, "the box is linked elsewhere");
-                        busy_logged = Some(reason);
-                    }
-                    Err(LinkError::Busy(_)) => {}
+                    Err(LinkError::Busy { reason, owner }) => busy = Some((owner, reason)),
                     Err(error) => debug!(?error, address = %target.address, "no local network link"),
                 }
+            }
+            // A box that answered busy on the local network is busy on the Relay too.
+            let box_key = config.lan.as_ref().and_then(|lan| lan.box_key());
+            if busy.is_none()
+                && let (Some(relay_config), Some(box_key)) = (&config.relay, box_key)
+                && (takeover || relay_retry.is_none_or(|at| Instant::now() >= at))
+            {
+                match relay::link(relay_config, &box_key, takeover).await {
+                    Ok(mut stream) => {
+                        info!(url = %relay_config.url, "linked through the Relay");
+                        busy_logged = None;
+                        relay_attempts = 0;
+                        relay_retry = None;
+                        let _ = device_event_sender.send(DeviceMessage::ConnectedRelay { url: relay_config.url.clone() }).await;
+                        linked = true;
+                        let probe = config.lan.as_ref().and_then(|lan| lan.target()).map(|target| target.address);
+                        let end = run_session(
+                            &mut stream,
+                            &relay_config.url,
+                            false,
+                            Firmware::Ours,
+                            Some(&config),
+                            probe.as_deref(),
+                            &mut pending,
+                            &mut receiver,
+                            &device_event_sender,
+                            &mut suspend,
+                        )
+                        .await;
+                        match end {
+                            SessionEnd::Shutdown => return,
+                            SessionEnd::Usb => info!("the box is on the cable, leaving the Relay"),
+                            SessionEnd::Lan => info!("the box is on the local network, leaving the Relay"),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Err(RelayError::Busy { reason, owner }) => {
+                        busy = Some((owner, reason));
+                        relay_retry = Some(Instant::now() + RelayError::Busy { reason: String::new(), owner: String::new() }.backoff(0));
+                    }
+                    Err(error) => {
+                        debug!(?error, "no Relay link");
+                        relay_retry = Some(Instant::now() + error.backoff(relay_attempts));
+                        relay_attempts = relay_attempts.saturating_add(1);
+                    }
+                }
+            }
+            if let Some((owner, reason)) = busy
+                && busy_logged.as_ref() != Some(&format!("{owner}/{reason}"))
+            {
+                info!(%owner, %reason, "the box is linked elsewhere");
+                busy_logged = Some(format!("{owner}/{reason}"));
+                let _ = device_event_sender.send(DeviceMessage::Busy { owner, reason }).await;
             }
             if linked {
                 let _ = device_event_sender.send(DeviceMessage::Disconnected).await;
@@ -292,6 +376,7 @@ async fn serial_worker(
             paced,
             Firmware::Listening { since: Instant::now() },
             None,
+            None,
             &mut pending,
             &mut receiver,
             &device_event_sender,
@@ -300,7 +385,7 @@ async fn serial_worker(
         .await;
         match end {
             SessionEnd::Shutdown => return,
-            SessionEnd::Reconnect | SessionEnd::Usb => {}
+            SessionEnd::Reconnect | SessionEnd::Usb | SessionEnd::Lan => {}
             // Closing a tty waits for unsent output to drain, which never happens if the peer doesn't read.
             SessionEnd::Released => drop(port.clear(ClearBuffer::Output)),
         }
@@ -325,6 +410,8 @@ enum SessionEnd {
     Shutdown,
     /// A box turned up on the cable while linked over the network.
     Usb,
+    /// The box answers on the local network while linked through the Relay.
+    Lan,
 }
 
 /// What the box on the other end runs, judged from what it prints. No port is opened just to ask, since opening
@@ -410,6 +497,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
     paced: bool,
     mut firmware: Firmware,
     watch_cable: Option<&SerialConfig>,
+    probe_lan: Option<&str>,
     pending: &mut VecDeque<Vec<u8>>,
     receiver: &mut mpsc::Receiver<Vec<u8>>,
     device_event_sender: &mpsc::Sender<DeviceMessage>,
@@ -420,6 +508,9 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
     // Over the network the cable wins: look for the box on it now and then.
     let mut cable_check = tokio::time::interval(CABLE_CHECK_EVERY);
     cable_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Through the Relay, the local network wins when the box answers there.
+    let mut lan_check = tokio::time::interval_at(Instant::now() + LAN_CHECK_EVERY, LAN_CHECK_EVERY);
+    lan_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // Frames wait, in order, until the box is known to run our firmware; only hello may go first.
@@ -476,6 +567,12 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
                 if *suspend.borrow() {
                     info!(port = %port_name, "serial port released for flashing");
                     return SessionEnd::Released;
+                }
+            }
+            _ = lan_check.tick(), if probe_lan.is_some() => {
+                let address = probe_lan.unwrap_or_default();
+                if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(1), tokio::net::TcpStream::connect(address)).await {
+                    return SessionEnd::Lan;
                 }
             }
             _ = cable_check.tick(), if watch_cable.is_some() => {
@@ -823,7 +920,7 @@ mod tests {
         let (device_sender, _device_receiver) = mpsc::channel(1);
         let (suspend_sender, mut suspend) = watch::channel(false);
 
-        let session = run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, &mut pending, &mut receiver, &device_sender, &mut suspend);
+        let session = run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend);
         let release = async {
             tokio::time::sleep(LISTEN_FIRST + Duration::from_millis(50)).await;
             suspend_sender.send(true).unwrap();
@@ -871,7 +968,7 @@ mod tests {
         frames.send(heartbeat_frame()).await.unwrap();
         let task = tokio::spawn(async move {
             let mut pending = VecDeque::new();
-            run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, &mut pending, &mut receiver, &device_sender, &mut suspend).await
+            run_session(&mut port, "test", false, Firmware::Listening { since: Instant::now() }, None, None, &mut pending, &mut receiver, &device_sender, &mut suspend).await
         });
         Session { peer, frames, device, _suspend: suspend_sender, task }
     }

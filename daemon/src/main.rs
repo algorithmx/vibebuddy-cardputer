@@ -6,6 +6,7 @@ mod codex_hooks;
 mod config;
 mod identity;
 mod lan;
+mod relay;
 mod link_alert;
 mod occasions;
 mod rom_flasher;
@@ -201,6 +202,9 @@ async fn main() {
             state_dir,
             fixed_address: std::env::var("VIBEBUDDY_LAN_ADDR").ok(),
         });
+        // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
+        let url = std::env::var("VIBEBUDDY_RELAY_URL").unwrap_or_else(|_| relay::DEFAULT_URL.to_owned());
+        serial_config = serial_config.with_relay(relay::RelayConfig { identity: identity.clone(), url });
     }
     let pin = serial_config.pin();
     if let Some(pin) = &pin {
@@ -307,7 +311,7 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     }
     let _ = state.device_bus.send(message.clone());
     // Ask right after connecting; the device reports its mode, firmware build and voice again.
-    if matches!(message, DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. }) {
+    if matches!(message, DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. } | DeviceMessage::ConnectedRelay { .. }) {
         send_event(state, device_command("device.hello"));
     }
     let DeviceMessage::Event(event) = message else {
@@ -428,6 +432,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/device/identify", post(post_identify))
         .route("/v1/device/volume", post(post_volume))
         .route("/v1/device/unpair", post(post_unpair))
+        .route("/v1/device/takeover", post(post_takeover))
         .route("/v1/device/wifi", post(post_wifi))
         .route("/v1/device/wifi/forget", post(post_wifi_forget))
         .route("/v1/device/choice", post(post_choice))
@@ -667,6 +672,28 @@ async fn post_unpair(
     let mut event = device_command("device.unpair");
     event.extra.insert("key".to_owned(), request.key.into());
     post_event(State(state), Json(event)).await
+}
+
+/// The user chose to take the box from the computer that has it: the next try over the network or the Relay
+/// asks for it outright (ADR-0011). Not from another computer's cable, which the box refuses.
+async fn post_takeover(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let refusal = {
+        let device = state.device.lock().await;
+        match &device.busy {
+            _ if device.connected => Some("this computer already has the box"),
+            Some(busy) if busy.reason == "usb" => Some("the box is on another computer's cable"),
+            None => Some("the box isn't linked elsewhere"),
+            Some(_) => None,
+        }
+    };
+    if let Some(message) = refusal {
+        return (StatusCode::CONFLICT, Json(ApiResponse { accepted: false, message: message.to_owned() }));
+    }
+    let Some(serial) = &state.serial else {
+        return (StatusCode::NOT_IMPLEMENTED, Json(ApiResponse { accepted: false, message: "no link worker".to_owned() }));
+    };
+    serial.request_takeover();
+    (StatusCode::ACCEPTED, Json(ApiResponse { accepted: true, message: "taking the box over".to_owned() }))
 }
 
 #[derive(serde::Deserialize)]
