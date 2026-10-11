@@ -522,7 +522,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
                 result = write_frame(port, &frame, paced) => {
                     if let Err(error) = result {
                         pending.push_front(frame);
-                        warn!(port = %port_name, %error, "serial write failed, reconnecting");
+                        warn!(port = %port_name, %error, "link write failed, reconnecting");
                         return SessionEnd::Reconnect;
                     }
                 }
@@ -584,7 +584,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
             result = port.read(&mut read_buffer) => {
                 match result {
                     Ok(0) => {
-                        warn!(port = %port_name, "serial port closed, reconnecting");
+                        warn!(port = %port_name, "link closed, reconnecting");
                         return SessionEnd::Reconnect;
                     }
                     Ok(count) => {
@@ -606,7 +606,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     Err(error) => {
-                        warn!(port = %port_name, %error, "serial read failed, reconnecting");
+                        warn!(port = %port_name, %error, "link read failed, reconnecting");
                         return SessionEnd::Reconnect;
                     }
                 }
