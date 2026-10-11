@@ -50,6 +50,12 @@ After welcome the Relay sends `{"t":"status","box":<online>,"owner":{"key","name
 
 A linked computer gets `{"t":"unlinked","reason":"takeover"|"moved"|"unpaired"}` when it loses the box; `moved` means it linked to the same box another way.
 
+## The daemon
+
+The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`). Failed tries back off: 2 s when unreachable, 10 s when busy, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes. The Relay's address is `wss://relay.korekore.ai` unless `VIBEBUDDY_RELAY_URL` says otherwise. The update manifest's optional `relay` field moves it from the next connection on, but only to a `wss://` address and never over the variable.
+
+The simulator plays the box on the Relay with `tools/simulate-device.py --relay ws://127.0.0.1:8787`, against `wrangler dev` in vibebuddy-cloud.
+
 ## Not decided yet
 
-How the daemon carries a Relay link next to USB and the local network, and resuming large writes after a drop.
+Resuming large writes after a drop. Noticing a computer that went away without closing its socket (a laptop asleep): the Relay keeps it as the owner, so the grace period never starts and another computer can only take over.
