@@ -26,6 +26,10 @@ pub struct Manifest {
     pub app: BTreeMap<String, Download>,
     /// Every released firmware, newest first, so an App too old for the newest one can still find one it can run.
     pub firmware: Vec<Firmware>,
+    /// Where the Relay is, when it isn't the address compiled into the daemon and the firmware (ADR-0012). Optional:
+    /// the Relay never depends on update checks, which can be off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +140,7 @@ mod tests {
                 min_app: "0.4.0".to_owned(),
                 download: Download { version: "0.3.3".to_owned(), url: "https://example/fw.zip".to_owned(), sha256: "bb".to_owned(), notes },
             }],
+            relay: None,
         }
     }
 

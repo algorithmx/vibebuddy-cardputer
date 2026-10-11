@@ -139,8 +139,11 @@ pub struct Device {
     pub firmware_version: Option<String>,
     pub voice: Option<String>,
     pub volume: Option<u8>,
-    /// Linked over the local network; `port` is then the box's address.
+    /// Linked over the local network or the Relay; `port` is then the box's or the Relay's address.
     pub network: bool,
+    pub relay: bool,
+    /// Another computer has the box (ADR-0011).
+    pub busy: Option<Busy>,
     /// Connected but running other firmware, as the daemon judged it (docs/architecture.md, decision 17).
     pub foreign_firmware: bool,
     /// Our firmware built for other hardware (the breadboard devkit); released firmware isn't offered to it.
@@ -157,6 +160,15 @@ pub struct Device {
     /// The Wi-Fi network the box is set to join, and the address it got there.
     pub wifi_network: Option<String>,
     pub wifi_address: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Busy {
+    /// By name; empty when the box didn't say.
+    pub owner: String,
+    /// `usb`: on that computer's cable, can't be taken. `linked`: can be taken over.
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

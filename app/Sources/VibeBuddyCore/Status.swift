@@ -51,6 +51,13 @@ public struct BoxCandidate: Codable, Equatable, Identifiable {
     public init(port: String, usbSerial: String?) { self.port = port; self.usbSerial = usbSerial }
 }
 
+/// The box is linked to another computer (ADR-0011): `reason` is "usb" (on its cable, can't be taken) or "linked".
+public struct BoxBusy: Codable, Equatable {
+    public var owner: String
+    public var reason: String
+    public init(owner: String, reason: String) { self.owner = owner; self.reason = reason }
+}
+
 /// A computer the box is paired with (ADR-0012).
 public struct PairedComputer: Codable, Equatable, Identifiable {
     public var key: String
@@ -84,10 +91,13 @@ public struct DeviceState: Codable, Equatable {
     public var pairedComputers: [PairedComputer]?
     /// Linked over the local network; `port` is then the box's address. Absent from older daemons.
     public var network: Bool?
+    /// Linked through the Relay; `port` is then the Relay's address. Absent from older daemons, like busy.
+    public var relay: Bool?
+    public var busy: BoxBusy?
     /// The Wi-Fi network the box is set to join, and the address it got there. Absent from older daemons.
     public var wifiNetwork: String?
     public var wifiAddress: String?
-    enum CodingKeys: String, CodingKey { case wifiNetwork = "wifi_network", wifiAddress = "wifi_address", connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
+    enum CodingKeys: String, CodingKey { case wifiNetwork = "wifi_network", wifiAddress = "wifi_address", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
     public init(connected: Bool, port: String? = nil, bridge: Bool = false, mode: String? = nil, firmwareBuild: String? = nil, firmwareVersion: String? = nil, voice: String? = nil, volume: Int? = nil, foreignFirmware: Bool? = nil) {
         self.connected = connected; self.port = port; self.bridge = bridge; self.mode = mode; self.firmwareBuild = firmwareBuild; self.firmwareVersion = firmwareVersion; self.voice = voice; self.volume = volume
         self.foreignFirmware = foreignFirmware

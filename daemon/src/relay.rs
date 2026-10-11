@@ -34,8 +34,36 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 pub struct RelayConfig {
     pub identity: Arc<Identity>,
-    /// `wss://relay.korekore.ai`, or `ws://127.0.0.1:8787` under `wrangler dev`.
-    pub url: String,
+    /// `wss://relay.korekore.ai`, or `ws://127.0.0.1:8787` under `wrangler dev`; the update manifest may move it.
+    url: Arc<std::sync::RwLock<String>>,
+    /// Set by `VIBEBUDDY_RELAY_URL`, which the manifest doesn't override.
+    fixed: bool,
+}
+
+impl RelayConfig {
+    /// `fixed` is an address given by hand; None means the compiled default, which the manifest may move.
+    pub fn new(identity: Arc<Identity>, fixed: Option<String>) -> Self {
+        let url = fixed.clone().unwrap_or_else(|| DEFAULT_URL.to_owned());
+        Self { identity, url: Arc::new(std::sync::RwLock::new(url)), fixed: fixed.is_some() }
+    }
+
+    pub fn url(&self) -> String {
+        self.url.read().map(|url| url.clone()).unwrap_or_else(|_| DEFAULT_URL.to_owned())
+    }
+
+    /// The signed update manifest names the Relay: used from the next connection on. Only `wss://`, and never over
+    /// an address given by hand.
+    pub fn offer(&self, url: &str) {
+        if self.fixed || !url.starts_with("wss://") {
+            return;
+        }
+        if let Ok(mut current) = self.url.write()
+            && *current != url
+        {
+            info!(%url, "the update manifest moves the Relay");
+            *current = url.to_owned();
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,7 +115,7 @@ fn connector() -> Result<Connector, RelayError> {
 /// Connects, proves this computer's key, and asks for the box. On success the returned stream carries
 /// the VibeBuddy Protocol as bytes, as the cable does.
 pub async fn link(config: &RelayConfig, box_key: &[u8; 32], takeover: bool) -> Result<DuplexStream, RelayError> {
-    let url = box_url(&config.url, box_key);
+    let url = box_url(&config.url(), box_key);
     let connected = tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector()?));
     let (mut socket, _) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connected).await {
         Err(_) => return Err(RelayError::Unreachable("timed out".to_owned())),
@@ -318,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn lines_go_through_the_relay_both_ways_until_the_box_is_taken() {
-        let config = RelayConfig { identity: Arc::new(identity()), url: fake_relay("linked").await };
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("linked").await));
         let mut stream = link(&config, &[5; 32], false).await.unwrap();
         stream.write_all(b"{\"version\":1,\"event\":\"device.hello\"}\n").await.unwrap();
         let mut received = String::new();
@@ -328,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_names_the_owner() {
-        let config = RelayConfig { identity: Arc::new(identity()), url: fake_relay("busy").await };
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy").await));
         assert_eq!(
             link(&config, &[5; 32], false).await.err(),
             Some(RelayError::Busy { reason: "usb".to_owned(), owner: "omarchy".to_owned() })
@@ -341,6 +369,19 @@ mod tests {
         assert_eq!(error.backoff(0), Duration::from_secs(2));
         assert_eq!(error.backoff(1), Duration::from_secs(4));
         assert_eq!(RelayError::RateLimited.backoff(9), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn the_manifest_moves_the_relay_unless_it_was_given_by_hand() {
+        let config = RelayConfig::new(Arc::new(identity()), None);
+        assert_eq!(config.url(), DEFAULT_URL);
+        config.offer("ws://plain.example");
+        assert_eq!(config.url(), DEFAULT_URL, "never off TLS");
+        config.offer("wss://relay2.korekore.ai");
+        assert_eq!(config.url(), "wss://relay2.korekore.ai");
+        let fixed = RelayConfig::new(Arc::new(identity()), Some("ws://127.0.0.1:8787".to_owned()));
+        fixed.offer("wss://relay2.korekore.ai");
+        assert_eq!(fixed.url(), "ws://127.0.0.1:8787");
     }
 
     #[test]

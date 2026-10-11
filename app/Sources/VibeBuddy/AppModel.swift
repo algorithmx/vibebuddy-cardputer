@@ -158,6 +158,8 @@ final class AppModel: ObservableObject {
 
     func unpair(key: String) { run { try await self.client.unpair(key: key) } }
 
+    func takeOver() { run { try await self.client.takeOver() } }
+
     func setWifi(ssid: String, password: String) { run { try await self.client.setWifi(ssid: ssid, password: password) } }
 
     func forgetWifi() { run { try await self.client.forgetWifi() } }

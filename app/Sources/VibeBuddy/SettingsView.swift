@@ -482,6 +482,19 @@ struct DeviceView: View {
         Form {
             Section {
                 LabeledContent("Link", value: connectionText)
+                // Another computer has the box (ADR-0011): say who, and offer to take it unless it's on their cable.
+                if !connected, let busy = model.status?.device.busy {
+                    let owner = busy.owner.isEmpty ? String(localized: "another computer") : busy.owner
+                    if busy.reason == "usb" {
+                        Text("The box is plugged into \(owner).").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        HStack {
+                            Text("The box is with \(owner).").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Take over") { model.takeOver() }
+                        }
+                    }
+                }
                 // Not while a flash waits for a replug: that row says not to hold K0 this time.
                 if let pin = model.status?.device.pin {
                     PinNotice(pin: pin)
@@ -571,6 +584,7 @@ struct DeviceView: View {
         guard device.connected else {
             return device.candidates?.isEmpty == false ? String(localized: "Several devices found") : String(localized: "Box not found")
         }
+        if device.relay == true { return String(localized: "Relay") }
         if device.network == true { return "\(device.port ?? "") · \(String(localized: "Wi-Fi"))" }
         return "\(device.port ?? "") · \(device.bridge ? String(localized: "UART bridge") : String(localized: "native USB"))"
     }

@@ -79,6 +79,10 @@ do {
     {"connected":true,"bridge":false,"network":true,"port":"192.168.1.23:7340","wifi_network":"Home","wifi_address":"192.168.1.23"}
     """.utf8))
     check(wifi.network == true && wifi.wifiNetwork == "Home" && wifi.wifiAddress == "192.168.1.23", "Wi-Fi fields decode")
+    let busy = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
+    {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
+    """.utf8))
+    check(busy.busy == BoxBusy(owner: "omarchy", reason: "linked"), "busy decodes")
 } catch {
     check(false, "status decoding threw: \(error)")
 }

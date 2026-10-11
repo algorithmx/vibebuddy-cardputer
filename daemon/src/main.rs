@@ -83,6 +83,8 @@ struct AppState {
     serial: Option<Arc<SerialTransport>>,
     /// This computer's pairing key; None when it couldn't be read or made, and then nothing is paired.
     identity: Option<Arc<identity::Identity>>,
+    /// Where the Relay is; the update manifest may move it.
+    relay: Option<relay::RelayConfig>,
     /// The update manifest and the firmware it offers; with no source, nothing is ever checked.
     updates: Arc<Mutex<Updates>>,
     /// "Check for updates" pressed: checks now instead of waiting for the daily one.
@@ -116,6 +118,7 @@ impl AppState {
             app_version: env::var("VIBEBUDDY_APP_VERSION").ok().filter(|value| !value.is_empty()),
             serial: None,
             identity: None,
+            relay: None,
             updates: Arc::new(Mutex::new(Updates::new(None, None))),
             check_updates: Arc::new(Notify::new()),
         }
@@ -195,6 +198,7 @@ async fn main() {
         None => None,
     };
     let mut serial_config = SerialConfig::from_env(known_box_file());
+    let mut relay_config = None;
     // Paired, the box can also be reached over the local network when it isn't on the cable (ADR-0012).
     if let (Some(identity), Some(state_dir)) = (&identity, config::state_dir()) {
         serial_config = serial_config.with_lan(lan::LanConfig {
@@ -203,8 +207,9 @@ async fn main() {
             fixed_address: std::env::var("VIBEBUDDY_LAN_ADDR").ok(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
-        let url = std::env::var("VIBEBUDDY_RELAY_URL").unwrap_or_else(|_| relay::DEFAULT_URL.to_owned());
-        serial_config = serial_config.with_relay(relay::RelayConfig { identity: identity.clone(), url });
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok());
+        serial_config = serial_config.with_relay(relay.clone());
+        relay_config = Some(relay);
     }
     let pin = serial_config.pin();
     if let Some(pin) = &pin {
@@ -228,11 +233,15 @@ async fn main() {
         state.device.lock().await.computer_key = Some(identity.public_key());
     }
     state.identity = identity;
+    state.relay = relay_config;
     state.device.lock().await.pin = pin;
     state.updates = Arc::new(Mutex::new(Updates::new(
         updates::Source::configured(),
         config::state_dir().map(|dir| dir.join("updates")),
     )));
+    if let (Some(relay), Some(url)) = (&state.relay, state.updates.lock().await.relay_url()) {
+        relay.offer(&url);
+    }
     tokio::spawn(watch_parent());
     tokio::spawn(sweep_expired_activities(state.clone()));
     tokio::spawn(send_heartbeats(state.clone()));
@@ -517,7 +526,11 @@ async fn check_once(state: &AppState) {
     let wanted = match fetched {
         Ok((text, manifest)) => {
             let mut updates = state.updates.lock().await;
-            updates.accept(&text, manifest).map(|firmware| (firmware, updates.firmware_root()))
+            let accepted = updates.accept(&text, manifest).map(|firmware| (firmware, updates.firmware_root()));
+            if let (Some(relay), Some(url)) = (&state.relay, updates.relay_url()) {
+                relay.offer(&url);
+            }
+            accepted
         }
         Err(error) => Err(error),
     };

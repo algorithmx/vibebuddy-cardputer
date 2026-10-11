@@ -301,16 +301,17 @@ async fn serial_worker(
             {
                 match relay::link(relay_config, &box_key, takeover).await {
                     Ok(mut stream) => {
-                        info!(url = %relay_config.url, "linked through the Relay");
+                        let url = relay_config.url();
+                        info!(%url, "linked through the Relay");
                         busy_logged = None;
                         relay_attempts = 0;
                         relay_retry = None;
-                        let _ = device_event_sender.send(DeviceMessage::ConnectedRelay { url: relay_config.url.clone() }).await;
+                        let _ = device_event_sender.send(DeviceMessage::ConnectedRelay { url: url.clone() }).await;
                         linked = true;
                         let probe = config.lan.as_ref().and_then(|lan| lan.target()).map(|target| target.address);
                         let end = run_session(
                             &mut stream,
-                            &relay_config.url,
+                            &url,
                             false,
                             Firmware::Ours,
                             Some(&config),
