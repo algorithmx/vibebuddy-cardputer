@@ -209,8 +209,14 @@ fn relay(url: String, box_id: String, sender: mpsc::Sender<Input>, outgoing: mps
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 continue;
             };
-            if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+            // A short read timeout lets this thread also send what the main loop queued.
+            let tcp = match socket.get_ref() {
+                tungstenite::stream::MaybeTlsStream::Plain(stream) => Some(stream),
+                tungstenite::stream::MaybeTlsStream::NativeTls(stream) => Some(stream.get_ref()),
+                _ => None,
+            };
+            if let Some(tcp) = tcp {
+                let _ = tcp.set_read_timeout(Some(Duration::from_millis(20)));
             }
             backoff = Duration::from_secs(1);
             let mut pinged = Instant::now();
