@@ -141,6 +141,8 @@ impl DeviceState {
             DeviceMessage::Disconnected => {
                 self.connected = false;
                 self.port = None;
+                self.network = false;
+                self.relay = false;
                 self.foreign_firmware = false;
             }
             DeviceMessage::Line(line) => {
@@ -364,6 +366,8 @@ mod tests {
         assert_eq!(state.busy.as_ref().map(|busy| busy.owner.as_str()), Some("omarchy"));
         state.apply(&DeviceMessage::ConnectedRelay { url: "wss://relay.korekore.ai".to_owned() });
         assert!(state.busy.is_none() && state.relay && state.network);
+        state.apply(&DeviceMessage::Disconnected);
+        assert!(!state.relay && !state.network, "a dropped link isn't through anything");
     }
 
     #[test]
