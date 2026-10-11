@@ -186,6 +186,8 @@ fn closed(frame: Option<&CloseFrame>) -> RelayError {
         Some(4001) => RelayError::Refused("auth".to_owned()),
         Some(4003) => RelayError::Refused("not_paired".to_owned()),
         Some(1008) => RelayError::RateLimited,
+        // Silent too long, as a sleeping laptop is: a drop like any other, and the box may still be ours.
+        Some(4004) => RelayError::Unreachable("silent".to_owned()),
         Some(code) => RelayError::Unreachable(format!("closed with {code}")),
         None => RelayError::Unreachable("closed".to_owned()),
     }
@@ -230,6 +232,15 @@ where
                             Some("data") => {
                                 let Some(line) = value["line"].as_str() else { continue };
                                 if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                            // Linked again while linked: the box reconnected to the Relay (it restarted, say), so
+                            // the session starts over with hello, as on a new cable connection.
+                            Some("linked") => {
+                                let hello = vibebuddy_protocol::Event::named("device.hello");
+                                let Ok(frame) = serde_json::to_string(&hello) else { continue };
+                                if sink.send(Message::text(json!({"t": "data", "line": frame}).to_string())).await.is_err() {
                                     break;
                                 }
                             }
@@ -333,9 +344,19 @@ mod tests {
                         let Message::Text(text) = message else { continue };
                         let value: Value = serde_json::from_str(&text).unwrap();
                         if value["t"] == "data" {
-                            let line = value["line"].as_str().unwrap().to_uppercase();
-                            socket.send(say(json!({"t": "data", "line": line}))).await.unwrap();
-                            socket.send(say(json!({"t": "unlinked", "reason": "takeover"}))).await.unwrap();
+                            let line = value["line"].as_str().unwrap();
+                            if line.contains("device.hello") && line.contains("\"version\"") && !line.contains("VERSION") && answer == "restart" {
+                                // The bridge said hello again after the box came back: end the test there.
+                                socket.send(say(json!({"t": "data", "line": "REHELLO"}))).await.unwrap();
+                                socket.send(say(json!({"t": "unlinked", "reason": "takeover"}))).await.unwrap();
+                                continue;
+                            }
+                            socket.send(say(json!({"t": "data", "line": line.to_uppercase()}))).await.unwrap();
+                            if answer == "restart" {
+                                socket.send(say(json!({"t": "linked"}))).await.unwrap();
+                            } else {
+                                socket.send(say(json!({"t": "unlinked", "reason": "takeover"}))).await.unwrap();
+                            }
                         }
                     }
                 }
@@ -352,6 +373,16 @@ mod tests {
         let mut received = String::new();
         stream.read_to_string(&mut received).await.unwrap();
         assert_eq!(received, "{\"VERSION\":1,\"EVENT\":\"DEVICE.HELLO\"}\n", "and then the stream ends on unlinked");
+    }
+
+    #[tokio::test]
+    async fn the_box_coming_back_starts_the_session_over() {
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("restart").await));
+        let mut stream = link(&config, &[5; 32], false).await.unwrap();
+        stream.write_all(b"{\"version\":1,\"event\":\"x\"}\n").await.unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).await.unwrap();
+        assert!(received.ends_with("REHELLO\n"), "hello went out again after linked: {received}");
     }
 
     #[tokio::test]
