@@ -1,10 +1,12 @@
 # Relay protocol
 
-How the daemon and the box talk to the Relay (ADR-0012). The Relay itself is a separate, closed-source service; this is the part both ends in this repo implement.
+How the daemon and the box talk to the Relay (ADR-0012). The Relay itself is the Worker `vibebuddy-relay` in the closed-source `vibebuddy-cloud` repo, which holds all of VibeBuddy's hosted services; this is the part both ends in this repo implement.
+
+The Relay lives at `wss://relay.korekore.ai`; staging will be `wss://relay-staging.korekore.ai`. That address is compiled into the daemon and the firmware, and the update manifest may override it; the Relay never depends on update checks, which can be off.
 
 ## Connecting
 
-Both the box and a computer open a WebSocket to `wss://<relay>/v1/boxes/<box-id>`. `<box-id>` is the box's Ed25519 public key, 32 bytes as unpadded base64url (43 characters), so a box needs no registration. Every message either way is one JSON object with a `t` field. A box takes at most 64 sockets; past that the upgrade gets HTTP 429.
+Both the box and a computer open a WebSocket to `wss://<relay>/v1/boxes/<box-id>`. `<box-id>` is the box's Ed25519 public key, 32 bytes as unpadded base64url (43 characters), so a box needs no registration. Every message either way is one JSON object with a `t` field. A box takes at most 4 sockets still authenticating from one IP (past that the upgrade gets HTTP 429) and at most 16 sockets in all; past 16 the oldest socket still authenticating is closed with `{"t":"error","code":"auth_timeout"}` and 4001 to make room. Authenticated sockets are bounded by one per key.
 
 The Relay first sends `{"t":"challenge","nonce":"…"}`. The client answers:
 
