@@ -141,6 +141,9 @@ fn main() {
     fs::create_dir_all(&directory).expect("create directory");
 
     let mut preview = Preview::new(&directory);
+    // The link tag in the top left: the preview's lines come over the cable.
+    preview.firmware.poll(&mut preview.board);
+    preview.snapshot("screen-link");
     preview.press(1, 1100);
     preview.snapshot("menu-open");
     preview.press(0, 50);
@@ -148,6 +151,10 @@ fn main() {
     for _ in 0..2 {
         preview.press(1, 50);
     }
+    preview.press(0, 50);
+    preview.snapshot("menu-network");
+    preview.press(0, 50);
+    preview.press(1, 50);
     preview.press(0, 50);
     preview.snapshot("menu-status");
 

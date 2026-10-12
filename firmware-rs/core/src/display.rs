@@ -169,6 +169,9 @@ pub struct Display {
     identify_until: Option<u32>,
     identify_next_toggle: u32,
     muted: bool,
+    /// How the box is linked, in the top left at all times: `USB`, `LAN` or `RELAY`, then `STG` when its Relay is
+    /// staging (docs/device-menu.md). Empty with no link and on production: NO LINK already says the first.
+    link_tag: Text<16>,
     /// The alarm is ringing: the phase ended and the user hasn't acted yet. Records the phase at the end;
     /// stops as soon as the view changes (start, abandon, skip) or the screen is switched away.
     ring_alarm: bool,
@@ -785,6 +788,7 @@ impl Display {
             identify_until: None,
             identify_next_toggle: 0,
             muted: false,
+            link_tag: Text::new(),
             ring_alarm: false,
             ring_alarm_phase: Phase::Focus,
             ring_alarm_shake_frames: 0,
@@ -1145,8 +1149,13 @@ impl Display {
         canvas.fill_rect(0, 0, WIDTH, HEIGHT, COLOR_BACKGROUND);
         canvas.fill_rect(0, 0, WIDTH, 4, status_color);
         canvas.draw_text_centered(12, b"VibeBuddy", 2, COLOR_TEXT);
+        let mut x = 8;
+        if !self.link_tag.is_empty() {
+            canvas.draw_text(x, 15, self.link_tag.as_bytes(), 1, COLOR_MUTED, 16);
+            x += text_width(self.link_tag.as_bytes(), 1) + 6;
+        }
         if self.muted {
-            canvas.draw_text(8, 15, b"MUTE", 1, COLOR_INPUT, 4);
+            canvas.draw_text(x, 15, b"MUTE", 1, COLOR_INPUT, 4);
         }
         match self.mode {
             Mode::Pomodoro => self.draw_pomodoro_scene(&mut canvas, scene, label, status_color),
@@ -1350,6 +1359,18 @@ impl Display {
             return;
         }
         self.muted = muted;
+        if self.ready {
+            let _ = self.render(screen, scene);
+        }
+    }
+
+    /// The link tag in the top left; redraws only on a change.
+    pub fn set_link_tag(&mut self, screen: &mut dyn Screen, scene: &Scene, tag: &[u8]) {
+        if self.link_tag.as_bytes() == tag {
+            return;
+        }
+        self.link_tag = Text::new();
+        self.link_tag.push_bytes(tag);
         if self.ready {
             let _ = self.render(screen, scene);
         }

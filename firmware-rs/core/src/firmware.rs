@@ -20,6 +20,7 @@ use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
 use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
+use crate::text::Text;
 use crate::voice_pack::crc32;
 use crate::lines::LinePicker;
 use crate::lan::{Conn, Lan, Output as LanOutput};
@@ -117,6 +118,10 @@ pub struct Firmware {
     /// The Wi-Fi network changed and the device layer hasn't picked it up yet.
     wifi_changed: bool,
     relay_changed: bool,
+    /// The box is on its Wi-Fi network, as the device layer reports.
+    wifi_joined: bool,
+    /// The Relay has welcomed the box on the socket that is open now.
+    relay_up: bool,
     /// The computer on the cable asked which networks the box can hear.
     scan_requested: bool,
     /// The computer on the cable, once it has paired: what the box reports to the Relay as its USB link.
@@ -237,6 +242,8 @@ impl Firmware {
             remote: false,
             wifi_changed: false,
             relay_changed: false,
+            wifi_joined: false,
+            relay_up: false,
             scan_requested: false,
             cable_key: None,
             volume: VOLUME_DEFAULT,
@@ -446,6 +453,54 @@ impl Firmware {
         core::mem::take(&mut self.relay_changed)
     }
 
+    /// The device layer joined the Wi-Fi network or lost it; shown in the menu's NETWORK view.
+    pub fn set_wifi_joined(&mut self, joined: bool) {
+        self.wifi_joined = joined;
+    }
+
+    /// The Relay welcomed the box, or its socket closed; shown in the menu's NETWORK view.
+    pub fn set_relay_up(&mut self, up: bool) {
+        self.relay_up = up;
+    }
+
+    /// How the box is linked to its computer, for the screen: `USB`, `LAN`, `RELAY`, or None.
+    fn link_path(&self, now: u32) -> Option<&'static [u8]> {
+        if self.link_lost {
+            return None;
+        }
+        match self.local_link(now) {
+            LocalLink::Usb(_) => Some(b"USB"),
+            LocalLink::Lan(_) => Some(b"LAN"),
+            LocalLink::None if self.lan.relay_link_active() => Some(b"RELAY"),
+            LocalLink::None => None,
+        }
+    }
+
+    /// The Relay by name: `PROD` and `STAGING` for ours, the host for any other.
+    fn relay_name(&self) -> &[u8] {
+        match relay_box::url_host(self.relay_url()) {
+            Some("relay.korekore.ai") => b"PROD",
+            Some("relay-staging.korekore.ai") => b"STAGING",
+            Some(host) => host.as_bytes(),
+            None => b"?",
+        }
+    }
+
+    /// The top-left tag on every screen (docs/device-menu.md): the link, then `STG` on the staging Relay.
+    pub fn link_tag(&self, now: u32) -> Text<16> {
+        let mut tag = Text::new();
+        if let Some(path) = self.link_path(now) {
+            tag.push_bytes(path);
+        }
+        if self.relay_name() == b"STAGING" {
+            if !tag.is_empty() {
+                tag.push_bytes(b" ");
+            }
+            tag.push_bytes(b"STG");
+        }
+        tag
+    }
+
     /// True once after `device.wifi.scan`: the device layer scans and reports `WIFI SEEN` lines.
     pub fn take_scan_request(&mut self) -> bool {
         core::mem::take(&mut self.scan_requested)
@@ -504,6 +559,9 @@ impl Firmware {
         self.handle_pomodoro_transition(board, transition);
         self.tend_leisure(board);
         let now = board.now_ms();
+        // The cable goes quiet and links come and go without a line to the screen; this only redraws on a change.
+        let tag = self.link_tag(now);
+        self.display.set_link_tag(board, &scene!(self, now), tag.as_bytes());
         self.display.tick(board, &scene!(self, now));
     }
 
@@ -744,7 +802,8 @@ impl Firmware {
         self.display.set_panel(board, &scene!(self, now), panel);
     }
 
-    fn menu_panel(&self, view: View, now: u32) -> Panel {
+    /// What the menu draws for a view.
+    pub fn menu_panel(&self, view: View, now: u32) -> Panel {
         let line = |label: &[u8], value: &[u8], tone| (label.to_vec(), value.to_vec(), tone);
         match view {
             View::List => {
@@ -761,6 +820,7 @@ impl Firmware {
                         Row::Volume => line(b"VOLUME", volume.as_bytes(), Tone::Accent),
                         Row::Mute => line(b"MUTE", if self.muted { b"ON" } else { b"OFF" }, Tone::Accent),
                         Row::Computers => line(b"COMPUTERS", paired.as_bytes(), Tone::Accent),
+                        Row::Network => line(b"NETWORK", b"OPEN", Tone::Dim),
                         Row::Status => line(b"STATUS", b"OPEN", Tone::Dim),
                     })
                     .collect();
@@ -769,7 +829,7 @@ impl Firmware {
                     Row::Volume => b"CHANGE",
                     Row::Mute => b"TOGGLE",
                     Row::Computers => b"FORGET",
-                    Row::Status => b"OPEN",
+                    Row::Network | Row::Status => b"OPEN",
                 };
                 Panel {
                     kind: PanelKind::List,
@@ -791,6 +851,29 @@ impl Firmware {
                     ],
                     selected: None,
                     hints: alloc::vec![(b"K0", b"FORGET"), (b"K1", b"BACK"), (b"K2", b"CLOSE")],
+                }
+            }
+            // Dimmed is what isn't working: no link, a network not joined, a Relay not connected.
+            View::Network => {
+                let wifi = match self.wifi() {
+                    None => line(b"WIFI", b"OFF", Tone::Dim),
+                    Some(wifi) => line(b"WIFI", wifi.ssid.as_bytes(), if self.wifi_joined { Tone::Plain } else { Tone::Dim }),
+                };
+                let relay = if self.wifi().is_none() {
+                    line(b"RELAY", b"OFF", Tone::Dim)
+                } else if self.relay_up {
+                    line(b"RELAY", self.relay_name(), Tone::Plain)
+                } else {
+                    let mut down = self.relay_name().to_vec();
+                    down.extend_from_slice(b" DOWN");
+                    line(b"RELAY", &down, Tone::Dim)
+                };
+                Panel {
+                    kind: PanelKind::Facts,
+                    title: b"NETWORK".to_vec(),
+                    lines: alloc::vec![self.link_line(now), wifi, relay],
+                    selected: None,
+                    hints: alloc::vec![(b"K0", b"BACK"), (b"K2", b"CLOSE")],
                 }
             }
             View::Status => {
@@ -817,7 +900,7 @@ impl Firmware {
                     lines: alloc::vec![
                         build_line(b"FIRMWARE", &self.build, Tone::Plain),
                         build_line(b"APP", &self.daemon_build, if self.link_lost { Tone::Dim } else { Tone::Plain }),
-                        line(b"MAC", if self.link_lost { b"NO LINK" } else { b"LINKED" }, Tone::Plain),
+                        self.link_line(now),
                         line(b"VOICE", voice.as_bytes(), Tone::Plain),
                         line(b"TODAY", today.as_bytes(), Tone::Plain),
                     ],
@@ -825,6 +908,14 @@ impl Firmware {
                     hints: alloc::vec![(b"K0", b"BACK"), (b"K2", b"CLOSE")],
                 }
             }
+        }
+    }
+
+    /// `LINK`: the way to the computer, or NO LINK.
+    fn link_line(&self, now: u32) -> (Vec<u8>, Vec<u8>, Tone) {
+        match self.link_path(now) {
+            Some(path) => (b"LINK".to_vec(), path.to_vec(), Tone::Plain),
+            None => (b"LINK".to_vec(), b"NO LINK".to_vec(), Tone::Dim),
         }
     }
 
