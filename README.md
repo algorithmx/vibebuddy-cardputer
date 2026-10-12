@@ -142,13 +142,21 @@ See [`docs/protocol.md`](docs/protocol.md) for the events.
 
 ### Updates
 
-The App and the box's firmware are released separately, and VibeBuddy looks for new versions of both ([ADR-0010](docs/adr/0010-firmware-and-app-release-separately-behind-an-update-manifest.md)). This is the only time it contacts anything on the internet:
+The App and the box's firmware are released separately, and VibeBuddy looks for new versions of both ([ADR-0010](docs/adr/0010-firmware-and-app-release-separately-behind-an-update-manifest.md)). Apart from the Relay (next section), this is the only time it contacts anything on the internet:
 
 - **When**: when it starts, once a day, and when you click Check now in Settings → General.
 - **What it sends**: your platform (`macos-arm64` or `linux-x86_64`), the App's version and the box's firmware version. Nothing else: no ID, no hook data, nothing about your agents or projects. On the Mac, Sparkle also fetches the App's update feed, sending the usual User-Agent with the App's name and version; its system profiling stays off.
 - **Where**: a signed list of releases at `https://updates.korekore.ai/vibebuddy/manifest.json` (and Sparkle's `appcast.xml` next to it), served by Cloudflare. The downloads themselves come from GitHub Releases.
 - **What happens**: nothing is installed without you. A new App opens Sparkle's window on the Mac, where you can install, wait or skip; on Linux, General says how to upgrade. Newer firmware is downloaded and checked in the background, then Settings → Device offers it with a button.
 - **Turning it off**: Settings → General → Check for updates. Builds from source have it off by default; the builds on the Releases page have it on.
+
+### Wi-Fi and the Relay
+
+Put the box on Wi-Fi (Settings → Device, with the box on the cable) and VibeBuddy reaches it without the cable: over the local network when this computer is on the same one, or through the VibeBuddy Relay when it isn't. The cable wins whenever it's plugged in, and moving between them doesn't drop the link ([ADR-0012](docs/adr/0012-the-relay-is-a-closed-cloudflare-service-with-pairing-not-accounts.md)).
+
+- **Pairing**: the box and each computer have their own key. A computer pairs with the box when it's plugged in; nothing else can link to the box, over the network or the Relay.
+- **What the Relay sees**: it runs on Cloudflare at `relay.korekore.ai`. While the box is on Wi-Fi it keeps a connection there, which carries its key, the names of the computers paired with it, and, while a computer is linked through the Relay, the lines that drive the box (agent states, task titles, project names). The connection is TLS, but the Relay itself can read those lines. The local network link isn't encrypted; it is signed with the keys, so only a paired computer can drive the box.
+- **Turning it off**: Settings → General → Reach the box through the VibeBuddy Relay. With it off, this computer never contacts the Relay. The box still connects to it while it's on Wi-Fi; forget its network to stop that.
 
 ### Giving the box to someone else
 

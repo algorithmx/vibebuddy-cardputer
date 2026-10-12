@@ -142,13 +142,21 @@ curl -H 'content-type: application/json' \
 
 ### 更新
 
-App 和盒子固件分开发布，VibeBuddy 会检查两者有没有新版本（[ADR-0010](docs/adr/0010-firmware-and-app-release-separately-behind-an-update-manifest.md)）。这是它唯一会联网的地方：
+App 和盒子固件分开发布，VibeBuddy 会检查两者有没有新版本（[ADR-0010](docs/adr/0010-firmware-and-app-release-separately-behind-an-update-manifest.md)）。除了中转（见下一节），这是它唯一会联网的地方：
 
 - **什么时候**：启动时、每天一次，以及你在设置 → 通用里点「立即检查」时。
 - **发送什么**：你的平台（`macos-arm64` 或 `linux-x86_64`）、App 版本和盒子的固件版本。别的都不发：没有任何标识，没有 Hook 数据，不涉及你的 Agent 和项目。在 Mac 上，Sparkle 还会拉取 App 的更新源，带上常规的 User-Agent（App 名称和版本），它的系统信息收集保持关闭。
 - **从哪里**：`https://updates.korekore.ai/vibebuddy/manifest.json` 上的一份签名发布清单（Sparkle 的 `appcast.xml` 就在旁边），由 Cloudflare 提供。下载本身来自 GitHub Releases。
 - **之后会怎样**：不经你同意什么都不会安装。Mac 上有新 App 时会弹出 Sparkle 的窗口，你可以安装、稍后或跳过；Linux 上通用页会说明怎么升级。更新的固件会在后台下载并校验，然后设置 → 设备会用一个按钮提示你更新。
 - **怎么关掉**：设置 → 通用 →「检查更新」。从源码编译的默认关闭；Releases 页面上的构建默认开启。
+
+### Wi-Fi 和中转
+
+让盒子连上 Wi-Fi（插着线，在设置 → 设备里设置）后，不插线也能连到它：电脑和盒子在同一个网络时走局域网，不在时通过 VibeBuddy 中转。插着线时总是优先走 USB，几种方式之间切换不会断开（[ADR-0012](docs/adr/0012-the-relay-is-a-closed-cloudflare-service-with-pairing-not-accounts.md)）。
+
+- **配对**：盒子和每台电脑都有自己的密钥。电脑插上盒子时自动配对；没配对过的，不管走网络还是中转都连不上盒子。
+- **中转能看到什么**：中转跑在 Cloudflare 上，地址是 `relay.korekore.ai`。盒子连着 Wi-Fi 时会一直和它保持一个连接，传的是盒子的密钥、和它配对的电脑的名字；有电脑通过中转连着盒子时，还有驱动盒子的那些消息（Agent 状态、任务标题、项目名）。连接走 TLS，但中转本身能读到这些消息。局域网连接没有加密，但用密钥签过名，只有配对过的电脑才能驱动盒子。
+- **怎么关掉**：设置 → 通用 →「盒子不在本机旁边时，通过 VibeBuddy 中转连接它」。关掉后这台电脑不会再连中转。盒子连着 Wi-Fi 时仍会连中转；要让它停下，就让盒子忘掉这个网络。
 
 ### 把盒子交给别人
 
