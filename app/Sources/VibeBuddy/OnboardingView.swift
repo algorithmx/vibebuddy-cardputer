@@ -1,14 +1,14 @@
 import SwiftUI
 import VibeBuddyCore
 
-/// First-run onboarding: welcome → find the box → connect agents → pick a character → launch at login → done.
+/// First-run onboarding: welcome → find the box → connect agents → pick a character → Wi-Fi → launch at login → done.
 struct OnboardingView: View {
     @ObservedObject var model: AppModel
     let finish: () -> Void
     @State private var step = 0
     @State private var pendingPlan: HookInstaller.Plan?
 
-    private let titles: [LocalizedStringKey] = ["Welcome", "Find the box", "Connect agents", "Pick a character", "Launch at login", "Done"]
+    private let titles: [LocalizedStringKey] = ["Welcome", "Find the box", "Connect agents", "Pick a character", "Wi-Fi", "Launch at login", "Done"]
 
     var body: some View {
         VStack(spacing: 16) {
@@ -27,7 +27,8 @@ struct OnboardingView: View {
                     case 1: findDevice
                     case 2: hooks
                     case 3: voices
-                    case 4: loginItem
+                    case 4: wifi
+                    case 5: loginItem
                     default: done
                     }
                 }
@@ -36,10 +37,10 @@ struct OnboardingView: View {
             .frame(maxHeight: .infinity)
             Divider()
             HStack {
-                if step > 0 && step < 5 { Button("Back") { step -= 1 } }
+                if step > 0 && step < 6 { Button("Back") { step -= 1 } }
                 Spacer()
-                if step == 1 || step == 3 { Button("Skip") { step += 1 }.disabled(flashing) }
-                if step < 5 {
+                if step == 1 || step == 3 || step == 4 { Button("Skip") { step += 1 }.disabled(flashing) }
+                if step < 6 {
                     // No paging while flashing: once you page away, nobody is watching the progress.
                     Button(step == 2 && !anyHookInstalled ? "Not now" : "Next") { step += 1 }
                         .keyboardShortcut(.defaultAction)
@@ -64,7 +65,7 @@ struct OnboardingView: View {
             Image(nsImage: PixelFace.largeImage()).interpolation(.none)
             VStack(alignment: .leading, spacing: 10) {
                 Text("VibeBuddy turns what your coding agents are doing into pictures and sounds on the box.").font(.title3)
-                Text("Next: plug in the box, connect your agents, pick a character, and choose whether to launch at login. Everything can be changed or skipped.")
+                Text("Next: plug in the box, connect your agents, pick a character, put the box on Wi-Fi, and choose whether to launch at login. Everything can be changed or skipped.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -150,6 +151,21 @@ struct OnboardingView: View {
             return String(localized: "The box's built-in voice speaks English (Jessica); pick a Chinese voice above to hear announcements in Chinese.")
         }
         return String(localized: "If you skip this, the box uses its built-in voice, Jessica (English).")
+    }
+
+    /// Wi-Fi is set over the cable only (ADR-0012), so the page needs the box plugged in and able to pair.
+    private var wifi: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Put the box on Wi-Fi?").font(.title3)
+            Text("Then this Mac reaches the box without the cable: over the local network, or through the VibeBuddy Relay when you're elsewhere.")
+                .foregroundStyle(.secondary)
+            if let device = model.status?.device, device.connected, device.network != true, device.boxKey != nil {
+                Form { WifiSection(model: model, device: device) }.formStyle(.grouped).frame(minHeight: 300)
+            } else {
+                Text("Plug in the box to set its network. You can also do it later on the Device tab in Settings.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var loginItem: some View {

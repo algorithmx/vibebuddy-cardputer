@@ -162,14 +162,6 @@ pub struct Device {
     pub wifi_address: Option<String>,
     /// What the box heard on its last scan, strongest first.
     pub wifi_seen: Vec<SeenNetwork>,
-    /// The Relay this computer uses, and the one the box last said it uses (`wss://host`).
-    pub relay_server: Option<String>,
-    pub box_relay: Option<String>,
-}
-
-/// A Relay's host, which is all that tells staging from production.
-pub fn relay_host(url: &str) -> &str {
-    url.strip_prefix("wss://").or_else(|| url.strip_prefix("ws://")).unwrap_or(url)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

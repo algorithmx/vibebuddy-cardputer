@@ -171,7 +171,10 @@
 "Next" = "下一步";
 "Get started" = "开始使用";
 "VibeBuddy turns what your coding agents are doing into pictures and sounds on the box." = "VibeBuddy 把你的编程 Agent 的状态变成盒子上的画面和声音。";
-"Next: plug in the box, connect your agents, pick a character, and choose whether to launch at login. Everything can be changed or skipped." = "接下来几步：插上盒子，接入 Agent，挑一个角色，决定要不要开机就启动。都能改，都能跳过。";
+"Next: plug in the box, connect your agents, pick a character, put the box on Wi-Fi, and choose whether to launch at login. Everything can be changed or skipped." = "接下来几步：插上盒子，接入 Agent，挑一个角色，让盒子连上 Wi-Fi，决定要不要开机就启动。都能改，都能跳过。";
+"Put the box on Wi-Fi?" = "让盒子连上 Wi-Fi？";
+"Then this Mac reaches the box without the cable: over the local network, or through the VibeBuddy Relay when you're elsewhere." = "这样不插线也能连到盒子：在同一个网络里走局域网，人在别处时通过 VibeBuddy 中转。";
+"Plug in the box to set its network. You can also do it later on the Device tab in Settings." = "插上盒子才能设置它的网络。也可以以后在设置的设备页里设置。";
 "Connect the box to this Mac with a USB cable." = "把盒子用 USB 线插到这台 Mac。";
 "Flashing VibeBuddy firmware…" = "正在刷入 VibeBuddy 固件…";
 "Hold K0 on the box and replug the cable to put it in download mode, then retry." = "按住盒子的 K0 再插一次线，让它进入下载模式，然后重试。";
@@ -294,8 +297,6 @@
 "Relay" = "中转";
 "Taking the box over was rejected (%lld)" = "接管盒子被拒绝（%lld）";
 "Reach the box through the VibeBuddy Relay when it's away from this computer" = "盒子不在本机旁边时，通过 VibeBuddy 中转连接它";
-"Relay: %@" = "中转：%@";
-"The box uses %@ until it's plugged into this computer." = "盒子在插到这台电脑之前，仍在用 %@。";
 "Nearby networks" = "附近的网络";
 "Choose…" = "选择…";
 "Scan" = "扫描";
@@ -303,3 +304,7 @@
 "Newer firmware is available: %@" = "有新固件：%@";
 "You can also skip this and update later on the Device tab in Settings." = "也可以先跳过，之后在设置的「设备」页更新。";
 "Downloading firmware %@…" = "正在下载固件 %@…";
+"The install script has connected your agents and set VibeBuddy to start when you log in. Next: find the box, pick a character, and put the box on Wi-Fi. Everything can be changed or skipped." = "安装脚本已经接好了你的 Agent，也设好了登录时自动启动。接下来几步：找到盒子，挑一个角色，让盒子连上 Wi-Fi。都能改，都能跳过。";
+"Connect the box to this computer with a USB cable." = "用 USB 线把盒子接到这台电脑上。";
+"Then this computer reaches the box without the cable: over the local network, or through the VibeBuddy Relay when you're elsewhere." = "这样不插线也能连到盒子：在同一个网络里走局域网，人在别处时通过 VibeBuddy 中转。";
+"VibeBuddy lives in the tray, or in Omarchy's bar: the buddy's face, with its eyes open while the box is online. To change anything, open Settings from there, or run VibeBuddy again." = "VibeBuddy 待在托盘里，或者 Omarchy 的状态栏上：图标是小伙伴的脸，盒子在线时睁着眼。想改什么设置，从那里打开设置，或者再运行一次 VibeBuddy。";

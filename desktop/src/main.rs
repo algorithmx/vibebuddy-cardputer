@@ -81,6 +81,8 @@ enum Message {
     TrayHostCheck,
     ThemeTick,
     OpenSettings,
+    /// A page of the first-run guide, or (None) leave it for the tabs.
+    Guide(Option<usize>),
     WindowClosed(window::Id),
     Tab(Tab),
     NotifyLink(bool),
@@ -171,6 +173,8 @@ struct App {
     theme_stamp: Option<SystemTime>,
     settings: Option<window::Id>,
     tab: Tab,
+    /// The first-run guide's page while it shows in place of the tabs.
+    guide: Option<usize>,
     /// The slider's position while it is being dragged; the box's own value otherwise.
     volume: Option<u8>,
     /// The last screen grabbed from the box, as PNG, and whether a grab is under way.
@@ -234,6 +238,7 @@ impl App {
             theme_stamp: theme::stamp(),
             settings: None,
             tab: Tab::General,
+            guide: None,
             volume: None,
             screenshot: None,
             screenshot_busy: false,
@@ -283,7 +288,10 @@ impl App {
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|look| character::look_frames(&look).map(|frames| (look, frames.iter().map(|frame| handle(frame, 2)).collect())));
         let restarted = std::env::args().any(|arg| arg == RESTARTED || arg == SETTINGS);
-        let open = first_launch() || restarted || !cfg!(target_os = "linux");
+        let first = first_launch();
+        // The install script connected the agents and set up the start at login; the guide is for what it couldn't.
+        app.guide = (first && cfg!(target_os = "linux")).then_some(0);
+        let open = first || restarted || !cfg!(target_os = "linux");
         let task = if open { Task::done(Message::OpenSettings) } else { Task::none() };
         (app, task)
     }
@@ -399,6 +407,7 @@ impl App {
                     self.notice = None;
                 }
             }
+            Message::Guide(page) => self.guide = page,
             Message::Tab(tab) => {
                 self.tab = tab;
                 // Agents can be installed or set up behind the app's back; look again whenever the tab opens.
@@ -693,6 +702,9 @@ impl App {
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
+        if let Some(page) = self.guide {
+            return self.guide(page);
+        }
         let tabs = [
             (Tab::General, tr("General", &[])),
             (Tab::Sound, tr("Character", &[])),
@@ -720,6 +732,93 @@ impl App {
             .push(notice)
             .spacing(16)
             .padding(20);
+        container(content).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    /// First run on Linux: what the install script couldn't do. It already connected the agents and set up the start
+    /// at login, so the guide is the Mac's without those pages: find the box, pick a character, put the box on Wi-Fi.
+    fn guide(&self, page: usize) -> Element<'_, Message> {
+        const LAST: usize = 4;
+        let titles = [tr("Welcome", &[]), tr("Find the box", &[]), tr("Pick a character", &[]), tr("Wi-Fi", &[]), tr("Done", &[])];
+        let steps = row(titles.into_iter().enumerate().map(|(index, title)| {
+            let title = text(title).size(13);
+            if index == page { title.into() } else { title.style(text::secondary).into() }
+        }))
+        .spacing(16);
+        let device = self.status.as_ref().map(|status| &status.device);
+        let online = device.is_some_and(|device| device.connected);
+        // No paging while flashing: once you page away, nobody is watching the progress.
+        let flashing = self.status.as_ref().and_then(|status| status.operation.as_ref()).is_some_and(|operation| {
+            operation.kind == status::OperationKind::Firmware && operation.running()
+        });
+        let body: Element<'_, Message> = match page {
+            0 => column![
+                text(tr("VibeBuddy turns what your coding agents are doing into pictures and sounds on the box.", &[])).size(18),
+                text(tr(
+                    "The install script has connected your agents and set VibeBuddy to start when you log in. Next: find the box, pick a character, and put the box on Wi-Fi. Everything can be changed or skipped.",
+                    &[]
+                )),
+            ]
+            .spacing(10)
+            .into(),
+            1 => scrollable(
+                column![text(tr("Connect the box to this computer with a USB cable.", &[])).size(18), self.box_section()]
+                    .push(online.then(|| {
+                        row![
+                            button(text(tr("Make it blink", &[]))).on_press(Message::Identify),
+                            text(tr("If the backlight flashes, that's the one.", &[])).size(13),
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center)
+                    }))
+                    .spacing(12)
+                    .padding(iced::Padding::ZERO.right(16)),
+            )
+            .into(),
+            2 => column![text(tr("Pick a character.", &[])).size(18), self.sound()].spacing(12).into(),
+            3 => scrollable(
+                column![
+                    text(tr("Put the box on Wi-Fi?", &[])).size(18),
+                    text(tr(
+                        "Then this computer reaches the box without the cable: over the local network, or through the VibeBuddy Relay when you're elsewhere.",
+                        &[]
+                    )),
+                ]
+                .push(match self.wifi_section() {
+                    Some(wifi) if !device.is_some_and(|device| device.network) => Element::from(wifi),
+                    _ => text(tr("Plug in the box to set its network. You can also do it later on the Device tab in Settings.", &[])).size(13).into(),
+                })
+                .spacing(12)
+                    .padding(iced::Padding::ZERO.right(16)),
+            )
+            .into(),
+            _ => column![
+                text(tr("All set.", &[])).size(18),
+                text(tr(
+                    "VibeBuddy lives in the tray, or in Omarchy's bar: the buddy's face, with its eyes open while the box is online. To change anything, open Settings from there, or run VibeBuddy again.",
+                    &[]
+                )),
+            ]
+            .spacing(10)
+            .into(),
+        };
+        let buttons = row![]
+            .push((page > 0 && page < LAST).then(|| button(text(tr("Back", &[]))).style(button::secondary).on_press(Message::Guide(Some(page - 1)))))
+            .push(space::horizontal())
+            .push((page > 0 && page < LAST).then(|| {
+                button(text(tr("Skip", &[]))).style(button::secondary).on_press_maybe((!flashing).then_some(Message::Guide(Some(page + 1))))
+            }))
+            .push(if page < LAST {
+                button(text(tr("Next", &[]))).on_press_maybe((!flashing).then_some(Message::Guide(Some(page + 1))))
+            } else {
+                button(text(tr("Get started", &[]))).on_press(Message::Guide(None))
+            })
+            .spacing(8);
+        let notice = self.notice.as_ref().map(|notice| match notice {
+            Ok(message) => text(message.clone()).size(13),
+            Err(error) => text(error.clone()).size(13).style(text::danger),
+        });
+        let content = column![steps, container(body).height(Length::Fill)].push(notice).push(buttons).spacing(16).padding(20);
         container(content).width(Length::Fill).height(Length::Fill).into()
     }
 
@@ -772,16 +871,6 @@ impl App {
                     .label(tr("Reach the box through the VibeBuddy Relay when it's away from this computer", &[]))
                     .on_toggle_maybe(self.status.is_some().then_some(Message::Relay)),
             )
-            // Development builds use the staging Relay and releases production; the box follows the computer on its cable.
-            .push(self.status.as_ref().and_then(|status| {
-                let device = &status.device;
-                let server = device.relay_server.as_deref()?;
-                let mut lines = column![text(tr("Relay: %@", &[&status::relay_host(server)])).size(13)];
-                if let Some(other) = device.box_relay.as_deref().filter(|other| *other != server) {
-                    lines = lines.push(text(tr("The box uses %@ until it's plugged into this computer.", &[&status::relay_host(other)])).size(13));
-                }
-                Some(lines)
-            }))
             .push(
                 toggler(check)
                     .label(tr("Check for updates", &[]))
@@ -1094,7 +1183,9 @@ impl App {
         scrollable(page).into()
     }
 
-    fn device(&self) -> Element<'_, Message> {
+    /// Where the box is and what it runs: the link, help finding it, and firmware to flash. The Device tab and the
+    /// first-run guide's Find the box page both show it.
+    fn box_section(&self) -> iced::widget::Column<'_, Message> {
         let device = self.status.as_ref().map(|status| &status.device);
         let link = match device {
             None => tr("daemon isn't running", &[]),
@@ -1269,6 +1360,41 @@ impl App {
             ]
             .spacing(4)
         });
+        // Another computer has the box (ADR-0011): say who, and offer to take it unless it's on their cable.
+        let busy_row = device.filter(|_| !online).and_then(|device| device.busy.as_ref()).map(|busy| {
+            let owner = if busy.owner.is_empty() { tr("another computer", &[]) } else { busy.owner.clone() };
+            if busy.reason == "usb" {
+                row![text(tr("The box is plugged into %@.", &[&owner])).size(13)]
+            } else {
+                row![
+                    text(tr("The box is with %@.", &[&owner])).size(13),
+                    space::horizontal(),
+                    button(text(tr("Take over", &[]))).on_press(Message::TakeOver),
+                ]
+                .spacing(12)
+            }
+        });
+        column![row![text(tr("Link", &[])).width(140), text(link)].spacing(12)]
+            .push(busy_row)
+            .push(pin)
+            .push(choice)
+            .push(not_found)
+            .push(row![text(tr("Box firmware", &[])).width(140), text(firmware)].spacing(12))
+            .push(row![text(tr("Latest firmware", &[])).width(140), text(latest)].spacing(12))
+            .push(device.filter(|_| online).and_then(|device| device.unsupported_board.as_ref()).map(|board| {
+                text(tr("This is a %@ board, which released firmware doesn't run on, so no update is offered.", &[board])).size(13)
+            }))
+            .push(update)
+            .push(unavailable)
+            .push(flashing)
+            .push(from_file)
+            .spacing(12)
+    }
+
+    fn device(&self) -> Element<'_, Message> {
+        let device = self.status.as_ref().map(|status| &status.device);
+        let online = device.is_some_and(|device| device.connected);
+        let busy = self.status.as_ref().and_then(|status| status.operation.as_ref()).is_some_and(status::Operation::running);
         // The computers the box is paired with (ADR-0012). Every computer it's plugged into pairs on its own, so this
         // one has no Remove: it would only pair again.
         let paired = device.filter(|device| online && device.box_key.is_some()).map(|device| {
@@ -1292,9 +1418,65 @@ impl App {
                 )
                 .spacing(6)
         });
+        // The frame is dark whatever the theme, so its text is light: in a light theme the theme's own text color
+        // vanished there, and a grab in progress looked like a button that did nothing.
+        let on_frame = |label: String| text(label).size(13).color(iced::Color::from_rgb8(0xd0, 0xd0, 0xd0));
+        let screen: Element<'_, Message> = match (&self.screenshot, self.screenshot_busy) {
+            (_, true) => on_frame(tr("Refreshing…", &[])).into(),
+            // Nearest-neighbour keeps the box's pixels crisp when scaled up.
+            (Some((_, handle)), false) => image(handle.clone())
+                .filter_method(image::FilterMethod::Nearest)
+                .width(Length::Fill)
+                .into(),
+            (None, false) => on_frame(tr("Click Refresh to see what the box is showing", &[])).into(),
+        };
+        // The tab outgrew the window: it scrolls, like the Character tab.
+        scrollable(
+            self.box_section()
+                .push(self.wifi_section())
+                .push(paired)
+                .push(column![
+                    // Separately distributed firmware (VibeBuddy-firmware-*.zip on Releases) comes in here.
+                    row![
+                        button(text(tr("Flash from file…", &[])))
+                            .on_press_maybe((online && !busy).then_some(Message::FlashFromFile)),
+                        button(text(tr("Make the box blink", &[])))
+                            .on_press_maybe((online && !busy).then_some(Message::Identify)),
+                    ]
+                    .spacing(8),
+                    row![
+                        text(tr("Box screen", &[])),
+                        space::horizontal(),
+                        button(text(tr("Refresh", &[])))
+                            .on_press_maybe((online && !self.screenshot_busy).then_some(Message::TakeScreenshot)),
+                        button(text(tr("Save image", &[])))
+                            .style(button::secondary)
+                            .on_press_maybe(self.screenshot.is_some().then_some(Message::SaveScreenshot)),
+                    ]
+                    .spacing(8),
+                    // A fixed height: the tab scrolls, and a scrolled column has no height left to fill.
+                    container(screen)
+                        .padding(4)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fixed(260.0))
+                        .style(|_| container::background(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
+                ]
+                .spacing(12))
+                .spacing(12)
+                // Room for the scroll bar, which otherwise covers the ends of the lines.
+                .padding(iced::Padding::ZERO.right(16)),
+        )
+        .into()
+    }
+
+    /// The Wi-Fi network the box joins; None until a box that can pair is on the cable or the network.
+    fn wifi_section(&self) -> Option<iced::widget::Column<'_, Message>> {
+        let device = self.status.as_ref().map(|status| &status.device);
+        let online = device.is_some_and(|device| device.connected);
+        let busy = self.status.as_ref().and_then(|status| status.operation.as_ref()).is_some_and(status::Operation::running);
         // The Wi-Fi network the box joins, so it can be reached without the cable (ADR-0012). Set over the cable only;
         // the password goes to the box and is kept nowhere else, so it is never shown again.
-        let wifi = device.filter(|device| online && device.box_key.is_some()).map(|device| {
+        device.filter(|device| online && device.box_key.is_some()).map(|device| {
             let network = device.wifi_network.clone().unwrap_or_else(|| tr("Not set", &[]));
             let mut wifi = column![
                 text(tr("Wi-Fi", &[])),
@@ -1331,78 +1513,7 @@ impl App {
                     );
             }
             wifi.push(text(tr("With Wi-Fi, a paired computer on the same network can drive the box without the cable.", &[])).size(13))
-        });
-        // The frame is dark whatever the theme, so its text is light: in a light theme the theme's own text color
-        // vanished there, and a grab in progress looked like a button that did nothing.
-        let on_frame = |label: String| text(label).size(13).color(iced::Color::from_rgb8(0xd0, 0xd0, 0xd0));
-        let screen: Element<'_, Message> = match (&self.screenshot, self.screenshot_busy) {
-            (_, true) => on_frame(tr("Refreshing…", &[])).into(),
-            // Nearest-neighbour keeps the box's pixels crisp when scaled up.
-            (Some((_, handle)), false) => image(handle.clone())
-                .filter_method(image::FilterMethod::Nearest)
-                .width(Length::Fill)
-                .into(),
-            (None, false) => on_frame(tr("Click Refresh to see what the box is showing", &[])).into(),
-        };
-        // Another computer has the box (ADR-0011): say who, and offer to take it unless it's on their cable.
-        let busy_row = device.filter(|_| !online).and_then(|device| device.busy.as_ref()).map(|busy| {
-            let owner = if busy.owner.is_empty() { tr("another computer", &[]) } else { busy.owner.clone() };
-            if busy.reason == "usb" {
-                row![text(tr("The box is plugged into %@.", &[&owner])).size(13)]
-            } else {
-                row![
-                    text(tr("The box is with %@.", &[&owner])).size(13),
-                    space::horizontal(),
-                    button(text(tr("Take over", &[]))).on_press(Message::TakeOver),
-                ]
-                .spacing(12)
-            }
-        });
-        column![row![text(tr("Link", &[])).width(140), text(link)].spacing(12)]
-            .push(busy_row)
-            .push(pin)
-            .push(choice)
-            .push(not_found)
-            .push(row![text(tr("Box firmware", &[])).width(140), text(firmware)].spacing(12))
-            .push(row![text(tr("Latest firmware", &[])).width(140), text(latest)].spacing(12))
-            .push(device.filter(|_| online).and_then(|device| device.unsupported_board.as_ref()).map(|board| {
-                text(tr("This is a %@ board, which released firmware doesn't run on, so no update is offered.", &[board])).size(13)
-            }))
-            .push(update)
-            .push(unavailable)
-            .push(flashing)
-            .push(from_file)
-            .push(wifi)
-            .push(paired)
-            .push(column![
-                // Separately distributed firmware (VibeBuddy-firmware-*.zip on Releases) comes in here.
-                row![
-                    button(text(tr("Flash from file…", &[])))
-                        .on_press_maybe((online && !busy).then_some(Message::FlashFromFile)),
-                    button(text(tr("Make the box blink", &[])))
-                        .on_press_maybe((online && !busy).then_some(Message::Identify)),
-                ]
-                .spacing(8),
-                row![
-                    text(tr("Box screen", &[])),
-                    space::horizontal(),
-                    button(text(tr("Refresh", &[])))
-                        .on_press_maybe((online && !self.screenshot_busy).then_some(Message::TakeScreenshot)),
-                    button(text(tr("Save image", &[])))
-                        .style(button::secondary)
-                        .on_press_maybe(self.screenshot.is_some().then_some(Message::SaveScreenshot)),
-                ]
-                .spacing(8),
-                container(screen)
-                    .padding(4)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center(Length::Fill)
-                    .style(|_| container::background(iced::Color::from_rgb8(0x16, 0x16, 0x16))),
-            ]
-            .spacing(12))
-            .spacing(12)
-            .into()
+        })
     }
 
     fn advanced(&self) -> Element<'_, Message> {
