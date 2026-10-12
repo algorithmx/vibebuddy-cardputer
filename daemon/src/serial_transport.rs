@@ -806,6 +806,20 @@ I (911) muse: board: ALIENTEK ATK-DNESP32S3-BOX\r\n";
         assert!(!is_esp_idf_app_log("I (x) muse: not a tick count"));
     }
 
+    /// Our box booting the OTA layout (ADR-0013), captured on a box on 2026-10-12: the ESP-IDF v6.0.1
+    /// bootloader with rollback logs its partition table and image segments before our first line.
+    #[test]
+    fn our_rollback_bootloader_does_not_pass_for_other_firmware() {
+        let boot = include_str!("fixtures/box-boot-ota-layout.txt");
+        let mut firmware = Firmware::Listening { since: Instant::now() };
+        for line in boot.lines() {
+            assert!(!is_esp_idf_app_log(line), "taken for another firmware's log: {line}");
+            firmware = firmware.after_line(line, Instant::now());
+            assert_ne!(firmware, Firmware::Foreign, "after {line}");
+        }
+        assert_eq!(firmware, Firmware::Ours);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_box_running_muse_is_written_nothing_not_even_hello() {
         let mut session = connected().await;
