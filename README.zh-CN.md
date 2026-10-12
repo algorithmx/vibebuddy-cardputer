@@ -53,9 +53,9 @@ VibeBuddy 是给 AI 编程 Agent 配的桌面宠物。它住在键盘旁一个�
 1. 用 Homebrew 安装：`brew install --cask second-state/tap/vibebuddy`。也可以从[最新 Release](https://github.com/second-state/vibebuddy/releases/latest) 下载 `VibeBuddy-<版本>-arm64.dmg`，把 VibeBuddy 拖进「应用程序」。两种方式装好后，App 都会自己更新。
 2. 把盒子插上 Mac。
 3. 打开 VibeBuddy，首次启动的引导会带你：
-   - 找到盒子（它会眨眼，确认是这一台）；
-   - 接入 Codex 与 Claude Code（写 Hook 配置前先展示改动）；
-   - 挑一个播报音色写进盒子；
+   - 找到盒子（它会眨眼，确认是这一台），有新固件的话顺手升级；
+   - 接入 Agent：Codex、Claude Code、OpenCode、GitHub Copilot CLI 和 Pi（写 Hook 配置前先展示改动）；
+   - 挑一个角色写进盒子（默认的机器人排在第一个）；
    - 设置登录时启动。
 
 之后 VibeBuddy 住在菜单栏，随时再打开一次 App 就能调出设置：图标告诉你盒子在不在线、什么模式、今天干了多少。设置窗有五页：通用（含界面语言）、角色（小助手是谁，以及音量）、接入、设备（固件更新、截图）、高级。固件单独发布：有 App 能运行的新固件时，VibeBuddy 会自动下载，设置 → 设备会提示更新盒子，由你确认。
@@ -225,7 +225,13 @@ Mac 端是一个菜单栏 App，它把 `vibebuddyd` 与 `vibebuddy-hook` 带在�
 just install    # 装包、装进 /Applications 并启动
 ```
 
-App 用 SwiftPM 构建，只需要命令行工具；`swift run --package-path app SelfTest` 跑视图模型的自检。
+App 用 SwiftPM 构建，只需要命令行工具。打包时还要用 `cargo-about` 收集第三方许可证，先装一次和 CI 相同的版本，否则构建会停在许可证那一步：
+
+```bash
+cargo install cargo-about --version 0.9.2 --locked --features cli
+```
+
+`swift run --package-path app SelfTest` 跑视图模型的自检。
 
 ### daemon
 
@@ -252,7 +258,7 @@ daemon 平时由 App 看管。没有 App 的开发机可以用 [`packaging/com.v
 - [`release-firmware`](.github/workflows/release-firmware.yml) 在 Linux 上构建固件。打 `firmware-vX.Y.Z` 标签会发一个单独的 Release（不标为最新版），里面是 `VibeBuddy-firmware-vX.Y.Z.zip`：固件三件套、`build.txt`、`version.txt` 和固件自己的许可证声明。daemon 下载的就是这个 zip，任何人也可以在设置 → 设备「从文件刷入…」里选它。标签必须与 `firmware-rs/device/Cargo.toml` 的 `version` 一致。
 - 固件发版前先写 `docs/releases/firmware-vX.Y.Z.md`：开头用 front matter 写明它能配合的最低 App 版本（两行 `---` 之间写 `min_app: 0.4.0`），然后写它做了什么。`just release-firmware 0.3.3` 检查那份文件，改版本号，提交、打标签、推送。
 - App 和固件一起发时，先把两边的发布说明都提交，再打任何一个标签。每次发布的清单任务都检出自己的标签，并且要求每个已发布的 release 都有说明；固件 Release 的说明若晚于 App 标签提交，App 的清单任务就会失败（v0.4.1 就是这样；从 main 手动重跑 `update-manifest` 即可恢复）。
-- Mac 出 arm64，Linux 出 x86_64。发布后怎么更新 AUR 包，见 `packaging/aur/README.md`。[second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) 里的 Homebrew cask 会在一小时内自动跟上新版本。
+- Mac 出 arm64，Linux 出 x86_64。AUR 包还没上架（见上文）：`packaging/aur/` 里的打包文件还停在 0.3.2，上架之前发布后不用管它。[second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) 里的 Homebrew cask 会在一小时内自动跟上新版本。
 
 仓库配齐五个签名 secrets 后用 Developer ID 签名并公证，下载即可打开；没配时退回 ad-hoc 签名，首次打开要在「隐私与安全性」里放行。secrets 用 [`tools/setup-release-signing.sh`](tools/setup-release-signing.sh) 配：它带着走完申请证书、打包 p12、生成 App 专用密码，并逐项验证后写进 GitHub。
 
