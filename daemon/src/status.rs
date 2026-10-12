@@ -175,7 +175,17 @@ impl DeviceState {
                     self.foreign_firmware = false;
                     self.firmware_build = Some(build.trim().to_owned());
                 } else if let Some(key) = line.strip_prefix(BOX_KEY_PREFIX) {
-                    self.box_key = Some(key.trim().to_owned());
+                    let key = key.trim();
+                    // Another key on the same port: the box made itself a new identity and restarted without the
+                    // port closing (#122). What the old identity had (pairings, Wi-Fi) is gone with it; the box
+                    // reports what it has again.
+                    if self.box_key.as_deref().is_some_and(|old| old != key) {
+                        self.paired = false;
+                        self.paired_computers.clear();
+                        self.wifi_network = None;
+                        self.wifi_address = None;
+                    }
+                    self.box_key = Some(key.to_owned());
                 } else if line.starts_with("PAIRED ") {
                     self.paired = true;
                 } else if let Some(url) = line.strip_prefix("RELAY URL ") {
@@ -396,6 +406,18 @@ mod tests {
         assert_eq!(seen, [("ByteTrade", -49), ("ByteTrade Guest", -61)], "hidden networks are left out");
         state.apply(&line("WIFI SEEN 0"));
         assert!(state.wifi_seen.is_empty(), "a new scan starts over");
+    }
+
+    #[test]
+    fn a_new_identity_drops_what_the_old_one_had() {
+        let mut state = DeviceState::default();
+        state.apply(&line("BOX KEY 1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE"));
+        state.apply(&line("WIFI NETWORK Home"));
+        state.apply(&line("WIFI ADDRESS 192.168.1.23"));
+        state.apply(&line("BOX KEY 1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE"));
+        assert_eq!(state.wifi_network.as_deref(), Some("Home"), "the same key again changes nothing");
+        state.apply(&line("BOX KEY pm3f5yT3yi4s2P90TalP1NcUZD3xBTfETdlii-KnvWM"));
+        assert_eq!((state.wifi_network, state.wifi_address), (None, None));
     }
 
     #[test]

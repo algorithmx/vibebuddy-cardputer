@@ -144,6 +144,8 @@ struct DeviceBoard {
     /// A computer is linked through the Relay, and the box's output goes there as whole lines.
     relay_peer: bool,
     relay_lines: RelayLines,
+    /// The firmware asked to restart; the main loop closes the sockets first.
+    restart: bool,
 }
 
 impl DeviceBoard {
@@ -197,6 +199,17 @@ impl Board for DeviceBoard {
 
     fn lan_peer(&mut self, conn: Option<u32>) {
         self.lan_peer = conn;
+    }
+
+    // With the radio on, the RNG draws on real noise.
+    fn random(&mut self) -> Option<[u8; 32]> {
+        let mut bytes = [0u8; 32];
+        esp_hal::rng::Rng::new().read(&mut bytes);
+        Some(bytes)
+    }
+
+    fn restart(&mut self) {
+        self.restart = true;
     }
 
     fn flash(&mut self) -> &mut dyn Flash {
@@ -360,6 +373,7 @@ async fn main(spawner: Spawner) -> ! {
         has_codec: false,
         lan_peer: None,
         relay_peer: false,
+        restart: false,
         relay_lines: RelayLines::default(),
     };
 
@@ -465,6 +479,15 @@ async fn main(spawner: Spawner) -> ! {
             net::CREDENTIALS.signal(wifi_credentials(&firmware));
         }
         firmware.poll(&mut board);
+        // Before restarting, close the Relay socket and the network connections so the computers and the
+        // Relay see the box go at once, rather than after their silence timeouts; a new identity has a new
+        // box-id, so nothing would replace the old one's socket (#122). The wait also lets the last line out.
+        if board.restart {
+            relay::STOP.signal(());
+            net::close_all();
+            Timer::after_millis(500).await;
+            esp_hal::system::software_reset();
+        }
         // This wait is the key sampling period: too long would miss quick taps.
         Timer::after_millis(10).await;
     }

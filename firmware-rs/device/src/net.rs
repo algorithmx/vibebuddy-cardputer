@@ -65,6 +65,13 @@ pub fn send(conn: u32, bytes: &[u8]) {
     }
 }
 
+/// Closes every connection, as before a restart.
+pub fn close_all() {
+    for signal in &CLOSE {
+        signal.signal(());
+    }
+}
+
 pub fn close(conn: u32) {
     if let Some(slot) = slot_of(conn) {
         CLOSE[slot].signal(());
