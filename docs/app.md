@@ -72,8 +72,11 @@ Five tabs, styled like System Settings: tabs across the top, grouped forms, syst
 2. Find the box: prompts you to plug in the box, lists the ports it finds, and once connected has the box blink to confirm. A box that left the factory on older firmware is offered the newer one right here, with the same confirmation as the Device tab; a box on other firmware is offered VibeBuddy firmware. Can be skipped, after which the menu bar keeps showing "Box not found".
 3. Connect agents: detects Codex, Claude Code, OpenCode, GitHub Copilot CLI and Pi, writes the hooks in one click, and prompts you to trust them in Codex's `/hooks`. You can choose "Not now", but you can't skip this page.
 4. Pick a character: preview and write it to the box; the default robot comes first. Can be skipped.
-5. Launch at login.
-6. Done.
+5. Wi-Fi: put the box on a network, so this Mac reaches it without the cable (ADR-0012). Needs the box on the cable; can be skipped.
+6. Launch at login.
+7. Done.
+
+On Linux the install script connects the agents and sets up the start at login, so the desktop app's first launch shows only Welcome, Find the box, Pick a character, Wi-Fi and Done, in its settings window.
 
 Finding the box comes before connecting agents: seeing the box come alive first, before configuring anything else, builds confidence.
 
