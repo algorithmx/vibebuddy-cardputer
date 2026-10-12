@@ -81,6 +81,8 @@ struct FakeBoard {
     lan_sent: Vec<(u32, String)>,
     lan_closed: Vec<u32>,
     lan_peer: Option<u32>,
+    /// The linked network computer's buffer is full.
+    peer_full: bool,
     /// Restarts asked for.
     restarts: usize,
 }
@@ -104,6 +106,7 @@ impl FakeBoard {
             lan_sent: Vec::new(),
             lan_closed: Vec::new(),
             lan_peer: None,
+            peer_full: false,
             restarts: 0,
         }
     }
@@ -141,6 +144,9 @@ impl Board for FakeBoard {
     }
     fn lan_peer(&mut self, conn: Option<u32>) {
         self.lan_peer = conn;
+    }
+    fn peer_can_take(&self, _bytes: usize) -> bool {
+        !self.peer_full
     }
     fn random(&mut self) -> Option<[u8; 32]> {
         Some([0x5a; 32])
@@ -495,6 +501,60 @@ fn a_screenshot_is_run_length_encoded() {
         .map(|run| run.split(':').nth(1).unwrap().parse::<usize>().unwrap())
         .sum();
     assert_eq!(pixels, 320 * 240);
+}
+
+/// Polls every 10 ms until `SHOT END`, returning each `SHOT` line with the time it went out.
+fn poll_screenshot(firmware: &mut Firmware, board: &mut FakeBoard) -> Vec<(u32, String)> {
+    let mut shot = Vec::new();
+    for _ in 0..20_000 {
+        firmware.poll(board);
+        let now = board.now_ms();
+        shot.extend(board.take_lines().into_iter().filter(|line| line.starts_with("SHOT")).map(|line| (now, line)));
+        if shot.last().is_some_and(|(_, line)| line == "SHOT END") {
+            return shot;
+        }
+        board.advance(10);
+    }
+    panic!("the screenshot never finished: {} lines", shot.len());
+}
+
+/// The rgb565 pixels the `SHOT` lines between BEGIN and END describe.
+fn shot_pixels(shot: &[(u32, String)]) -> Vec<u16> {
+    let mut pixels = Vec::new();
+    for (_, line) in &shot[1..shot.len() - 1] {
+        for run in line.split(' ').skip(1) {
+            let (color, count) = run.split_once(':').unwrap();
+            let color = u16::from_str_radix(color, 16).unwrap();
+            pixels.extend(std::iter::repeat_n(color, count.parse().unwrap()));
+        }
+    }
+    pixels
+}
+
+#[test]
+fn a_screenshot_over_the_relay_is_sent_a_line_at_a_time() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    firmware.relay_line(&mut board, br#"{"version":1,"event":"device.screenshot"}"#);
+    assert!(!board.take_lines().iter().any(|line| line.starts_with("SHOT")), "nothing at once");
+    let shot = poll_screenshot(&mut firmware, &mut board);
+    assert_eq!(shot[0].1, "SHOT BEGIN 320x240 BACKLIGHT ON");
+    assert_eq!(shot_pixels(&shot).len(), 320 * 240);
+}
+
+#[test]
+fn a_screenshot_waits_while_the_network_cannot_take_a_whole_line() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    firmware.relay_line(&mut board, br#"{"version":1,"event":"device.screenshot"}"#);
+    board.peer_full = true;
+    for _ in 0..100 {
+        firmware.poll(&mut board);
+        board.advance(10);
+    }
+    assert!(!board.take_lines().iter().any(|line| line.starts_with("SHOT")), "nothing dropped half-way");
+    board.peer_full = false;
+    let shot = poll_screenshot(&mut firmware, &mut board);
+    assert_eq!(shot[0].1, "SHOT BEGIN 320x240 BACKLIGHT ON");
+    assert_eq!(shot_pixels(&shot).len(), 320 * 240);
 }
 
 #[test]
@@ -872,6 +932,27 @@ mod lan {
         assert_eq!(board.lan_peer, Some(1), "the box's output goes to it");
         firmware.lan_received(&mut board, 1, b"{\"version\":1,\"event\":\"device.hello\"}\n");
         assert!(board.take_lines().contains(&"MODE DUTY".to_owned()));
+    }
+
+    #[test]
+    fn a_screenshot_over_the_network_is_the_frame_when_asked_paced_for_the_relay() {
+        let (mut firmware, mut board) = paired_box();
+        link_up(&mut firmware, &mut board, 1);
+        // No two neighbouring pixels alike: the most runs a frame can have.
+        let pattern: Vec<u16> = (0..320 * 240).map(|index| (index % 7) as u16 * 0x1111).collect();
+        for (index, color) in pattern.iter().enumerate() {
+            board.frame[index * 2..index * 2 + 2].copy_from_slice(&color.to_be_bytes());
+        }
+        firmware.lan_received(&mut board, 1, b"{\"version\":1,\"event\":\"device.screenshot\"}\n");
+        assert!(!board.take_lines().iter().any(|line| line.starts_with("SHOT")), "nothing at once");
+        // The screen moves on while the lines go out; the picture is the one asked for.
+        board.frame.fill(0xff);
+        let shot = poll_screenshot(&mut firmware, &mut board);
+        assert_eq!(shot_pixels(&shot), pattern);
+        // Every line is one Relay message: well under its 8 KiB, and the box's 4 KB network pipe.
+        assert!(shot.iter().all(|(_, line)| line.len() < 2048), "longest {}", shot.iter().map(|(_, line)| line.len()).max().unwrap());
+        // Under the Relay's 50 messages a second, burst or not.
+        assert!(shot.windows(2).all(|pair| pair[1].0 - pair[0].0 >= 30));
     }
 
     #[test]

@@ -61,8 +61,20 @@ fn slot_of(conn: u32) -> Option<usize> {
 /// Queues bytes for a connection; dropped when it can't take more, like the serial port's output.
 pub fn send(conn: u32, bytes: &[u8]) {
     if let Some(slot) = slot_of(conn) {
-        let _ = OUT[slot].try_write(bytes);
+        // One try_write stops at the end of the pipe's ring even with room left past it.
+        let mut rest = bytes;
+        while let Ok(count) = OUT[slot].try_write(rest) {
+            rest = &rest[count..];
+            if rest.is_empty() {
+                break;
+            }
+        }
     }
+}
+
+/// How many bytes [`send`] can take for a connection now; unlimited for one that is gone, since it drops them anyway.
+pub fn room(conn: u32) -> usize {
+    slot_of(conn).map_or(usize::MAX, |slot| OUT[slot].free_capacity())
 }
 
 /// Closes every connection, as before a restart.

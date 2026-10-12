@@ -201,6 +201,11 @@ impl Board for DeviceBoard {
         self.lan_peer = conn;
     }
 
+    fn peer_can_take(&self, bytes: usize) -> bool {
+        // A Relay slot holds a line of any length; leave a couple for the box's other messages.
+        self.lan_peer.is_none_or(|conn| net::room(conn) >= bytes) && (!self.relay_peer || relay::OUT.free_capacity() > 2)
+    }
+
     // With the radio on, the RNG draws on real noise.
     fn random(&mut self) -> Option<[u8; 32]> {
         let mut bytes = [0u8; 32];
