@@ -106,6 +106,7 @@ enum Message {
     WifiPassword(String),
     JoinWifi,
     ForgetWifi,
+    ScanWifi,
     Identify,
     UseVoice(&'static str),
     /// A form of address for a language, or none.
@@ -499,6 +500,7 @@ impl App {
                 return Task::perform(client::set_wifi(self.wifi_ssid.clone(), password), Message::Done);
             }
             Message::ForgetWifi => return Task::perform(client::forget_wifi(), Message::Done),
+            Message::ScanWifi => return Task::perform(client::scan_wifi(), Message::Done),
             Message::Identify => return Task::perform(client::identify(), Message::Done),
             Message::UseVoice(id) => {
                 let form = assets::language_of(id).and_then(|language| self.characters.address(language)).map(str::to_owned);
@@ -1294,7 +1296,18 @@ impl App {
                 wifi = wifi.push(text(tr("Plug in the cable to change the box's network.", &[])).size(13));
             } else {
                 let valid = !self.wifi_ssid.is_empty() && self.wifi_ssid.len() <= 32 && self.wifi_password.len() <= 63;
+                // Names are case-sensitive, so the box's own scan is the way to pick one; typing stays for hidden networks.
+                let seen = device.wifi_seen.iter().take(8).map(|network| {
+                    let label = format!("{}  {} dBm", network.ssid, network.rssi);
+                    let style = if network.ssid == self.wifi_ssid { button::primary } else { button::secondary };
+                    button(text(label).size(13)).style(style).on_press(Message::WifiSsid(network.ssid.clone())).into()
+                });
                 wifi = wifi
+                    .push(
+                        row![text(tr("Nearby networks", &[])).size(13), space::horizontal(), button(text(tr("Scan", &[]))).style(button::secondary).on_press_maybe((!busy).then_some(Message::ScanWifi))]
+                            .spacing(8),
+                    )
+                    .push(column(seen).spacing(4))
                     .push(text_input(&tr("Network name", &[]), &self.wifi_ssid).on_input(Message::WifiSsid))
                     .push(text_input(&tr("Password", &[]), &self.wifi_password).secure(true).on_input(Message::WifiPassword))
                     .push(

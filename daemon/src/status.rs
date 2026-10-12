@@ -54,6 +54,8 @@ pub struct DeviceState {
     pub wifi_network: Option<String>,
     /// The address the box got on that network.
     pub wifi_address: Option<String>,
+    /// The networks the box heard on its last scan, strongest first, one entry per name.
+    pub wifi_seen: Vec<SeenNetwork>,
     /// Connected, but running other firmware (a factory unit, or Muse on a box that runs it): it's there, not
     /// offline, and the daemon writes it nothing until it resets and reports our build.
     pub foreign_firmware: bool,
@@ -74,6 +76,13 @@ pub struct Busy {
     pub owner: String,
     /// `usb`: it is on that computer's cable, and can't be taken. `linked`: it can be taken over.
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SeenNetwork {
+    pub ssid: String,
+    /// Signal strength in dBm.
+    pub rssi: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -112,6 +121,7 @@ impl DeviceState {
                 self.paired_computers.clear();
                 self.wifi_network = None;
                 self.wifi_address = None;
+                self.wifi_seen.clear();
             }
             DeviceMessage::ConnectedNetwork { address } => {
                 self.apply(&DeviceMessage::Connected { port: address.clone(), bridge: false, usb_serial: None });
@@ -137,6 +147,7 @@ impl DeviceState {
                 self.paired_computers.clear();
                 self.wifi_network = None;
                 self.wifi_address = None;
+                self.wifi_seen.clear();
             }
             DeviceMessage::Disconnected => {
                 self.connected = false;
@@ -166,6 +177,21 @@ impl DeviceState {
                 } else if line.trim() == "WIFI FORGOTTEN" {
                     self.wifi_network = None;
                     self.wifi_address = None;
+                } else if let Some(seen) = line.strip_prefix("WIFI SEEN ") {
+                    // `WIFI SEEN <count>` starts a scan; `WIFI SEEN <rssi> <channel> <ssid>` is one network.
+                    let mut parts = seen.splitn(3, ' ');
+                    match (parts.next().map(str::parse::<i32>), parts.next().map(str::parse::<u8>), parts.next()) {
+                        (Some(Ok(_)), None, None) => self.wifi_seen.clear(),
+                        (Some(Ok(rssi)), Some(Ok(_)), Some(ssid)) if !ssid.trim().is_empty() => {
+                            let ssid = ssid.trim_end().to_owned();
+                            match self.wifi_seen.iter_mut().find(|network| network.ssid == ssid) {
+                                Some(network) => network.rssi = network.rssi.max(rssi),
+                                None => self.wifi_seen.push(SeenNetwork { ssid, rssi }),
+                            }
+                            self.wifi_seen.sort_by_key(|network| std::cmp::Reverse(network.rssi));
+                        }
+                        _ => {}
+                    }
                 } else if let Some(address) = line.strip_prefix("WIFI ADDRESS ") {
                     self.wifi_address = Some(address.trim().to_owned());
                 } else if line.starts_with("PAIRS ") {
@@ -329,6 +355,7 @@ mod tests {
                 paired_computers: Vec::new(),
                 wifi_network: None,
                 wifi_address: None,
+                wifi_seen: Vec::new(),
                 foreign_firmware: false,
                 unsupported_board: None,
                 pin: None,
@@ -347,6 +374,18 @@ mod tests {
         assert!(state.paired);
         state.apply(&DeviceMessage::Connected { port: "/dev/cu.y".to_owned(), bridge: false, usb_serial: None });
         assert_eq!((state.box_key, state.paired), (None, false));
+    }
+
+    #[test]
+    fn a_scan_lists_each_network_once_strongest_first() {
+        let mut state = DeviceState::default();
+        for text in ["WIFI SEEN 4", "WIFI SEEN -61 1 ByteTrade Guest", "WIFI SEEN -49 1 ByteTrade", "WIFI SEEN -68 6 ByteTrade", "WIFI SEEN -70 3 "] {
+            state.apply(&line(text));
+        }
+        let seen: Vec<_> = state.wifi_seen.iter().map(|network| (network.ssid.as_str(), network.rssi)).collect();
+        assert_eq!(seen, [("ByteTrade", -49), ("ByteTrade Guest", -61)], "hidden networks are left out");
+        state.apply(&line("WIFI SEEN 0"));
+        assert!(state.wifi_seen.is_empty(), "a new scan starts over");
     }
 
     #[test]

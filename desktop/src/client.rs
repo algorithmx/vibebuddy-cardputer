@@ -115,6 +115,11 @@ pub async fn set_wifi(ssid: String, password: String) -> Result<(), String> {
     post("/v1/device/wifi", Some(serde_json::json!({ "ssid": ssid, "password": password }))).await
 }
 
+/// The box scans; what it hears arrives in the status as `wifi_seen`.
+pub async fn scan_wifi() -> Result<(), String> {
+    post("/v1/device/wifi/scan", None).await
+}
+
 pub async fn forget_wifi() -> Result<(), String> {
     post("/v1/device/wifi/forget", None).await
 }

@@ -115,6 +115,8 @@ pub struct Firmware {
     remote: bool,
     /// The Wi-Fi network changed and the device layer hasn't picked it up yet.
     wifi_changed: bool,
+    /// The computer on the cable asked which networks the box can hear.
+    scan_requested: bool,
     /// The computer on the cable, once it has paired: what the box reports to the Relay as its USB link.
     cable_key: Option<[u8; 32]>,
     volume: u32,
@@ -232,6 +234,7 @@ impl Firmware {
             lan: Lan::new(),
             remote: false,
             wifi_changed: false,
+            scan_requested: false,
             cable_key: None,
             volume: VOLUME_DEFAULT,
             audio_ready: false,
@@ -427,6 +430,11 @@ impl Firmware {
     /// The network to join, for the device layer.
     pub fn wifi(&self) -> Option<&Wifi> {
         self.link.as_ref().and_then(|(_, link)| link.wifi.as_ref())
+    }
+
+    /// True once after `device.wifi.scan`: the device layer scans and reports `WIFI SEEN` lines.
+    pub fn take_scan_request(&mut self) -> bool {
+        core::mem::take(&mut self.scan_requested)
     }
 
     /// True once after the network was set or forgotten: the device layer should reconnect.
@@ -1078,11 +1086,13 @@ impl Firmware {
             _ if event.starts_with("voice.") => self.handle_voice_event(board, fields, event),
             // Pairing is the computer at the other end of the cable telling the box who it is (ADR-0012).
             // Only over the cable: whoever is at the box decides who may link and which network it joins.
-            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" if self.remote => {
+            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" if self.remote => {
                 Self::write_literal(board, "ERROR cable_only\n");
             }
             "device.pair" | "device.unpair" | "device.pairs" => self.handle_pairing(board, fields, event),
             "device.wifi.set" | "device.wifi.forget" => self.handle_wifi(board, fields, event),
+            // The radio belongs to the device layer, which reports what it hears as `WIFI SEEN` lines.
+            "device.wifi.scan" => self.scan_requested = true,
             // Link self-test: send the received string's length and CRC back to the Mac to check for corrupted serial bytes.
             "device.echo" => {
                 if let Some(data) = string(fields, "data") {

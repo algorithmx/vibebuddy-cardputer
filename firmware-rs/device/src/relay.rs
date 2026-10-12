@@ -39,8 +39,8 @@ const MAX_FRAME: usize = 8 * 1024 + 16;
 
 /// What the Relay task tells the main loop.
 pub enum RelayIn {
-    /// A new socket's challenge nonce: the main loop answers with the box's signed hello.
-    Challenge(String),
+    /// A new socket's number and challenge nonce: the main loop answers with the box's signed hello.
+    Challenge(u32, String),
     /// Any other message, as JSON text.
     Message(String),
     /// The socket is gone.
@@ -50,8 +50,18 @@ pub enum RelayIn {
 }
 
 pub static IN: Channel<CriticalSectionRawMutex, RelayIn, 16> = Channel::new();
-/// Text frames to send, from the main loop.
-pub static OUT: Channel<CriticalSectionRawMutex, String, 32> = Channel::new();
+/// Text frames to send, from the main loop, each with the number of the socket it was meant for.
+/// Frames for an older socket are dropped: a hello signed for its nonce, or data for its computer, sent
+/// first on a new socket fails authentication there (seen on relay-staging, 2026-10-12).
+pub static OUT: Channel<CriticalSectionRawMutex, (u32, String), 32> = Channel::new();
+/// The socket frames are for now; 0 when there is none.
+static SOCKET: AtomicU32 = AtomicU32::new(0);
+static NEXT_SOCKET: AtomicU32 = AtomicU32::new(1);
+
+/// The number to queue a frame with: the socket that is up now.
+pub fn current_socket() -> u32 {
+    SOCKET.load(Ordering::Relaxed)
+}
 /// The box's id, which names its place on the Relay; signalled once at boot.
 pub static BOX_ID: Signal<CriticalSectionRawMutex, String> = Signal::new();
 
@@ -120,7 +130,10 @@ pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
             }
         }
         let started = Instant::now();
-        if let Err(why) = session(stack, &tls, &box_id).await {
+        SOCKET.store(NEXT_SOCKET.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        let result = session(stack, &tls, &box_id).await;
+        SOCKET.store(0, Ordering::Relaxed);
+        if let Err(why) = result {
             line(alloc::format!("RELAY FAILED {why}"));
             if why == UPGRADE {
                 let _ = IN.try_send(RelayIn::Gone);
@@ -221,7 +234,7 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Res
                     let value: serde_json::Value = serde_json::from_str(&text).map_err(|_| "bad json")?;
                     if value["t"] == "challenge" {
                         let nonce = value["nonce"].as_str().unwrap_or_default();
-                        IN.send(RelayIn::Challenge(String::from(nonce))).await;
+                        IN.send(RelayIn::Challenge(current_socket(), String::from(nonce))).await;
                     } else {
                         IN.send(RelayIn::Message(text)).await;
                     }
@@ -239,7 +252,10 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Res
                 heard = Instant::now();
                 input.extend_from_slice(&chunk[..count]);
             }
-            Either3::Second(text) => send_frame(&mut session, FrameType::Text(false), text.as_bytes()).await?,
+            Either3::Second((socket_number, text)) if socket_number == current_socket() => {
+                send_frame(&mut session, FrameType::Text(false), text.as_bytes()).await?;
+            }
+            Either3::Second(_) => {}
             Either3::Third(()) => {
                 if heard.elapsed() >= DEAD_AFTER {
                     return Err("silent");

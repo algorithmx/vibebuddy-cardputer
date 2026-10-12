@@ -43,6 +43,8 @@ pub enum NetEvent {
 }
 
 pub static EVENTS: Channel<CriticalSectionRawMutex, NetEvent, 16> = Channel::new();
+/// The computer on the cable asked for the networks the box can hear.
+pub static SCAN: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// The network to join, or None to leave Wi-Fi; signalled at boot and whenever the user changes it.
 pub static CREDENTIALS: Signal<CriticalSectionRawMutex, Option<(String, String)>> = Signal::new();
 
@@ -107,7 +109,10 @@ async fn connection(mut controller: WifiController<'static>) {
     loop {
         // Wait for a network to join, or a change while not connected.
         if wanted.is_none() {
-            wanted = CREDENTIALS.wait().await;
+            match select(CREDENTIALS.wait(), SCAN.wait()).await {
+                embassy_futures::select::Either::First(next) => wanted = next,
+                embassy_futures::select::Either::Second(()) => report_scan(&mut controller).await,
+            }
             continue;
         }
         let Some((ssid, password)) = wanted.clone() else { continue };
@@ -138,9 +143,17 @@ async fn connection(mut controller: WifiController<'static>) {
         match select(controller.connect_async(), CREDENTIALS.wait()).await {
             embassy_futures::select::Either::First(Ok(_)) => {
                 line(String::from("WIFI CONNECTED"));
-                match select(controller.wait_for_disconnect_async(), CREDENTIALS.wait()).await {
-                    embassy_futures::select::Either::First(_) => line(String::from("WIFI DISCONNECTED")),
-                    embassy_futures::select::Either::Second(next) => {
+                // Scans can run while connected; the station stays on its network.
+                let next = loop {
+                    match select3(controller.wait_for_disconnect_async(), CREDENTIALS.wait(), SCAN.wait()).await {
+                        Either3::First(_) => break None,
+                        Either3::Second(next) => break Some(next),
+                        Either3::Third(()) => report_scan(&mut controller).await,
+                    }
+                };
+                match next {
+                    None => line(String::from("WIFI DISCONNECTED")),
+                    Some(next) => {
                         let _ = controller.disconnect_async().await;
                         wanted = next;
                         if wanted.is_none() {

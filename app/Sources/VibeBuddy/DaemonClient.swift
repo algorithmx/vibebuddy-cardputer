@@ -84,6 +84,12 @@ struct DaemonClient {
         guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Setting Wi-Fi was rejected (\(code))")) }
     }
 
+    /// The box scans; what it hears arrives in the status stream as `wifiSeen`.
+    func scanWifi() async throws {
+        let (code, data) = try await post("/v1/device/wifi/scan", body: Data(), contentType: "application/json")
+        guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Scanning for networks was rejected (\(code))")) }
+    }
+
     func forgetWifi() async throws {
         let (code, data) = try await post("/v1/device/wifi/forget", body: Data(), contentType: "application/json")
         guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Forgetting Wi-Fi was rejected (\(code))")) }
