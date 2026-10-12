@@ -137,7 +137,7 @@ Whenever `vibebuddyd` sees `BOX KEY`, it pairs: its own key lives in `identity` 
 {"version":1,"event":"device.pairs"}
 ```
 
-Replies are diagnostic lines. `device.pair` gets `PAIRED <computer key>`, or `PAIR FULL` once 16 computers are paired. `device.unpair` gets `UNPAIRED <computer key>`. `device.pairs` gets `PAIRS <n>` followed by one `PAIR <computer key> <name>` per computer. A malformed key gets `PAIR INVALID`. Names longer than 32 bytes are cut. None of these is agent activity. When the box's own menu forgets every computer (COMPUTERS, [`device-menu.md`](device-menu.md)), it prints `UNPAIRED ALL`.
+Replies are diagnostic lines. `device.pair` gets `PAIRED <computer key>`, or `PAIR FULL` once 16 computers are paired. `device.unpair` gets `UNPAIRED <computer key>`. `device.pairs` gets `PAIRS <n>` followed by one `PAIR <computer key> <name>` per computer. A malformed key gets `PAIR INVALID`. Names longer than 32 bytes are cut. None of these is agent activity. When the box's own menu forgets every computer (COMPUTERS, [`device-menu.md`](device-menu.md)), it prints `UNPAIRED ALL`. When the menu makes the box a new identity, it prints `NEW IDENTITY <box key>` and restarts; after that it reports the new `BOX KEY`, and the daemon remembers it only from the cable.
 
 After pairing, the daemon asks `device.pairs`, and `/v1/status` reports `device.box_key`, `device.computer_key` (this computer) and `device.paired_computers`. `POST /v1/device/unpair` with `{"key": …}` forgets another computer; this computer is refused, since it pairs again whenever it's plugged in.
 

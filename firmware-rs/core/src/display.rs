@@ -169,6 +169,9 @@ pub struct Display {
     identify_until: Option<u32>,
     identify_next_toggle: u32,
     muted: bool,
+    /// How the box is linked, as an icon in the top left at all times, and `STG` after it while that link goes
+    /// through the staging Relay (docs/device-menu.md). No icon with no link: NO LINK already says so.
+    link: (Option<LinkPath>, bool),
     /// The alarm is ringing: the phase ended and the user hasn't acted yet. Records the phase at the end;
     /// stops as soon as the view changes (start, abandon, skip) or the screen is switched away.
     ring_alarm: bool,
@@ -785,6 +788,7 @@ impl Display {
             identify_until: None,
             identify_next_toggle: 0,
             muted: false,
+            link: (None, false),
             ring_alarm: false,
             ring_alarm_phase: Phase::Focus,
             ring_alarm_shake_frames: 0,
@@ -1107,9 +1111,12 @@ impl Display {
             Some(look) => draw_look_on_duty(canvas, look, state, self.animation_frame, LOOK_CENTER_X + x_offset, status_color),
             None => draw_buddy(canvas, state, self.animation_frame, x_offset, status_color),
         }
-        canvas.draw_text_centered(162, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
+        // The third task card ends at y = 158: the label moves down to keep clear of it.
+        let crowded = self.tasks.len() >= 3;
+        let label_y = if crowded { 168 } else { 162 };
+        canvas.draw_text_centered(label_y, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
         if !self.tasks.is_empty() {
-            canvas.draw_text_centered(195, b"LATEST ON TOP", 1, COLOR_MUTED);
+            canvas.draw_text_centered(if crowded { 198 } else { 195 }, b"LATEST ON TOP", 1, COLOR_MUTED);
         } else if self.state == State::Idle && !self.link_lost {
             // No rotation while the link is lost: a moving screen looks alive, the exact opposite of NO LINK.
             self.draw_idle_line(canvas, scene);
@@ -1145,8 +1152,17 @@ impl Display {
         canvas.fill_rect(0, 0, WIDTH, HEIGHT, COLOR_BACKGROUND);
         canvas.fill_rect(0, 0, WIDTH, 4, status_color);
         canvas.draw_text_centered(12, b"VibeBuddy", 2, COLOR_TEXT);
+        let mut x = 8;
+        if let Some(path) = self.link.0 {
+            draw_icon(&mut canvas, x, 12, path.icon(), COLOR_MUTED);
+            x += ICON_WIDTH * ICON_SCALE + 6;
+        }
+        if self.link.1 {
+            canvas.draw_text(x, 15, b"STG", 1, COLOR_WORKING, 3);
+            x += text_width(b"STG", 1) + 6;
+        }
         if self.muted {
-            canvas.draw_text(8, 15, b"MUTE", 1, COLOR_INPUT, 4);
+            canvas.draw_text(x, 15, b"MUTE", 1, COLOR_INPUT, 4);
         }
         match self.mode {
             Mode::Pomodoro => self.draw_pomodoro_scene(&mut canvas, scene, label, status_color),
@@ -1349,6 +1365,17 @@ impl Display {
         }
     }
 
+    /// The link icon and staging mark in the top left; redraws only on a change.
+    pub fn set_link(&mut self, screen: &mut dyn Screen, scene: &Scene, path: Option<LinkPath>, staging: bool) {
+        if self.link == (path, staging) {
+            return;
+        }
+        self.link = (path, staging);
+        if self.ready {
+            let _ = self.render(screen, scene);
+        }
+    }
+
     /// Redraws immediately. After a key press changes the pomodoro, don't wait for the next animation frame.
     pub fn refresh(&mut self, screen: &mut dyn Screen, scene: &Scene) {
         if self.ready {
@@ -1465,6 +1492,75 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
         x += text_width(key, 1) + 10;
         canvas.draw_text(x, 206, action, 1, COLOR_TEXT, 12);
         x += text_width(action, 1) + 14;
+    }
+}
+
+/// How the box is linked to its computer (USB wins, then the local network, then the Relay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkPath {
+    Usb,
+    Lan,
+    Relay,
+}
+
+impl LinkPath {
+    pub fn label(self) -> &'static [u8] {
+        match self {
+            Self::Usb => b"USB",
+            Self::Lan => b"LAN",
+            Self::Relay => b"RELAY",
+        }
+    }
+
+    /// A plug for the cable, Wi-Fi waves for the local network, a cloud for the Relay.
+    fn icon(self) -> &'static [u16; ICON_HEIGHT] {
+        match self {
+            Self::Usb => &ICON_USB,
+            Self::Lan => &ICON_LAN,
+            Self::Relay => &ICON_RELAY,
+        }
+    }
+}
+
+const ICON_WIDTH: i32 = 12;
+const ICON_HEIGHT: usize = 7;
+const ICON_SCALE: i32 = 2;
+/// One row per entry, the leftmost pixel in bit 11.
+const ICON_USB: [u16; ICON_HEIGHT] = [
+    0b000000111111,
+    0b000000100001,
+    0b111111101101,
+    0b111111100001,
+    0b111111101101,
+    0b000000100001,
+    0b000000111111,
+];
+const ICON_LAN: [u16; ICON_HEIGHT] = [
+    0b001111111100,
+    0b010000000010,
+    0b100011110001,
+    0b000100001000,
+    0b001000000100,
+    0b000001100000,
+    0b000001100000,
+];
+const ICON_RELAY: [u16; ICON_HEIGHT] = [
+    0b000001110000,
+    0b001110001000,
+    0b010000000110,
+    0b100000000001,
+    0b100000000001,
+    0b100000000001,
+    0b011111111110,
+];
+
+fn draw_icon(canvas: &mut Canvas, x: i32, y: i32, rows: &[u16; ICON_HEIGHT], color: u16) {
+    for (row, bits) in rows.iter().enumerate() {
+        for column in 0..ICON_WIDTH {
+            if bits >> (ICON_WIDTH - 1 - column) & 1 == 1 {
+                canvas.fill_rect(x + column * ICON_SCALE, y + row as i32 * ICON_SCALE, ICON_SCALE, ICON_SCALE, color);
+            }
+        }
     }
 }
 

@@ -19,17 +19,34 @@ pub enum Row {
     StopPhase,
     Volume,
     Mute,
-    /// The computers paired with the box; K0 asks whether to forget them all.
+    /// Who trusts the box: K0 opens FORGET ALL and NEW IDENTITY.
     Computers,
+    /// How the box is linked, its Wi-Fi and its Relay.
+    Network,
     Status,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     List,
+    Network,
     Status,
+    /// FORGET ALL, NEW IDENTITY and BACK: K1 moves, K0 opens.
+    Computers,
     /// Asks before forgetting every paired computer: K0 forgets, K1 goes back.
     Forget,
+    /// Asks twice before the box makes itself a new identity (#122): K0 goes on, K1 goes back.
+    NewIdentity,
+    Sure,
+}
+
+/// The rows of the COMPUTERS view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComputersRow {
+    /// Only while computers are paired.
+    ForgetAll,
+    NewIdentity,
+    Back,
 }
 
 /// What decides which rows show, read afresh on every key.
@@ -39,6 +56,8 @@ pub struct Context {
     pub phase_active: bool,
     /// How many computers are paired with the box.
     pub paired: usize,
+    /// The box has a key, so computers can pair with it (not on the single-slot layout).
+    pub identity: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,12 +74,16 @@ pub enum Action {
     ToggleMute,
     /// Forget every paired computer; back on the list afterwards.
     ForgetComputers,
+    /// Make a new key and forget pairings, Wi-Fi and the Relay; this closes the menu.
+    NewIdentity,
 }
 
 pub struct Menu {
     view: Option<View>,
     /// Kept as a row rather than an index: rows come and go (STOP FOCUS once the phase is given up).
     selected: Row,
+    /// The row selected in the COMPUTERS view, by index.
+    computers_selected: usize,
     last_key_ms: u32,
 }
 
@@ -72,7 +95,7 @@ impl Default for Menu {
 
 impl Menu {
     pub fn new() -> Self {
-        Self { view: None, selected: Row::Volume, last_key_ms: 0 }
+        Self { view: None, selected: Row::Volume, computers_selected: 0, last_key_ms: 0 }
     }
 
     pub fn is_open(&self) -> bool {
@@ -84,16 +107,30 @@ impl Menu {
     }
 
     pub fn rows(context: Context) -> Vec<Row> {
-        let mut rows = Vec::with_capacity(5);
+        let mut rows = Vec::with_capacity(6);
         if context.phase_active {
             rows.push(Row::StopPhase);
         }
         rows.extend([Row::Volume, Row::Mute]);
-        if context.paired > 0 {
+        if context.identity {
             rows.push(Row::Computers);
         }
-        rows.push(Row::Status);
+        rows.extend([Row::Network, Row::Status]);
         rows
+    }
+
+    pub fn computers_rows(context: Context) -> Vec<ComputersRow> {
+        let mut rows = Vec::with_capacity(3);
+        if context.paired > 0 {
+            rows.push(ComputersRow::ForgetAll);
+        }
+        rows.extend([ComputersRow::NewIdentity, ComputersRow::Back]);
+        rows
+    }
+
+    /// The selected row's index in the COMPUTERS view.
+    pub fn computers_selected(&self, context: Context) -> usize {
+        self.computers_selected.min(Self::computers_rows(context).len() - 1)
     }
 
     /// The selected row's index among `rows(context)`; the first row if it has gone.
@@ -134,13 +171,32 @@ impl Menu {
                 }
                 Row::Volume => Action::StepVolume,
                 Row::Mute => Action::ToggleMute,
-                Row::Computers => self.show(View::Forget),
+                Row::Computers => {
+                    self.computers_selected = 0;
+                    self.show(View::Computers)
+                }
+                Row::Network => self.show(View::Network),
                 Row::Status => self.show(View::Status),
             },
-            (View::Status, ButtonEvent::K0Short) | (View::Forget, ButtonEvent::K1Short) => self.show(View::List),
+            (View::Network | View::Status, ButtonEvent::K0Short) => self.show(View::List),
+            (View::Computers, ButtonEvent::K1Short) => {
+                self.computers_selected = (self.computers_selected(context) + 1) % Self::computers_rows(context).len();
+                Action::Redraw
+            }
+            (View::Computers, ButtonEvent::K0Short) => match Self::computers_rows(context)[self.computers_selected(context)] {
+                ComputersRow::ForgetAll => self.show(View::Forget),
+                ComputersRow::NewIdentity => self.show(View::NewIdentity),
+                ComputersRow::Back => self.show(View::List),
+            },
+            (View::Forget | View::NewIdentity | View::Sure, ButtonEvent::K1Short) => self.show(View::Computers),
             (View::Forget, ButtonEvent::K0Short) => {
                 self.view = Some(View::List);
                 Action::ForgetComputers
+            }
+            (View::NewIdentity, ButtonEvent::K0Short) => self.show(View::Sure),
+            (View::Sure, ButtonEvent::K0Short) => {
+                self.close();
+                Action::NewIdentity
             }
             _ => Action::None,
         }
@@ -240,31 +296,62 @@ mod tests {
         assert_eq!(short(""), pair("?", ""));
     }
 
-    const PLAIN: Context = Context { phase_active: false, paired: 0 };
-    const FULL: Context = Context { phase_active: true, paired: 2 };
+    const PLAIN: Context = Context { phase_active: false, paired: 0, identity: false };
+    const FULL: Context = Context { phase_active: true, paired: 2, identity: true };
 
     #[test]
     fn rows_follow_the_context() {
-        assert_eq!(Menu::rows(PLAIN), [Row::Volume, Row::Mute, Row::Status]);
-        assert_eq!(Menu::rows(FULL), [Row::StopPhase, Row::Volume, Row::Mute, Row::Computers, Row::Status]);
+        assert_eq!(Menu::rows(PLAIN), [Row::Volume, Row::Mute, Row::Network, Row::Status]);
+        assert_eq!(Menu::rows(FULL), [Row::StopPhase, Row::Volume, Row::Mute, Row::Computers, Row::Network, Row::Status]);
     }
 
     #[test]
     fn forgetting_computers_asks_first() {
-        let paired = Context { phase_active: false, paired: 1 };
+        let paired = Context { phase_active: false, paired: 1, identity: true };
         let mut menu = Menu::new();
         menu.open(paired, 0);
         menu.key(ButtonEvent::K1Short, paired, 0);
         menu.key(ButtonEvent::K1Short, paired, 0);
         assert_eq!(menu.key(ButtonEvent::K0Short, paired, 0), Action::Redraw);
+        assert_eq!(menu.view(), Some(View::Computers));
+        assert_eq!(menu.key(ButtonEvent::K0Short, paired, 0), Action::Redraw);
         assert_eq!(menu.view(), Some(View::Forget));
         assert_eq!(menu.key(ButtonEvent::K1Short, paired, 0), Action::Redraw, "K1 backs out");
-        assert_eq!(menu.view(), Some(View::List));
+        assert_eq!(menu.view(), Some(View::Computers));
         menu.key(ButtonEvent::K0Short, paired, 0);
         assert_eq!(menu.key(ButtonEvent::K0Short, paired, 0), Action::ForgetComputers);
         assert_eq!(menu.view(), Some(View::List));
-        let after = Context { phase_active: false, paired: 0 };
-        assert_eq!(Menu::rows(after)[menu.selected(after)], Row::Volume, "the row is gone");
+        let after = Context { phase_active: false, paired: 0, identity: true };
+        assert_eq!(Menu::computers_rows(after), [ComputersRow::NewIdentity, ComputersRow::Back], "nothing to forget");
+    }
+
+    #[test]
+    fn a_new_identity_asks_twice() {
+        let context = Context { phase_active: false, paired: 1, identity: true };
+        let mut menu = Menu::new();
+        menu.open(context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        menu.key(ButtonEvent::K0Short, context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        assert_eq!(menu.key(ButtonEvent::K0Short, context, 0), Action::Redraw);
+        assert_eq!(menu.view(), Some(View::NewIdentity));
+        assert_eq!(menu.key(ButtonEvent::K0Short, context, 0), Action::Redraw);
+        assert_eq!(menu.view(), Some(View::Sure));
+        assert_eq!(menu.key(ButtonEvent::K1Short, context, 0), Action::Redraw, "either step backs out");
+        assert_eq!(menu.view(), Some(View::Computers));
+        menu.key(ButtonEvent::K0Short, context, 0);
+        menu.key(ButtonEvent::K0Short, context, 0);
+        assert_eq!(menu.key(ButtonEvent::K0Short, context, 0), Action::NewIdentity);
+        assert!(!menu.is_open());
+        menu.open(context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        menu.key(ButtonEvent::K0Short, context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        menu.key(ButtonEvent::K1Short, context, 0);
+        assert_eq!(menu.key(ButtonEvent::K0Short, context, 0), Action::Redraw, "BACK");
+        assert_eq!(menu.view(), Some(View::List));
     }
 
     #[test]
@@ -276,6 +363,7 @@ mod tests {
         assert_eq!(menu.key(ButtonEvent::K1Short, PLAIN, 10), Action::Redraw);
         assert_eq!(menu.key(ButtonEvent::K1Short, PLAIN, 20), Action::Redraw);
         assert_eq!(menu.selected(PLAIN), 2);
+        menu.key(ButtonEvent::K1Short, PLAIN, 30);
         menu.key(ButtonEvent::K1Short, PLAIN, 30);
         assert_eq!(menu.selected(PLAIN), 0);
         assert_eq!(menu.key(ButtonEvent::K2Short, PLAIN, 40), Action::Close);
@@ -292,11 +380,15 @@ mod tests {
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::ToggleMute);
         menu.key(ButtonEvent::K1Short, PLAIN, 0);
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
+        assert_eq!(menu.view(), Some(View::Network));
+        assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
+        menu.key(ButtonEvent::K1Short, PLAIN, 0);
+        assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
         assert_eq!(menu.view(), Some(View::Status));
         assert_eq!(menu.key(ButtonEvent::K1Short, PLAIN, 0), Action::None, "the status view has no rows");
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
         assert_eq!(menu.view(), Some(View::List));
-        assert_eq!(menu.selected(PLAIN), 2, "back on STATUS");
+        assert_eq!(menu.selected(PLAIN), 3, "back on STATUS");
     }
 
     #[test]
@@ -305,7 +397,7 @@ mod tests {
         menu.open(FULL, 0);
         assert_eq!(menu.key(ButtonEvent::K0Short, FULL, 0), Action::StopPhase);
         assert!(!menu.is_open());
-        let after = Context { phase_active: false, paired: 2 };
+        let after = Context { phase_active: false, paired: 2, identity: true };
         menu.open(after, 0);
         assert_eq!(Menu::rows(after)[menu.selected(after)], Row::Volume);
     }

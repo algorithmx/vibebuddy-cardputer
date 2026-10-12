@@ -77,6 +77,13 @@ pub fn room(conn: u32) -> usize {
     slot_of(conn).map_or(usize::MAX, |slot| OUT[slot].free_capacity())
 }
 
+/// Closes every connection, as before a restart.
+pub fn close_all() {
+    for signal in &CLOSE {
+        signal.signal(());
+    }
+}
+
 pub fn close(conn: u32) {
     if let Some(slot) = slot_of(conn) {
         CLOSE[slot].signal(());

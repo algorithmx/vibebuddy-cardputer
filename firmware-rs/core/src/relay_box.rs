@@ -77,7 +77,10 @@ impl RelayBox {
     /// A message from the Relay other than the challenge.
     pub fn message<B: Board>(&mut self, firmware: &mut Firmware, board: &mut B, value: &Value) {
         match value["t"].as_str() {
-            Some("welcome") => self.welcomed = true,
+            Some("welcome") => {
+                self.welcomed = true;
+                firmware.set_relay_up(true);
+            }
             Some("linked") => {
                 let key = value["computer"].as_str().and_then(link::decode_key);
                 firmware.relay_linked(board.now_ms(), key);
@@ -96,6 +99,7 @@ impl RelayBox {
     /// The socket closed: nobody is linked through it, and everything is said again on the next welcome.
     pub fn gone(&mut self, firmware: &mut Firmware, now: u32) {
         firmware.relay_linked(now, None);
+        firmware.set_relay_up(false);
         *self = Self::new();
     }
 

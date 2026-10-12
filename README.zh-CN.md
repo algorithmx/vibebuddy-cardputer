@@ -149,6 +149,10 @@ App 和盒子固件分开发布，VibeBuddy 会检查两者有没有新版本（
 - **之后会怎样**：不经你同意什么都不会安装。Mac 上有新 App 时会弹出 Sparkle 的窗口，你可以安装、稍后或跳过；Linux 上通用页会说明怎么升级。更新的固件会在后台下载并校验，然后设置 → 设备会用一个按钮提示你更新。
 - **怎么关掉**：设置 → 通用 →「检查更新」。从源码编译的默认关闭；Releases 页面上的构建默认开启。
 
+### 把盒子交给别人
+
+盒子有自己的密钥，电脑插上时就和它配对。盒子转手前，或者怀疑密钥泄露时，给它换一把新的：长按 K1 打开菜单，进 COMPUTERS → NEW ID，确认两次。盒子会生成新密钥，忘掉所有配对过的电脑、Wi-Fi 网络和 Relay，然后重启。角色、配音、音量和今天的统计都保留。之后每台电脑下次插上时重新配对，Wi-Fi 网络在 App 里重新设置。只想忘掉电脑、保留密钥，就用同一处的 FORGET ALL。
+
 ## 开发
 
 日常操作都收在根目录的 [`justfile`](justfile) 里，`just` 列出全部。如何搭环境、跑测试、提交改动见 [`CONTRIBUTING.md`](CONTRIBUTING.md)（英文）。先读这些：[`docs/architecture.md`](docs/architecture.md)（边界与决定）、[`CONTEXT.md`](CONTEXT.md)（领域词汇）、[`docs/pet.md`](docs/pet.md)（氛围小助手设计）、[`docs/protocol.md`](docs/protocol.md)（协议决定）、[`docs/references.md`](docs/references.md)（外部项目的借鉴边界）和 [`LESSONS.md`](LESSONS.md)（经验教训）。

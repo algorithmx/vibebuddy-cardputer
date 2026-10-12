@@ -149,6 +149,10 @@ The App and the box's firmware are released separately, and VibeBuddy looks for 
 - **What happens**: nothing is installed without you. A new App opens Sparkle's window on the Mac, where you can install, wait or skip; on Linux, General says how to upgrade. Newer firmware is downloaded and checked in the background, then Settings → Device offers it with a button.
 - **Turning it off**: Settings → General → Check for updates. Builds from source have it off by default; the builds on the Releases page have it on.
 
+### Giving the box to someone else
+
+The box has its own key, which computers pair with when it's plugged in. Before the box changes hands, or if you think its key has leaked, give it a new one: hold K1 for the menu, then COMPUTERS → NEW ID, and confirm twice. The box makes a new key and forgets every paired computer, its Wi-Fi network and its Relay, then restarts. Its Character, voice, volume and today's tally stay. Every computer then pairs again the next time it's plugged in, and the Wi-Fi network is set again from the App. To forget the computers but keep the key, use FORGET ALL in the same place.
+
 ## Development
 
 Everyday tasks live in the [`justfile`](justfile); run `just` to list them. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to set up, test and send changes. The docs to start with are [`docs/architecture.md`](docs/architecture.md) (boundaries and decisions), [`CONTEXT.md`](CONTEXT.md) (domain terms), [`docs/pet.md`](docs/pet.md) (the buddy's design), [`docs/protocol.md`](docs/protocol.md) (protocol decisions), [`docs/references.md`](docs/references.md) (what we borrow from other projects, and where we stop) and [`LESSONS.md`](LESSONS.md) (lessons learned).
