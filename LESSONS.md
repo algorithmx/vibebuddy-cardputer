@@ -304,3 +304,9 @@ Over SSH, match by something the shell's own command line can't contain: a PID k
 On 2026-10-09 I had dragon run `just install` in a worktree branched before #99, which renamed the bundle to `VibeBuddy.app`. The worktree's `build-app.sh` still installed to `/Applications/Vibe Buddy.app`, so the new build landed next to the app in daily use instead of replacing it, and two copies fought over the box and port 7331.
 
 Before installing anything meant for daily use, fetch and check out `origin/main` (or confirm the branch contains it). `git log -1 origin/main` against `HEAD` takes a second; cleaning up a second app bundle does not.
+
+## A release step that runs offline needs its dependencies fetched first
+
+On 2026-10-12 the first `just release 0.4.2` stopped halfway: it updates the firmware's lockfile with `--offline`, and the machine had never built the firmware, so `embassy-executor` wasn't in the cargo cache. Nothing had been committed or pushed, but `Cargo.toml` and `Cargo.lock` were left changed and had to be reverted by hand before the retry.
+
+A step that only runs at release time is the one nobody exercises (see the v0.3.0 lockfile lesson above). The release recipe now runs `cargo fetch` for the workspace and the firmware before it changes anything, so a missing crate is fetched, or fails while the tree is still clean.
