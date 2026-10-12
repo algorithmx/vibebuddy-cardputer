@@ -207,7 +207,7 @@ async fn main() {
             fixed_address: std::env::var("VIBEBUDDY_LAN_ADDR").ok(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
-        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok());
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release());
         serial_config = serial_config.with_relay(relay.clone());
         relay_config = Some(relay);
     }
@@ -242,6 +242,9 @@ async fn main() {
     )));
     if let (Some(relay), Some(url)) = (&state.relay, state.updates.lock().await.relay_url()) {
         relay.offer(&url);
+    }
+    if let Some(relay) = &state.relay {
+        state.device.lock().await.relay_server = Some(relay.url());
     }
     tokio::spawn(watch_parent());
     tokio::spawn(sweep_expired_activities(state.clone()));
@@ -307,6 +310,13 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     {
         send_event(state, pair_command(identity));
         send_event(state, device_command("device.pairs"));
+        // The box uses the Relay its computer on the cable uses, so a development build and its box
+        // meet on staging and a release and its box on production (docs/relay-protocol.md, "Which Relay").
+        if let Some(url) = state.relay.as_ref().and_then(relay::RelayConfig::for_box) {
+            let mut event = device_command("device.relay.set");
+            event.extra.insert("url".to_owned(), url.into());
+            send_event(state, event);
+        }
         // Remembered so the box can be found and checked over the network later (ADR-0012).
         if let Some(dir) = config::state_dir() {
             lan::remember(&lan::box_key_file(&dir), key.trim());
@@ -531,6 +541,7 @@ async fn check_once(state: &AppState) {
             let accepted = updates.accept(&text, manifest).map(|firmware| (firmware, updates.firmware_root()));
             if let (Some(relay), Some(url)) = (&state.relay, updates.relay_url()) {
                 relay.offer(&url);
+                state.device.lock().await.relay_server = Some(relay.url());
             }
             accepted
         }
@@ -1302,6 +1313,14 @@ mod tests {
         assert_eq!(pair.event, "device.pair");
         assert_eq!(pair.extra["key"], key.as_str());
         assert_eq!(pair.extra["name"], "dragon's MacBook");
+        assert!(
+            !transport.events().iter().any(|event| event.event == "device.relay.set"),
+            "nothing to give the box without a Relay"
+        );
+        state.relay = Some(relay::RelayConfig::new(state.identity.clone().unwrap(), None, false));
+        publish_device_message(&state, DeviceMessage::Line("BOX KEY 1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE".to_owned())).await;
+        let set = transport.events().into_iter().find(|event| event.event == "device.relay.set").expect("the Relay for the box");
+        assert_eq!(set.extra["url"], relay::STAGING_URL);
         std::fs::remove_dir_all(dir).ok();
     }
 

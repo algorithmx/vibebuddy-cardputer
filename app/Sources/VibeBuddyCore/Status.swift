@@ -107,7 +107,14 @@ public struct DeviceState: Codable, Equatable {
     public var wifiAddress: String?
     /// What the box heard on its last scan, strongest first. Absent from older daemons.
     public var wifiSeen: [SeenNetwork]?
-    enum CodingKeys: String, CodingKey { case wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
+    /// The Relay this computer uses, and the one the box last said it uses (`wss://host`). Absent from older daemons.
+    public var relayServer: String?
+    public var boxRelay: String?
+    /// A Relay's host, which is all that tells staging from production.
+    public static func relayHost(_ url: String) -> String {
+        url.replacingOccurrences(of: "wss://", with: "").replacingOccurrences(of: "ws://", with: "")
+    }
+    enum CodingKeys: String, CodingKey { case relayServer = "relay_server", boxRelay = "box_relay", wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
     public init(connected: Bool, port: String? = nil, bridge: Bool = false, mode: String? = nil, firmwareBuild: String? = nil, firmwareVersion: String? = nil, voice: String? = nil, volume: Int? = nil, foreignFirmware: Bool? = nil) {
         self.connected = connected; self.port = port; self.bridge = bridge; self.mode = mode; self.firmwareBuild = firmwareBuild; self.firmwareVersion = firmwareVersion; self.voice = voice; self.volume = volume
         self.foreignFirmware = foreignFirmware

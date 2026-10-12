@@ -17,6 +17,7 @@ use crate::display::{Display, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, Scen
 use crate::leisure::{Leisure, Tier};
 use crate::menu::{self, Action as MenuAction, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
+use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
 use crate::voice_pack::crc32;
@@ -115,6 +116,7 @@ pub struct Firmware {
     remote: bool,
     /// The Wi-Fi network changed and the device layer hasn't picked it up yet.
     wifi_changed: bool,
+    relay_changed: bool,
     /// The computer on the cable asked which networks the box can hear.
     scan_requested: bool,
     /// The computer on the cable, once it has paired: what the box reports to the Relay as its USB link.
@@ -234,6 +236,7 @@ impl Firmware {
             lan: Lan::new(),
             remote: false,
             wifi_changed: false,
+            relay_changed: false,
             scan_requested: false,
             cable_key: None,
             volume: VOLUME_DEFAULT,
@@ -430,6 +433,17 @@ impl Firmware {
     /// The network to join, for the device layer.
     pub fn wifi(&self) -> Option<&Wifi> {
         self.link.as_ref().and_then(|(_, link)| link.wifi.as_ref())
+    }
+
+    /// The Relay to connect to: what the computer on the cable last set, or the firmware's default.
+    pub fn relay_url(&self) -> &str {
+        self.link().and_then(|link| link.relay.as_deref()).unwrap_or(relay_box::DEFAULT_URL)
+    }
+
+    /// True once after the computer on the cable moved the box to another Relay: the device layer
+    /// should drop its socket and connect to [`Self::relay_url`].
+    pub fn take_relay_change(&mut self) -> bool {
+        core::mem::take(&mut self.relay_changed)
     }
 
     /// True once after `device.wifi.scan`: the device layer scans and reports `WIFI SEEN` lines.
@@ -1086,11 +1100,16 @@ impl Firmware {
             _ if event.starts_with("voice.") => self.handle_voice_event(board, fields, event),
             // Pairing is the computer at the other end of the cable telling the box who it is (ADR-0012).
             // Only over the cable: whoever is at the box decides who may link and which network it joins.
-            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" if self.remote => {
+            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" | "device.relay.set"
+                if self.remote =>
+            {
                 Self::write_literal(board, "ERROR cable_only\n");
             }
             "device.pair" | "device.unpair" | "device.pairs" => self.handle_pairing(board, fields, event),
             "device.wifi.set" | "device.wifi.forget" => self.handle_wifi(board, fields, event),
+            // Which Relay follows the computer on the cable, so a development build and a release reach the
+            // same Relay as their box (docs/relay-protocol.md, "Which Relay").
+            "device.relay.set" => self.handle_relay(board, fields),
             // The radio belongs to the device layer, which reports what it hears as `WIFI SEEN` lines.
             "device.wifi.scan" => self.scan_requested = true,
             // Link self-test: send the received string's length and CRC back to the Mac to check for corrupted serial bytes.
@@ -1145,6 +1164,7 @@ impl Firmware {
             if let Some(wifi) = &link.wifi {
                 Self::write_value_line(board, "WIFI NETWORK ", wifi.ssid.as_bytes());
             }
+            Self::write_value_line(board, "RELAY URL ", self.relay_url().as_bytes());
         }
     }
 
@@ -1210,6 +1230,26 @@ impl Firmware {
             Some(wifi) => Self::write_value_line(board, "WIFI NETWORK ", wifi.ssid.as_bytes()),
             None => Self::write_literal(board, "WIFI FORGOTTEN\n"),
         }
+    }
+
+    /// `device.relay.set {"url": "wss://host"}`. The computer sends it on every link over the cable, so
+    /// the record is saved only when the Relay really changes.
+    fn handle_relay<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>) {
+        let Some(url) = string(fields, "url").filter(|url| relay_box::url_host(url).is_some()) else {
+            return Self::write_literal(board, "RELAY INVALID\n");
+        };
+        let url = url.trim_end_matches('/');
+        if url != self.relay_url() {
+            let Some((store, link)) = self.link.as_mut() else {
+                return Self::write_literal(board, "RELAY UNAVAILABLE\n");
+            };
+            link.relay = (url != relay_box::DEFAULT_URL).then(|| url.into());
+            if store.save(board.flash(), link).is_err() {
+                return Self::write_literal(board, "LINK SAVE ERROR\n");
+            }
+            self.relay_changed = true;
+        }
+        Self::write_value_line(board, "RELAY URL ", self.relay_url().as_bytes());
     }
 
     /// From the box's menu: forget every paired computer, for a box changing hands. Each pairs

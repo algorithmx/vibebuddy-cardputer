@@ -79,6 +79,8 @@ do {
     {"connected":true,"bridge":false,"network":true,"port":"192.168.1.23:7340","wifi_network":"Home","wifi_address":"192.168.1.23"}
     """.utf8))
     check(wifi.network == true && wifi.wifiNetwork == "Home" && wifi.wifiAddress == "192.168.1.23", "Wi-Fi fields decode")
+    let relays = try JSONDecoder().decode(DeviceState.self, from: Data(#"{"connected":true,"bridge":false,"relay_server":"wss://relay-staging.korekore.ai","box_relay":"wss://relay.korekore.ai"}"#.utf8))
+    check(relays.relayServer.map(DeviceState.relayHost) == "relay-staging.korekore.ai" && relays.boxRelay == "wss://relay.korekore.ai", "Relay fields decode")
     let busy = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
     {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
     """.utf8))

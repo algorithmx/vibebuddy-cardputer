@@ -54,6 +54,10 @@ pub struct DeviceState {
     pub wifi_network: Option<String>,
     /// The address the box got on that network.
     pub wifi_address: Option<String>,
+    /// The Relay this computer uses, `wss://host`; None without a key. Set by the daemon, not the box.
+    pub relay_server: Option<String>,
+    /// The Relay the box uses, as it last said (`RELAY URL`); it follows the computer on the cable.
+    pub box_relay: Option<String>,
     /// The networks the box heard on its last scan, strongest first, one entry per name.
     pub wifi_seen: Vec<SeenNetwork>,
     /// Connected, but running other firmware (a factory unit, or Muse on a box that runs it): it's there, not
@@ -122,6 +126,7 @@ impl DeviceState {
                 self.wifi_network = None;
                 self.wifi_address = None;
                 self.wifi_seen.clear();
+                self.box_relay = None;
             }
             DeviceMessage::ConnectedNetwork { address } => {
                 self.apply(&DeviceMessage::Connected { port: address.clone(), bridge: false, usb_serial: None });
@@ -148,6 +153,7 @@ impl DeviceState {
                 self.wifi_network = None;
                 self.wifi_address = None;
                 self.wifi_seen.clear();
+                self.box_relay = None;
             }
             DeviceMessage::Disconnected => {
                 self.connected = false;
@@ -172,6 +178,8 @@ impl DeviceState {
                     self.box_key = Some(key.trim().to_owned());
                 } else if line.starts_with("PAIRED ") {
                     self.paired = true;
+                } else if let Some(url) = line.strip_prefix("RELAY URL ") {
+                    self.box_relay = Some(url.trim().to_owned());
                 } else if let Some(network) = line.strip_prefix("WIFI NETWORK ") {
                     self.wifi_network = Some(network.trim().to_owned());
                 } else if line.trim() == "WIFI FORGOTTEN" {
@@ -355,6 +363,8 @@ mod tests {
                 paired_computers: Vec::new(),
                 wifi_network: None,
                 wifi_address: None,
+                relay_server: None,
+                box_relay: None,
                 wifi_seen: Vec::new(),
                 foreign_firmware: false,
                 unsupported_board: None,
@@ -386,6 +396,15 @@ mod tests {
         assert_eq!(seen, [("ByteTrade", -49), ("ByteTrade Guest", -61)], "hidden networks are left out");
         state.apply(&line("WIFI SEEN 0"));
         assert!(state.wifi_seen.is_empty(), "a new scan starts over");
+    }
+
+    #[test]
+    fn the_box_says_which_relay_it_uses() {
+        let mut state = DeviceState::default();
+        state.apply(&line("RELAY URL wss://relay-staging.korekore.ai"));
+        assert_eq!(state.box_relay.as_deref(), Some("wss://relay-staging.korekore.ai"));
+        state.apply(&DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None });
+        assert_eq!(state.box_relay, None, "a box that comes back says it again");
     }
 
     #[test]

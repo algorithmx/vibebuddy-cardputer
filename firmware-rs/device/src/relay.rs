@@ -1,15 +1,17 @@
-//! The box on the Relay (ADR-0012, docs/relay-protocol.md): a WebSocket over TLS to
-//! `relay.korekore.ai`, kept open whenever the box is on Wi-Fi. This task only moves text frames;
+//! The box on the Relay (ADR-0012, docs/relay-protocol.md): a WebSocket over TLS to the Relay the
+//! computer on the cable last named (`relay.korekore.ai` until one does), kept open whenever the box
+//! is on Wi-Fi. This task only moves text frames;
 //! firmware-core's `RelayBox`, run by the main loop, decides what they say. The certificate is checked
 //! against the roots in `certs/relay-roots.pem` (#110), so the box needs the time first: SNTP from
 //! `time.cloudflare.com`.
 
+use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::CStr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -23,10 +25,8 @@ use esp_hal::rng::Rng;
 use mbedtls_rs::io::Write as _;
 use mbedtls_rs::sys::hook::wall_clock::MbedtlsWallClock;
 use mbedtls_rs::{Certificate, ClientSessionConfig, Session, SessionConfig, Tls, X509};
+use vibebuddy_firmware_core::relay_box;
 
-/// The Relay (ADR-0012).
-const HOST: &str = "relay.korekore.ai";
-const HOST_C: &CStr = c"relay.korekore.ai";
 const TIME_HOST: &str = "time.cloudflare.com";
 const ROOTS: &str = concat!(include_str!("../certs/relay-roots.pem"), "\0");
 /// Every 30 s the box sends a WebSocket ping, which keeps NATs open, and the exact text `{"t":"ping"}`,
@@ -64,6 +64,9 @@ pub fn current_socket() -> u32 {
 }
 /// The box's id, which names its place on the Relay; signalled once at boot.
 pub static BOX_ID: Signal<CriticalSectionRawMutex, String> = Signal::new();
+/// The Relay's URL, `wss://host`: signalled at boot and whenever the computer on the cable names
+/// another, which drops the socket and connects to the new one.
+pub static URL: Signal<CriticalSectionRawMutex, String> = Signal::new();
 
 /// Unix seconds at `Instant` zero, once SNTP has answered; 0 until then. 32 bits last until 2106, and
 /// Xtensa has no 64-bit atomics.
@@ -105,6 +108,8 @@ fn civil(unix: u64) -> mbedtls_rs::sys::tm {
 
 /// The Relay refused this firmware's protocol version: stop trying until it is updated.
 const UPGRADE: &str = "update needed";
+/// The computer on the cable named another Relay.
+const MOVED: &str = "moved";
 
 fn line(text: String) {
     let _ = IN.try_send(RelayIn::Line(text));
@@ -113,8 +118,15 @@ fn line(text: String) {
 #[embassy_executor::task]
 pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
     let box_id = BOX_ID.wait().await;
+    let mut url = URL.wait().await;
     let mut backoff = Duration::from_secs(2);
     loop {
+        if let Some(next) = URL.try_take() {
+            url = next;
+            backoff = Duration::from_secs(2);
+        }
+        // firmware-core only keeps a URL it can use.
+        let host = relay_box::url_host(&url).unwrap_or_default();
         stack.wait_config_up().await;
         if UNIX_AT_BOOT.load(Ordering::Relaxed) == 0 {
             match sntp(stack).await {
@@ -131,16 +143,20 @@ pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
         }
         let started = Instant::now();
         SOCKET.store(NEXT_SOCKET.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-        let result = session(stack, &tls, &box_id).await;
+        let result = session(stack, &tls, host, &box_id).await;
         SOCKET.store(0, Ordering::Relaxed);
-        if let Err(why) = result {
-            line(alloc::format!("RELAY FAILED {why}"));
-            if why == UPGRADE {
-                let _ = IN.try_send(RelayIn::Gone);
-                return;
-            }
-        }
         let _ = IN.try_send(RelayIn::Gone);
+        match result {
+            Err(MOVED) => continue,
+            // Only another firmware, or another Relay, can help.
+            Err(UPGRADE) => {
+                line(alloc::format!("RELAY FAILED {UPGRADE}"));
+                URL.signal(URL.wait().await);
+                continue;
+            }
+            Err(why) => line(alloc::format!("RELAY FAILED {why}")),
+            Ok(()) => {}
+        }
         // A socket that lasted a while was fine; start the backoff over.
         if started.elapsed() > Duration::from_secs(60) {
             backoff = Duration::from_secs(2);
@@ -171,8 +187,8 @@ async fn sntp(stack: Stack<'static>) -> Option<u64> {
     seconds_since_1900.checked_sub(2_208_988_800).filter(|&unix| unix > 1_700_000_000)
 }
 
-async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Result<(), &'static str> {
-    let address = match stack.dns_query(HOST, DnsQueryType::A).await.ok().and_then(|found| found.first().copied()) {
+async fn session(stack: Stack<'static>, tls: &Tls<'static>, host: &str, box_id: &str) -> Result<(), &'static str> {
+    let address = match stack.dns_query(host, DnsQueryType::A).await.ok().and_then(|found| found.first().copied()) {
         Some(IpAddress::Ipv4(address)) => address,
         _ => return Err("dns"),
     };
@@ -183,9 +199,10 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Res
     socket.set_timeout(Some(DEAD_AFTER));
     socket.connect((IpAddress::Ipv4(address), 443)).await.map_err(|_| "connect")?;
     let roots = CStr::from_bytes_with_nul(ROOTS.as_bytes()).map_err(|_| "roots")?;
+    let server_name = CString::new(host).map_err(|_| "host")?;
     let config = ClientSessionConfig {
         ca_chain: Some(Certificate::new(X509::PEM(roots)).map_err(|_| "roots")?),
-        server_name: Some(HOST_C),
+        server_name: Some(&server_name),
         ..ClientSessionConfig::new()
     };
     let mut session = Session::new(tls.reference(), socket, &SessionConfig::Client(config)).map_err(|_| "tls")?;
@@ -194,7 +211,7 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Res
     let mut key = [0u8; 16];
     Rng::new().read(&mut key);
     let request = alloc::format!(
-        "GET /v1/boxes/{box_id} HTTP/1.1\r\nHost: {HOST}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        "GET /v1/boxes/{box_id} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
         base64(&key)
     );
     session.write_all(request.as_bytes()).await.map_err(|_| "upgrade")?;
@@ -246,22 +263,28 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, box_id: &str) -> Res
                 _ => {}
             }
         }
-        match select3(session.read(&mut chunk), OUT.receive(), ping.next()).await {
-            Either3::First(Ok(0)) | Either3::First(Err(_)) => return Err("closed"),
-            Either3::First(Ok(count)) => {
+        match select4(session.read(&mut chunk), OUT.receive(), ping.next(), URL.wait()).await {
+            Either4::First(Ok(0)) | Either4::First(Err(_)) => return Err("closed"),
+            Either4::First(Ok(count)) => {
                 heard = Instant::now();
                 input.extend_from_slice(&chunk[..count]);
             }
-            Either3::Second((socket_number, text)) if socket_number == current_socket() => {
+            Either4::Second((socket_number, text)) if socket_number == current_socket() => {
                 send_frame(&mut session, FrameType::Text(false), text.as_bytes()).await?;
             }
-            Either3::Second(_) => {}
-            Either3::Third(()) => {
+            Either4::Second(_) => {}
+            Either4::Third(()) => {
                 if heard.elapsed() >= DEAD_AFTER {
                     return Err("silent");
                 }
                 send_frame(&mut session, FrameType::Ping, &[]).await?;
-                send_frame(&mut session, FrameType::Text(false), vibebuddy_firmware_core::relay_box::PING.as_bytes()).await?;
+                send_frame(&mut session, FrameType::Text(false), relay_box::PING.as_bytes()).await?;
+            }
+            // The task picks the new URL up as it connects again.
+            Either4::Fourth(next) => {
+                URL.signal(next);
+                let _ = send_frame(&mut session, FrameType::Close, &1000u16.to_be_bytes()).await;
+                return Err(MOVED);
             }
         }
     }

@@ -2,7 +2,22 @@
 
 How the daemon and the box talk to the Relay (ADR-0012). The Relay itself is the Worker `vibebuddy-relay` in the closed-source `vibebuddy-cloud` repo, which holds all of VibeBuddy's hosted services; this is the part both ends in this repo implement.
 
-The Relay lives at `wss://relay.korekore.ai`; staging is `wss://relay-staging.korekore.ai`. That address is compiled into the daemon and the firmware, and the update manifest may override it; the Relay never depends on update checks, which can be off.
+The Relay lives at `wss://relay.korekore.ai`; staging is `wss://relay-staging.korekore.ai`. Releases use production and every other build uses staging; the box uses whichever its computer on the cable uses (see "Which Relay"). The Relay never depends on update checks, which can be off.
+
+## Which Relay
+
+The daemon picks its Relay in this order:
+
+1. `VIBEBUDDY_RELAY_URL`, for example `ws://127.0.0.1:8787` under `wrangler dev`.
+2. In a release build only, the update manifest's optional `relay` field: a `wss://` address, used from the next connection on.
+3. The build's default: `wss://relay.korekore.ai` for a release build (CI builds of a tag, compiled with `VIBEBUDDY_RELEASE_TAG=1`), `wss://relay-staging.korekore.ai` for everything else, which includes CI builds of main and builds from source.
+
+The box follows the computer on its cable. Each time the daemon links over USB to a box that reports `BOX KEY`, it sends its own Relay with `device.relay.set` (docs/protocol.md, "Relay"), unless that Relay isn't a `wss://` host the box can use, such as a local `ws://` one. The box keeps it in the `link` partition and, if it changed, drops its Relay socket and connects to the new one. Firmware that has never been told uses `wss://relay.korekore.ai`. The Relay switch in the App (config `relay`) turns the daemon's own use of the Relay off; it doesn't change which Relay the box is given.
+
+Two effects follow, both accepted while development builds stay inside the team:
+
+- An App from before this rule (0.4.1 and older) never sends a Relay, so a box a development build moved to staging stays there under it. Those Apps have no Relay client, so nothing is lost; the first release App with this rule moves the box back on its first USB link.
+- A box is on the Relay of the last computer it was plugged into. A user's box plugged once into a development build moves to staging, and the user's release App can then reach it over the local network or USB but not the Relay until it is plugged into that computer again. If development builds ever reach people outside the team, only an explicit opt-in should send staging to a box.
 
 ## Connecting
 
@@ -59,7 +74,7 @@ When the box reconnects to the Relay while a computer is linked through it, that
 
 ## The daemon
 
-The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`), and the daemon stays on its socket: it asks again whenever `status` shows the box free, sends `takeover` there the moment the user asks, and sends `{"t":"ping"}` every 30 s meanwhile. While linked, `status` with `box: false` means the box is gone (the link reads as down) until `linked` comes again. Failed tries back off: 2 s when unreachable, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes; sockets the daemon gives up on purpose close with 1000. The Relay's address is compiled in as `wss://relay.korekore.ai`; `VIBEBUDDY_RELAY_URL` says otherwise, for example `wss://relay-staging.korekore.ai` for development. The user can turn the Relay off in the App's settings (config `relay`, on by default); off, the daemon doesn't try it and leaves a link through it. The update manifest's optional `relay` field moves it from the next connection on, but only to a `wss://` address and never over the variable.
+The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`), and the daemon stays on its socket: it asks again whenever `status` shows the box free, sends `takeover` there the moment the user asks, and sends `{"t":"ping"}` every 30 s meanwhile. While linked, `status` with `box: false` means the box is gone (the link reads as down) until `linked` comes again. Failed tries back off: 2 s when unreachable, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes; sockets the daemon gives up on purpose close with 1000. Which Relay it uses, and which it gives the box, is in "Which Relay"; `/v1/status` reports the daemon's as `device.relay_server` and the box's as `device.box_relay`, and the Apps show both when they differ. The user can turn the Relay off in the App's settings (config `relay`, on by default); off, the daemon doesn't try it and leaves a link through it.
 
 The simulator plays the box on the Relay with `tools/simulate-device.py --relay ws://127.0.0.1:8787`, against `wrangler dev` in vibebuddy-cloud; `npx wrangler dev --var GRACE_MS:5000` shortens the grace period for such tests (production never sets it).
 

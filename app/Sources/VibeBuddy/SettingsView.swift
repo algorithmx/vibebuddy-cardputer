@@ -42,6 +42,16 @@ struct GeneralView: View {
             // ADR-0012: the Relay carries the box's messages through VibeBuddy's server, so it can be turned off.
             Toggle("Reach the box through the VibeBuddy Relay when it's away from this computer", isOn: Binding(get: { model.status?.config.relay ?? true }, set: { model.setRelay($0) }))
                 .disabled(model.status == nil)
+            // Development builds use the staging Relay and releases production; the box follows the computer on its cable.
+            if let server = model.status?.device.relayServer {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Relay: \(DeviceState.relayHost(server))")
+                    if let box = model.status?.device.boxRelay, box != server {
+                        Text("The box uses \(DeviceState.relayHost(box)) until it's plugged into this computer.")
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Updates") {
                 Toggle("Check for updates", isOn: Binding(get: { model.status?.config.checkUpdates ?? model.updates?.enabled ?? false }, set: { model.setCheckUpdates($0) }))
                     .disabled(model.status == nil)
