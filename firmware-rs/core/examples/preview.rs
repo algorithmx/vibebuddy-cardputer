@@ -183,4 +183,14 @@ fn main() {
     preview.display.set_muted(&mut preview.screen, &scene!(preview), true);
     preview.set_mode(Mode::Duty);
     preview.snapshot("pet_muted");
+
+    // Three cards: the state label keeps clear of the last one.
+    preview.display.set_muted(&mut preview.screen, &scene!(preview), false);
+    let three = [
+        TaskInput { title: Some(b"CC:UPDATE README"), state: State::Working, elapsed_s: 20, project: Some(b"VIBEBUDDY") },
+        TaskInput { title: Some(b"CX:BUILD FIRMWARE"), state: State::Working, elapsed_s: 60, project: Some(b"VIBEBUDDY") },
+        TaskInput { title: Some(b"CI:APP TESTS"), state: State::Working, elapsed_s: 120, project: Some(b"VIBEBUDDY") },
+    ];
+    preview.show(State::Working, None, &three);
+    preview.snapshot("pet_three_tasks");
 }

@@ -1111,9 +1111,12 @@ impl Display {
             Some(look) => draw_look_on_duty(canvas, look, state, self.animation_frame, LOOK_CENTER_X + x_offset, status_color),
             None => draw_buddy(canvas, state, self.animation_frame, x_offset, status_color),
         }
-        canvas.draw_text_centered(162, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
+        // The third task card ends at y = 158: the label moves down to keep clear of it.
+        let crowded = self.tasks.len() >= 3;
+        let label_y = if crowded { 168 } else { 162 };
+        canvas.draw_text_centered(label_y, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
         if !self.tasks.is_empty() {
-            canvas.draw_text_centered(195, b"LATEST ON TOP", 1, COLOR_MUTED);
+            canvas.draw_text_centered(if crowded { 198 } else { 195 }, b"LATEST ON TOP", 1, COLOR_MUTED);
         } else if self.state == State::Idle && !self.link_lost {
             // No rotation while the link is lost: a moving screen looks alive, the exact opposite of NO LINK.
             self.draw_idle_line(canvas, scene);
