@@ -13,7 +13,7 @@ use vibebuddy_protocol::{Event, ProtocolError, VERSION};
 
 use crate::audio::{Occasion, Sound, clamp_volume, VOLUME_DEFAULT};
 use crate::buttons::{ButtonEvent, Buttons, Levels};
-use crate::display::{Display, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, Scene, Screen, State, TaskInput, Tone};
+use crate::display::{Display, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, SNAPSHOT_LINE_BYTES, Scene, Screen, Snapshot, State, TaskInput, Tone};
 use crate::leisure::{Leisure, Tier};
 use crate::menu::{self, Action as MenuAction, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
@@ -38,6 +38,9 @@ const AUDIO_DRAIN_MS: u32 = 10000;
 /// Task ends this close together speak once: a burst of three dones read out back to back is noise, and the
 /// screen already shows every card. Longer than the longest line, so the window also covers its playback.
 const MERGE_WINDOW_MS: u32 = 15000;
+/// One screenshot line to a computer linked over the network this often: about 33 a second, under the
+/// Relay's 50 messages a second (docs/relay-protocol.md) with room for the box's other output.
+const SNAPSHOT_LINE_MS: u32 = 30;
 
 /// Result of audio init: the codec model (ES8311 or NS4168) on success, or the step it got
 /// stuck at on failure. Either is reported to the Mac as is.
@@ -87,6 +90,11 @@ pub trait Board: Screen {
     fn lan_close(&mut self, _conn: Conn) {}
     /// From now on [`Board::write`] also goes to this connection, the computer linked over the network.
     fn lan_peer(&mut self, _conn: Option<Conn>) {}
+    /// The computer linked over the network or the Relay can take `bytes` more right now without any being
+    /// dropped; true when none is linked. A screenshot waits on it rather than lose half a line.
+    fn peer_can_take(&self, _bytes: usize) -> bool {
+        true
+    }
 }
 
 /// What the box is linked to without the Relay.
@@ -114,6 +122,8 @@ pub struct Firmware {
     lan: Lan,
     /// The line being handled came over the network rather than the cable: pairing and Wi-Fi are refused.
     remote: bool,
+    /// A screenshot on its way to a computer linked over the network, and when its next line is due.
+    snapshot: Option<(Snapshot, u32)>,
     /// The Wi-Fi network changed and the device layer hasn't picked it up yet.
     wifi_changed: bool,
     relay_changed: bool,
@@ -235,6 +245,7 @@ impl Firmware {
             entropy: core::array::from_fn(|index| (seed.rotate_left(index as u32 % 32) >> (index % 4 * 8)) as u8 ^ index as u8),
             lan: Lan::new(),
             remote: false,
+            snapshot: None,
             wifi_changed: false,
             relay_changed: false,
             scan_requested: false,
@@ -495,6 +506,7 @@ impl Firmware {
             }
         }
         self.continue_voice_begin(board);
+        self.send_snapshot(board, now);
         if self.menu.expire(now) {
             Self::write_literal(board, "MENU CLOSED\n");
             self.show_menu(board);
@@ -505,6 +517,22 @@ impl Firmware {
         self.tend_leisure(board);
         let now = board.now_ms();
         self.display.tick(board, &scene!(self, now));
+    }
+
+    fn send_snapshot<B: Board>(&mut self, board: &mut B, now: u32) {
+        let Some((snapshot, due)) = &mut self.snapshot else { return };
+        if (now.wrapping_sub(*due) as i32) < 0 || !board.peer_can_take(SNAPSHOT_LINE_BYTES) {
+            return;
+        }
+        match snapshot.next_line() {
+            Some(mut line) => {
+                // One write, so the newline can't be dropped apart from its line.
+                line.push('\n');
+                board.write(line.as_bytes());
+                *due = now.wrapping_add(SNAPSHOT_LINE_MS);
+            }
+            None => self.snapshot = None,
+        }
     }
 
     fn set_link_lost<B: Board>(&mut self, board: &mut B, lost: bool) {
@@ -1055,6 +1083,11 @@ impl Firmware {
                 }
             }
             // A screenshot is a debugging action: it isn't agent activity and doesn't wake leisure.
+            // Over the network the frame is copied and sent a line at a time from `poll` instead.
+            "device.screenshot" if self.remote => {
+                let now = board.now_ms();
+                self.snapshot = Some((self.display.snapshot(board.frame()), now));
+            }
             "device.screenshot" => {
                 let display = &self.display;
                 board.with_frame_and_output(&mut |frame, output| {

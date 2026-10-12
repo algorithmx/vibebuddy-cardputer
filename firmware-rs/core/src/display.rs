@@ -1237,31 +1237,25 @@ impl Display {
     /// Writes out while encoding instead of buffering the whole frame: one frame's run-length encoding is
     /// tens of KB, larger than the heap.
     pub fn dump(&self, frame: &[u8], write_line: &mut dyn FnMut(&[u8])) {
-        let begin = text!(64, "SHOT BEGIN {}x{} BACKLIGHT {}", WIDTH, HEIGHT, if self.backlight_on { "ON" } else { "OFF" });
-        write_line(begin.as_bytes());
-        let pixel = |index: usize| u16::from_be_bytes([frame[index * 2], frame[index * 2 + 1]]);
-        let total = FRAME_BYTES / 2;
+        write_line(self.shot_begin().as_bytes());
         let mut index = 0;
-        let mut line = Text::<200>::new();
-        line.push_bytes(b"SHOT");
-        let mut runs = 0;
-        while index < total {
-            let color = pixel(index);
-            let mut run = 1;
-            while index + run < total && pixel(index + run) == color && run < 60000 {
-                run += 1;
-            }
-            let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" {:04x}:{}", color, run));
-            index += run;
-            runs += 1;
-            if runs == 16 || index == total {
-                write_line(line.as_bytes());
-                line = Text::new();
-                line.push_bytes(b"SHOT");
-                runs = 0;
-            }
+        while index < FRAME_BYTES / 2 {
+            let mut line = Text::<200>::new();
+            line.push_bytes(b"SHOT");
+            push_runs(frame, &mut index, 16, &mut line);
+            write_line(line.as_bytes());
         }
         write_line(b"SHOT END");
+    }
+
+    /// A screenshot for a computer linked over the network, taken now and sent a line at a time: the network
+    /// can't take a whole frame at once the way the cable can, and the screen keeps changing meanwhile.
+    pub fn snapshot(&self, frame: &[u8]) -> Snapshot {
+        Snapshot { frame: frame.to_vec(), begin: Some(self.shot_begin()), index: 0, done: false }
+    }
+
+    fn shot_begin(&self) -> Text<64> {
+        text!(64, "SHOT BEGIN {}x{} BACKLIGHT {}", WIDTH, HEIGHT, if self.backlight_on { "ON" } else { "OFF" })
     }
 
     /// Records today's stats, which the idle screen rotates through. Takes effect on the next draw.
@@ -1476,4 +1470,55 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Runs per `SHOT` line in a [`Snapshot`]: at most 11 bytes each, so a line stays under 2 KB, which fits the
+/// box's 4 KB network pipe and the Relay's 8 KiB messages with room to spare.
+const SNAPSHOT_RUNS: usize = 180;
+/// The longest line a [`Snapshot`] gives, newline included.
+pub const SNAPSHOT_LINE_BYTES: usize = 4 + SNAPSHOT_RUNS * 11 + 1;
+
+/// A copy of one frame (150 KB, so it lives in PSRAM) and how far it has been sent.
+pub struct Snapshot {
+    frame: Vec<u8>,
+    begin: Option<Text<64>>,
+    index: usize,
+    done: bool,
+}
+
+impl Snapshot {
+    /// The next line, without a newline: the `SHOT BEGIN` line, `SHOT` lines of runs, then `SHOT END`; None after that.
+    pub fn next_line(&mut self) -> Option<alloc::string::String> {
+        if let Some(begin) = self.begin.take() {
+            return Some(alloc::string::String::from_utf8_lossy(begin.as_bytes()).into_owned());
+        }
+        if self.index < FRAME_BYTES / 2 {
+            let mut line = alloc::string::String::from("SHOT");
+            push_runs(&self.frame, &mut self.index, SNAPSHOT_RUNS, &mut line);
+            return Some(line);
+        }
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        Some("SHOT END".into())
+    }
+}
+
+/// Appends up to `max_runs` ` rgb565:length` runs starting at pixel `*index`, and moves `index` past them.
+fn push_runs(frame: &[u8], index: &mut usize, max_runs: usize, line: &mut dyn core::fmt::Write) {
+    let pixel = |index: usize| u16::from_be_bytes([frame[index * 2], frame[index * 2 + 1]]);
+    let total = FRAME_BYTES / 2;
+    for _ in 0..max_runs {
+        if *index >= total {
+            break;
+        }
+        let color = pixel(*index);
+        let mut run = 1;
+        while *index + run < total && pixel(*index + run) == color && run < 60000 {
+            run += 1;
+        }
+        let _ = line.write_fmt(format_args!(" {:04x}:{}", color, run));
+        *index += run;
+    }
 }
