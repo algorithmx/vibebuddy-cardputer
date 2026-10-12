@@ -11,24 +11,27 @@ Both the box and a computer open a WebSocket to `wss://<relay>/v1/boxes/<box-id>
 The Relay first sends `{"t":"challenge","nonce":"…"}`. The client answers:
 
 ```json
-{"t":"hello","role":"box","key":"<public key>","sig":"<signature>"}
+{"t":"hello","role":"box","key":"<public key>","sig":"<signature>","v":1}
 ```
 
-`role` is `box` or `computer`, `key` the client's own public key, and `sig` its Ed25519 signature, base64url, over the UTF-8 bytes of
+`role` is `box` or `computer`, `key` the client's own public key, `v` the protocol version the client speaks (an integer; absent means 1), and `sig` its Ed25519 signature, base64url, over the UTF-8 bytes of
 
 ```text
 vibebuddy-relay-v1\n<role>\n<box-id>\n<nonce>
 ```
 
-A box must use the key that is its id. A computer must be in the box's paired list. The Relay replies `{"t":"welcome"}`, or `{"t":"error","code":"auth"|"not_paired"}` and closes (4001, 4003). A socket without a valid hello within 10 s gets `{"t":"error","code":"auth_timeout"}` and close 4001.
+A box must use the key that is its id. A computer must be in the box's paired list. The Relay replies `{"t":"welcome","v":1}` (its own protocol version; parsers ignore fields they don't know), or `{"t":"error","code":"auth"|"not_paired"}` and closes (4001, 4003). A socket without a valid hello within 10 s gets `{"t":"error","code":"auth_timeout"}` and close 4001.
 
 One socket per key: a new connection from the same box, or the same computer, replaces the old one (close 4002). A computer's Relay link survives the swap: the box isn't told, the new socket's `status` shows it linked, and data flows without sending `link` again.
+
+A `v` that isn't an integer gets `{"t":"error","code":"auth"}` and close 4001. A `v` older than the Relay's minimum gets `{"t":"error","code":"upgrade"}` and close 4005: the client stops retrying and says an update is needed. The minimum is 1 today. The Relay raises its version when it adds something clients may rely on, and its minimum only when it drops support for old clients.
 
 ## Limits and keepalive
 
 - A message over 8 KiB gets `{"t":"error","code":"too_big"}` and close 1009.
 - Each socket may send a burst of 100 messages, refilled at 50 a second; past that it gets `{"t":"error","code":"rate"}` and close 1008. A linked computer dropped this way counts as gone.
-- Clients send WebSocket ping frames every 30 s, and treat the link as dead after 75 s with no frame from the Relay, then reconnect with backoff. The Relay answers pings without waking; there is no JSON ping message.
+- Clients send WebSocket ping frames every 30 s, and treat the link as dead after 75 s with no frame from the Relay, then reconnect with backoff. Ping frames keep NATs open, but the Relay can't see them.
+- The sign of life the Relay does see is the exact text `{"t":"ping"}` (no spaces, no other fields), which it answers with the exact text `{"t":"pong"}` without waking. The box sends it every 30 s. While a computer is connected to the box, a box with no message and no answered ping for 75 s is closed with 4004 `silent`, and computers get `status` with `box: false`; the box reconnects with backoff, says hello again and re-sends `paired`. With no computer connected the box isn't watched. Any other text is a normal message.
 
 ## The box
 
