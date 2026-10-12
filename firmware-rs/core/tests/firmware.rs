@@ -1030,6 +1030,22 @@ mod relay {
     }
 
     #[test]
+    fn every_new_socket_hears_the_local_link_again() {
+        // The Relay forgets a local owner when the box's socket goes, so a box that reconnects while still on
+        // the cable must claim it again.
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{COMPUTER}","name":"a"}}"#));
+        let mut relay = RelayBox::new();
+        for socket in ["first", "second"] {
+            relay.hello(&firmware, socket);
+            relay.message(&mut firmware, &mut board, &json!({"t": "welcome"}));
+            let reports: Vec<Value> = relay.report(&firmware, board.now_ms()).iter().map(|text| parse(text)).collect();
+            assert_eq!(reports[1], json!({"t": "linked", "via": "usb", "computer": COMPUTER}), "{socket}");
+            relay.gone(&mut firmware, board.now_ms());
+        }
+    }
+
+    #[test]
     fn pairing_over_the_relay_is_refused() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let mut relay = RelayBox::new();
