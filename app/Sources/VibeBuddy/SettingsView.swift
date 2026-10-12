@@ -255,19 +255,21 @@ struct HooksView: View {
     @State private var pendingPlan: HookInstaller.Plan?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Connect agents").font(.headline)
-            Text("VibeBuddy only forwards session IDs, event names and working directories — never prompts or replies.").font(.callout).foregroundStyle(.secondary)
-            Text("This writes user-level config, so one install covers both the desktop app's sessions and the same agent running in a terminal.").font(.callout).foregroundStyle(.secondary)
-            ForEach(HookAgent.allCases, id: \.rawValue) { agent in
-                HookRow(model: model, agent: agent, pendingPlan: $pendingPlan)
+        // Scrolls: five agents and the terminals outgrow the window, and an overflowing VStack pushes the tab bar out of sight.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Connect agents").font(.headline)
+                Text("VibeBuddy only forwards session IDs, event names and working directories — never prompts or replies.").font(.callout).foregroundStyle(.secondary)
+                Text("This writes user-level config, so one install covers both the desktop app's sessions and the same agent running in a terminal.").font(.callout).foregroundStyle(.secondary)
+                ForEach(HookAgent.allCases, id: \.rawValue) { agent in
+                    HookRow(model: model, agent: agent, pendingPlan: $pendingPlan)
+                }
+                Text("Terminal tabs").font(.headline).padding(.top, 8)
+                Text("With access to your terminal, K2 goes straight to the tab a session runs in, instead of just bringing the terminal forward. Only the terminals you run agents in need it.").font(.callout).foregroundStyle(.secondary)
+                ForEach(TerminalAccess.installed) { terminal in
+                    TerminalAccessRow(model: model, terminal: terminal, state: model.terminalAccess[terminal.bundleID] ?? .unknown)
+                }
             }
-            Text("Terminal tabs").font(.headline).padding(.top, 8)
-            Text("With access to your terminal, K2 goes straight to the tab a session runs in, instead of just bringing the terminal forward. Only the terminals you run agents in need it.").font(.callout).foregroundStyle(.secondary)
-            ForEach(TerminalAccess.installed) { terminal in
-                TerminalAccessRow(model: model, terminal: terminal, state: model.terminalAccess[terminal.bundleID] ?? .unknown)
-            }
-            Spacer()
         }
         .onAppear { model.refreshTerminalAccess() }
         // The answer may have changed in System Settings while the window was in the background.
@@ -512,7 +514,7 @@ struct DeviceView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
-                    Button("Update to \(offer.version)") { confirmUpdate(offer) }
+                    Button("Update to \(offer.version)") { FlashConfirm.update(offer, then: model.updateFirmware) }
                         .disabled(model.operationRunning || !connected)
                 } else if model.foreignFirmware {
                     Text("The box isn't running VibeBuddy firmware.").foregroundStyle(.orange)
@@ -615,16 +617,6 @@ struct DeviceView: View {
         if alert.runModal() == .alertFirstButtonReturn { model.flashFirmware(package) }
     }
 
-    private func confirmUpdate(_ offer: FirmwareOffer) {
-        let alert = NSAlert()
-        alert.messageText = String(localized: "Update the box firmware to \(offer.version)?")
-        var text = String(localized: "The box restarts once; its voice pack and today's stats are kept. Over the UART bridge this takes a few minutes.")
-        if let notes = Firmware.notes(offer.notes, chinese: Resources.uiLanguage == .zh) { text = notes + "\n\n" + text }
-        alert.informativeText = text
-        alert.addButton(withTitle: String(localized: "Update"))
-        alert.addButton(withTitle: String(localized: "Cancel"))
-        if alert.runModal() == .alertFirstButtonReturn { model.updateFirmware() }
-    }
 }
 
 /// Why there's no firmware to flash yet and what to do about it: shared by onboarding and the Device tab.
@@ -719,8 +711,20 @@ struct BoxNotFoundHelp: View {
     }
 }
 
-/// Confirmation for flashing a factory box: shared by onboarding and the Device tab.
+/// Confirmations for flashing: shared by onboarding and the Device tab.
 enum FlashConfirm {
+    @MainActor
+    static func update(_ offer: FirmwareOffer, then flash: () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Update the box firmware to \(offer.version)?")
+        var text = String(localized: "The box restarts once; its voice pack and today's stats are kept. Over the UART bridge this takes a few minutes.")
+        if let notes = Firmware.notes(offer.notes, chinese: Resources.uiLanguage == .zh) { text = notes + "\n\n" + text }
+        alert.informativeText = text
+        alert.addButton(withTitle: String(localized: "Update"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        if alert.runModal() == .alertFirstButtonReturn { flash() }
+    }
+
     @MainActor
     static func foreign(then flash: () -> Void) {
         let alert = NSAlert()

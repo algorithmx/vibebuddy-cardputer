@@ -70,6 +70,11 @@ release version:
     [[ -s "docs/releases/v${v}.md" ]] || { echo "write docs/releases/v${v}.md (what this release does) and commit it first" >&2; exit 2; }
     # Always write ${v}, not $v: a character right after $v can be read as part of the name
     # (full-width punctuation in the old Chinese messages did exactly that).
+    # The two updates below run offline, so every dependency must already be in the cargo cache. A machine that has
+    # never built the firmware lacks its crates (v0.4.2's first run stopped on embassy-executor); fetch them first,
+    # before anything is changed, so a failure leaves the tree clean.
+    cargo fetch -q
+    RUSTUP_TOOLCHAIN=stable cargo fetch --manifest-path firmware-rs/device/Cargo.toml -q
     perl -pi -e 'BEGIN{$new=shift} s/^version = ".*"/version = "$new"/ && ($done++) unless $done' "${v}" Cargo.toml
     cargo update --workspace --offline -q
     # The firmware has its own lockfile, which also records these crates' versions; a stale one fails the
