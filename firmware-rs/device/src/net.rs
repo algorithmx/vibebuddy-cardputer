@@ -143,7 +143,10 @@ async fn connection(mut controller: WifiController<'static>) {
                     }
                 }
             }
-            embassy_futures::select::Either::First(Err(error)) => line(alloc::format!("WIFI FAILED {error:?}")),
+            embassy_futures::select::Either::First(Err(error)) => {
+                line(alloc::format!("WIFI FAILED {error:?}"));
+                report_scan(&mut controller).await;
+            }
             embassy_futures::select::Either::Second(next) => {
                 wanted = next;
                 continue;
@@ -153,6 +156,22 @@ async fn connection(mut controller: WifiController<'static>) {
         if let embassy_futures::select::Either::Second(next) = select(Timer::after(Duration::from_secs(10)), CREDENTIALS.wait()).await {
             wanted = next;
         }
+    }
+}
+
+/// `WIFI SEEN <rssi> <channel> <ssid>` for what the box can hear, strongest first: when it can't join,
+/// this tells a 5 GHz-only network or a mistyped name from a box that hears nothing.
+async fn report_scan(controller: &mut WifiController<'static>) {
+    let config = esp_radio::wifi::scan::ScanConfig::default().with_max(12);
+    match controller.scan_async(&config).await {
+        Ok(mut found) => {
+            found.sort_by_key(|ap| core::cmp::Reverse(ap.signal_strength));
+            line(alloc::format!("WIFI SEEN {}", found.len()));
+            for ap in found {
+                line(alloc::format!("WIFI SEEN {} {} {}", ap.signal_strength, ap.channel, ap.ssid.as_str()));
+            }
+        }
+        Err(error) => line(alloc::format!("WIFI SCAN FAILED {error:?}")),
     }
 }
 

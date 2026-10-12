@@ -368,6 +368,7 @@ async fn main(spawner: Spawner) -> ! {
     // Booting got this far, so an image installed over the air keeps its slot.
     storage::confirm_running_image();
     net::CREDENTIALS.signal(wifi_credentials(&firmware));
+    report_memory(&mut board);
 
     let mut input = [0u8; 256];
     loop {
@@ -390,6 +391,10 @@ async fn main(spawner: Spawner) -> ! {
                 net::NetEvent::Line(line) => {
                     board.write(line.as_bytes());
                     board.write(b"\n");
+                    // Once on the network, the Wi-Fi driver has taken what it needs (#108).
+                    if line.starts_with("WIFI ADDRESS") {
+                        report_memory(&mut board);
+                    }
                 }
                 net::NetEvent::Opened(conn, nonce) => firmware.lan_opened(&mut board, conn, nonce),
                 net::NetEvent::Received(conn, bytes) => firmware.lan_received(&mut board, conn, &bytes),
@@ -407,4 +412,13 @@ async fn main(spawner: Spawner) -> ! {
 
 fn wifi_credentials(firmware: &Firmware) -> Option<(alloc::string::String, alloc::string::String)> {
     firmware.wifi().map(|wifi| (wifi.ssid.clone(), wifi.password.clone()))
+}
+
+/// `MEMORY INTERNAL <free>/<total> PSRAM <free>/<total>` in bytes: what the heaps have left (#108).
+fn report_memory(board: &mut DeviceBoard) {
+    let stats = esp_alloc::HEAP.stats();
+    let internal = esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into());
+    let external = esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into());
+    let line = alloc::format!("MEMORY INTERNAL {internal} PSRAM {external} TOTAL {}/{}\n", stats.size - stats.current_usage, stats.size);
+    board.write(line.as_bytes());
 }
