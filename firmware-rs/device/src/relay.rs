@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::ffi::CStr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use embassy_futures::select::{Either4, select4};
+use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
@@ -67,6 +67,8 @@ pub static BOX_ID: Signal<CriticalSectionRawMutex, String> = Signal::new();
 /// The Relay's URL, `wss://host`: signalled at boot and whenever the computer on the cable names
 /// another, which drops the socket and connects to the new one.
 pub static URL: Signal<CriticalSectionRawMutex, String> = Signal::new();
+/// The box is about to restart: close the socket with 1000 and stay off.
+pub static STOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Unix seconds at `Instant` zero, once SNTP has answered; 0 until then. 32 bits last until 2106, and
 /// Xtensa has no 64-bit atomics.
@@ -110,6 +112,8 @@ fn civil(unix: u64) -> mbedtls_rs::sys::tm {
 const UPGRADE: &str = "update needed";
 /// The computer on the cable named another Relay.
 const MOVED: &str = "moved";
+/// The box is restarting.
+const STOPPED: &str = "stopped";
 
 fn line(text: String) {
     let _ = IN.try_send(RelayIn::Line(text));
@@ -148,6 +152,7 @@ pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
         let _ = IN.try_send(RelayIn::Gone);
         match result {
             Err(MOVED) => continue,
+            Err(STOPPED) => return,
             // Only another firmware, or another Relay, can help.
             Err(UPGRADE) => {
                 line(alloc::format!("RELAY FAILED {UPGRADE}"));
@@ -263,7 +268,7 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, host: &str, box_id: 
                 _ => {}
             }
         }
-        match select4(session.read(&mut chunk), OUT.receive(), ping.next(), URL.wait()).await {
+        match select4(session.read(&mut chunk), OUT.receive(), ping.next(), select(URL.wait(), STOP.wait())).await {
             Either4::First(Ok(0)) | Either4::First(Err(_)) => return Err("closed"),
             Either4::First(Ok(count)) => {
                 heard = Instant::now();
@@ -281,7 +286,11 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, host: &str, box_id: 
                 send_frame(&mut session, FrameType::Text(false), relay_box::PING.as_bytes()).await?;
             }
             // The task picks the new URL up as it connects again.
-            Either4::Fourth(next) => {
+            Either4::Fourth(Either::Second(())) => {
+                let _ = send_frame(&mut session, FrameType::Close, &1000u16.to_be_bytes()).await;
+                return Err(STOPPED);
+            }
+            Either4::Fourth(Either::First(next)) => {
                 URL.signal(next);
                 let _ = send_frame(&mut session, FrameType::Close, &1000u16.to_be_bytes()).await;
                 return Err(MOVED);
