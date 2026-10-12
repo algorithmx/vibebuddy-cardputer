@@ -29,9 +29,9 @@ const PROTOCOL_VERSION: u32 = 1;
 /// The exact text the Relay counts as a sign of life and answers without waking.
 const PING: &str = r#"{"t":"ping"}"#;
 
-/// Where the Relay is when nothing overrides it. Staging while builds are internal; production
-/// (`wss://relay.korekore.ai`) once it is deployed.
-pub const DEFAULT_URL: &str = "wss://relay-staging.korekore.ai";
+/// Where the Relay is when nothing overrides it; development points at `wss://relay-staging.korekore.ai`
+/// with `VIBEBUDDY_RELAY_URL`.
+pub const DEFAULT_URL: &str = "wss://relay.korekore.ai";
 /// Pings go out this often, and a Relay silent this long is taken for gone (docs/relay-protocol.md).
 const PING_EVERY: Duration = Duration::from_secs(30);
 const DEAD_AFTER: Duration = Duration::from_secs(75);
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn the_manifest_moves_the_relay_unless_it_was_given_by_hand() {
         let config = RelayConfig::new(Arc::new(identity()), None);
-        assert_eq!(config.url(), DEFAULT_URL);
+        assert_eq!(config.url(), "wss://relay.korekore.ai");
         config.offer("ws://plain.example");
         assert_eq!(config.url(), DEFAULT_URL, "never off TLS");
         config.offer("wss://relay2.korekore.ai");

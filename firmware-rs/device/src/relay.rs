@@ -1,5 +1,5 @@
 //! The box on the Relay (ADR-0012, docs/relay-protocol.md): a WebSocket over TLS to
-//! `relay-staging.korekore.ai`, kept open whenever the box is on Wi-Fi. This task only moves text frames;
+//! `relay.korekore.ai`, kept open whenever the box is on Wi-Fi. This task only moves text frames;
 //! firmware-core's `RelayBox`, run by the main loop, decides what they say. The certificate is checked
 //! against the roots in `certs/relay-roots.pem` (#110), so the box needs the time first: SNTP from
 //! `time.cloudflare.com`.
@@ -24,9 +24,9 @@ use mbedtls_rs::io::Write as _;
 use mbedtls_rs::sys::hook::wall_clock::MbedtlsWallClock;
 use mbedtls_rs::{Certificate, ClientSessionConfig, Session, SessionConfig, Tls, X509};
 
-/// The Relay, staging while builds are internal (ADR-0012).
-const HOST: &str = "relay-staging.korekore.ai";
-const HOST_C: &CStr = c"relay-staging.korekore.ai";
+/// The Relay (ADR-0012).
+const HOST: &str = "relay.korekore.ai";
+const HOST_C: &CStr = c"relay.korekore.ai";
 const TIME_HOST: &str = "time.cloudflare.com";
 const ROOTS: &str = concat!(include_str!("../certs/relay-roots.pem"), "\0");
 /// Every 30 s the box sends a WebSocket ping, which keeps NATs open, and the exact text `{"t":"ping"}`,
