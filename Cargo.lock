@@ -4687,7 +4687,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibebuddy-desktop"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "futures",
@@ -4704,7 +4704,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-firmware-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ed25519-dalek",
  "libm",
@@ -4714,7 +4714,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-hook"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "libc",
@@ -4724,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-manifest"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -4739,7 +4739,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-protocol"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4747,7 +4747,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddyd"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "axum",
  "base64 0.22.1",

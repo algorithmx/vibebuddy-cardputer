@@ -1,14 +1,14 @@
 import SwiftUI
 import VibeBuddyCore
 
-/// First-run onboarding: welcome → find the box → connect agents → pick a voice → launch at login → done.
+/// First-run onboarding: welcome → find the box → connect agents → pick a character → launch at login → done.
 struct OnboardingView: View {
     @ObservedObject var model: AppModel
     let finish: () -> Void
     @State private var step = 0
     @State private var pendingPlan: HookInstaller.Plan?
 
-    private let titles: [LocalizedStringKey] = ["Welcome", "Find the box", "Connect agents", "Pick a voice", "Launch at login", "Done"]
+    private let titles: [LocalizedStringKey] = ["Welcome", "Find the box", "Connect agents", "Pick a character", "Launch at login", "Done"]
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,17 +19,21 @@ struct OnboardingView: View {
                 }
             }
             Divider()
-            Group {
-                switch step {
-                case 0: welcome
-                case 1: findDevice
-                case 2: hooks
-                case 3: voices
-                case 4: loginItem
-                default: done
+            // Pages scroll instead of overflowing: a fixed-size page gets clipped top and bottom once its content grows.
+            ScrollView {
+                Group {
+                    switch step {
+                    case 0: welcome
+                    case 1: findDevice
+                    case 2: hooks
+                    case 3: voices
+                    case 4: loginItem
+                    default: done
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxHeight: .infinity)
             Divider()
             HStack {
                 if step > 0 && step < 5 { Button("Back") { step -= 1 } }
@@ -46,7 +50,7 @@ struct OnboardingView: View {
             }
         }
         .padding(24)
-        .frame(width: 560, height: 440)
+        .frame(width: 560, height: 540)
         .sheet(item: Binding(get: { pendingPlan.map(PlanBox.init) }, set: { pendingPlan = $0?.plan })) { box in
             PlanSheet(plan: box.plan, confirm: { model.applyHookPlan(box.plan); pendingPlan = nil }, cancel: { pendingPlan = nil })
         }
@@ -59,8 +63,8 @@ struct OnboardingView: View {
         HStack(alignment: .top, spacing: 24) {
             Image(nsImage: PixelFace.largeImage()).interpolation(.none)
             VStack(alignment: .leading, spacing: 10) {
-                Text("VibeBuddy turns what Codex and Claude Code are doing into pictures and sounds on the box.").font(.title3)
-                Text("Next: plug in the box, connect your agents, pick an announcement voice, and choose whether to launch at login. Everything can be changed or skipped.")
+                Text("VibeBuddy turns what your coding agents are doing into pictures and sounds on the box.").font(.title3)
+                Text("Next: plug in the box, connect your agents, pick a character, and choose whether to launch at login. Everything can be changed or skipped.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -100,6 +104,14 @@ struct OnboardingView: View {
                 Label("Found it: \(device.port ?? "")", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                 Button("Make it blink") { model.identify() }
                 Text("If the backlight flashes, that's the one.").font(.caption).foregroundStyle(.secondary)
+                // The cable is in and someone is watching: the best moment to bring a box that left the factory on older firmware up to date.
+                if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
+                    Label("Newer firmware is available: \(offer.version)", systemImage: "arrow.down.circle").foregroundStyle(.orange)
+                    Button("Update to \(offer.version)") { FlashConfirm.update(offer, then: model.updateFirmware) }
+                    Text("You can also skip this and update later on the Device tab in Settings.").font(.caption).foregroundStyle(.secondary)
+                } else if let offer = model.offeredFirmware, offer.newerThanBox {
+                    Text("Downloading firmware \(offer.version)…").font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 Label(model.daemonAlive ? "No box yet — this updates once you plug it in." : "Starting the daemon…", systemImage: "cable.connector")
                     .foregroundStyle(.secondary)
@@ -121,11 +133,10 @@ struct OnboardingView: View {
 
     private var voices: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Pick an announcement voice.").font(.title3)
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(Resources.bundledVoices) { entry in VoiceCard(model: model, entry: entry) }
-                }
+            Text("Pick a character.").font(.title3)
+            VStack(spacing: 6) {
+                RobotCard(model: model)
+                ForEach(Resources.bundledVoices) { entry in VoiceCard(model: model, entry: entry) }
             }
             if let operation = model.operation, operation.kind == .voicePack { OperationRow(operation: operation) }
             Text(voiceFootnote).font(.caption).foregroundStyle(.secondary)

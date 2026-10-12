@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-firmware-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ed25519-dalek",
  "libm",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "vibebuddy-protocol"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
