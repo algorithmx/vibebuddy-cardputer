@@ -24,6 +24,7 @@ pub mod leisure;
 pub mod lines;
 pub mod look;
 pub mod menu;
+pub mod ota;
 pub mod pomodoro;
 pub mod storage;
 pub mod voice_pack;

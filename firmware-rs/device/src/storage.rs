@@ -6,7 +6,8 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 use esp_storage::FlashStorage;
-use vibebuddy_firmware_core::storage::{Flash, FlashError};
+use vibebuddy_firmware_core::ota;
+use vibebuddy_firmware_core::storage::{Flash, FlashError, find_partition};
 
 static FLASH: Mutex<RefCell<Option<FlashStorage<'static>>>> = Mutex::new(RefCell::new(None));
 
@@ -19,6 +20,18 @@ fn with_flash<T>(action: impl FnOnce(&mut FlashStorage<'static>) -> Result<T, es
         Some(flash) => action(flash).map_err(|_| FlashError),
         None => Err(FlashError),
     })
+}
+
+/// Marks the running image as working, if it was just installed over the air and is waiting for that
+/// (ADR-0013); otherwise the bootloader rolls back to the previous slot on the next boot. Does nothing
+/// after a USB flash, which leaves otadata blank, or on the single-slot layout, which has no otadata.
+/// The write erases one otadata sector, so it runs at boot, before the Mac talks.
+pub fn confirm_running_image() {
+    let mut flash = SharedFlash;
+    if let Some(otadata) = find_partition(&mut flash, "otadata") {
+        // If this fails the image is rolled back on the next boot, which is the safe direction.
+        let _ = ota::confirm(&mut flash, otadata);
+    }
 }
 
 /// Reads any offset and length: reads 4-byte aligned into a small buffer, then picks out the wanted
