@@ -889,13 +889,14 @@ mod lan {
         };
         let (mut firmware, mut board) = paired_box();
         let now = board.now_ms();
-        assert_eq!((firmware.link_path(now), firmware.on_staging()), (None, false), "no link on production shows nothing");
+        assert_eq!(firmware.link_mark(now), (None, false), "no link shows nothing");
         assert_eq!(values(&firmware, now), [("NO LINK".to_owned(), Tone::Dim), ("OFF".to_owned(), Tone::Dim), ("OFF".to_owned(), Tone::Dim)]);
 
         send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.set","ssid":"Home","password":"secret"}"#);
         send(&mut firmware, &mut board, r#"{"version":1,"event":"device.relay.set","url":"wss://relay-staging.korekore.ai"}"#);
         let now = board.now_ms();
-        assert_eq!((firmware.link_path(now), firmware.on_staging()), (Some(LinkPath::Usb), true));
+        assert!(firmware.on_staging());
+        assert_eq!(firmware.link_mark(now), (Some(LinkPath::Usb), false), "the cable doesn't go through the Relay");
         assert_eq!(values(&firmware, now)[1..], [("Home".to_owned(), Tone::Dim), ("STAGING DOWN".to_owned(), Tone::Dim)]);
         firmware.set_wifi_joined(true);
         firmware.set_relay_up(true);
@@ -903,7 +904,10 @@ mod lan {
 
         board.advance(USB_QUIET_MS);
         link_up(&mut firmware, &mut board, 1);
-        assert_eq!(firmware.link_path(board.now_ms()), Some(LinkPath::Lan));
+        assert_eq!(firmware.link_mark(board.now_ms()), (Some(LinkPath::Lan), false));
+        firmware.lan_closed(&mut board, 1);
+        firmware.relay_linked(board.now_ms(), Some(computer().verifying_key().to_bytes()));
+        assert_eq!(firmware.link_mark(board.now_ms()), (Some(LinkPath::Relay), true), "STG marks a link through staging");
     }
 
     #[test]

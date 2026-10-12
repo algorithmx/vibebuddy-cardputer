@@ -475,9 +475,17 @@ impl Firmware {
         }
     }
 
-    /// The box uses the staging Relay, which every screen marks (docs/device-menu.md).
+    /// The box uses the staging Relay.
     pub fn on_staging(&self) -> bool {
         self.relay_name() == b"STAGING"
+    }
+
+    /// What the top left of every screen shows: the link's icon, and whether `STG` follows it. `STG` only
+    /// marks a link that goes through the staging Relay; over USB or the local network the Relay isn't in
+    /// the way, and the NETWORK view still says which one the box uses.
+    pub fn link_mark(&self, now: u32) -> (Option<LinkPath>, bool) {
+        let path = self.link_path(now);
+        (path, path == Some(LinkPath::Relay) && self.on_staging())
     }
 
     /// The Relay by name: `PROD` and `STAGING` for ours, the host for any other.
@@ -549,7 +557,7 @@ impl Firmware {
         self.tend_leisure(board);
         let now = board.now_ms();
         // The cable goes quiet and links come and go without a line to the screen; this only redraws on a change.
-        let (path, staging) = (self.link_path(now), self.on_staging());
+        let (path, staging) = self.link_mark(now);
         self.display.set_link(board, &scene!(self, now), path, staging);
         self.display.tick(board, &scene!(self, now));
     }

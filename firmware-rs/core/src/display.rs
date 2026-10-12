@@ -169,8 +169,8 @@ pub struct Display {
     identify_until: Option<u32>,
     identify_next_toggle: u32,
     muted: bool,
-    /// How the box is linked, as an icon in the top left at all times, and `STG` after it while its Relay is
-    /// staging (docs/device-menu.md). No icon with no link: NO LINK already says so.
+    /// How the box is linked, as an icon in the top left at all times, and `STG` after it while that link goes
+    /// through the staging Relay (docs/device-menu.md). No icon with no link: NO LINK already says so.
     link: (Option<LinkPath>, bool),
     /// The alarm is ringing: the phase ended and the user hasn't acted yet. Records the phase at the end;
     /// stops as soon as the view changes (start, abandon, skip) or the screen is switched away.

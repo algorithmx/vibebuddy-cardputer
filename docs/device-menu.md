@@ -70,7 +70,7 @@ How the box reaches its computer, as rows a glance can read; anything dimmed isn
 
 ![The plug in the top left](images/screen-link.png)
 
-Every screen shows how the box is linked as a small icon in its top left: a plug for USB, Wi-Fi waves for the local network, a cloud for the Relay. While the box uses the staging Relay, `STG` follows in orange, so a development build is never mistaken for a release. No icon shows without a link: the screen already says NO LINK. MUTE, when on, comes after them.
+Every screen shows how the box is linked as a small icon in its top left: a plug for USB, Wi-Fi waves for the local network, a cloud for the Relay. While that link goes through the staging Relay, `STG` follows the cloud in orange, so a development build is never mistaken for a release; over USB or the local network the Relay isn't in the way, so no `STG` shows (the NETWORK view still names the Relay). No icon shows without a link: the screen already says NO LINK. MUTE, when on, comes after them.
 
 ![USB, local network and Relay icons](images/link-icons.png)
 
