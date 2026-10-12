@@ -7,6 +7,7 @@
 //! taken away.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -24,6 +25,9 @@ use crate::identity::Identity;
 
 /// The Relay protocol version this daemon speaks (docs/relay-protocol.md).
 const PROTOCOL_VERSION: u32 = 1;
+
+/// The exact text the Relay counts as a sign of life and answers without waking.
+const PING: &str = r#"{"t":"ping"}"#;
 
 /// Where the Relay is when nothing overrides it. Staging while builds are internal; production
 /// (`wss://relay.korekore.ai`) once it is deployed.
@@ -78,8 +82,6 @@ pub enum RelayError {
     RateLimited,
     /// It refused us: `auth`, `not_paired` or another error code.
     Refused(String),
-    /// The box is linked elsewhere: `usb` or `linked`, and by whom.
-    Busy { reason: String, owner: String },
     /// Close 4005: the Relay no longer speaks this daemon's protocol version. Only an update helps.
     Upgrade,
 }
@@ -90,7 +92,6 @@ impl RelayError {
         let base = match self {
             Self::RateLimited => Duration::from_secs(30),
             Self::Refused(_) => Duration::from_secs(60),
-            Self::Busy { .. } => Duration::from_secs(10),
             Self::Unreachable(_) => Duration::from_secs(2),
             // Not again in this run: the next try would be refused the same way.
             Self::Upgrade => return Duration::from_secs(365 * 24 * 3600),
@@ -120,9 +121,20 @@ fn connector() -> Result<Connector, RelayError> {
     Ok(Connector::Rustls(Arc::new(config)))
 }
 
-/// Connects, proves this computer's key, and asks for the box. On success the returned stream carries
-/// the VibeBuddy Protocol as bytes, as the cable does.
-pub async fn link(config: &RelayConfig, box_key: &[u8; 32], takeover: bool) -> Result<DuplexStream, RelayError> {
+/// How a link that finds the box busy waits on the same socket instead of reconnecting: the Relay pushes
+/// `status` whenever the owner or the box changes, and a takeover goes out the moment the user asks.
+pub struct Wait<'a> {
+    /// Set when the user chose Take over; taken as it is sent.
+    pub takeover: &'a AtomicBool,
+    /// Told who has the box, each time the Relay says busy.
+    pub busy: &'a mut (dyn FnMut(String, String) + Send),
+    /// True when waiting no longer makes sense: the box turned up on the cable, or the Relay was turned off.
+    pub give_up: &'a (dyn Fn() -> bool + Sync),
+}
+
+/// Connects, proves this computer's key, and asks for the box, waiting on the socket while someone else has
+/// it. On success the returned stream carries the VibeBuddy Protocol as bytes, as the cable does.
+pub async fn link(config: &RelayConfig, box_key: &[u8; 32], wait: Wait<'_>) -> Result<DuplexStream, RelayError> {
     let url = box_url(&config.url(), box_key);
     let connected = tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector()?));
     let (mut socket, _) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connected).await {
@@ -133,17 +145,85 @@ pub async fn link(config: &RelayConfig, box_key: &[u8; 32], takeover: bool) -> R
         Ok(Err(error)) => return Err(RelayError::Unreachable(error.to_string())),
         Ok(Ok(connected)) => connected,
     };
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut socket, &config.identity, box_key, takeover)).await {
+    let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut socket, &config.identity, box_key)).await {
         Err(_) => Err(RelayError::Unreachable("handshake timed out".to_owned())),
-        Ok(Err(error)) => {
-            let _ = socket.close(None).await;
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(())) => wait_for_box(&mut socket, wait).await,
+    };
+    match result {
+        Ok(()) => Ok(bridge(socket)),
+        Err(error) => {
+            close_normally(&mut socket).await;
             Err(error)
         }
-        Ok(Ok(())) => Ok(bridge(socket)),
     }
 }
 
-async fn handshake<S>(socket: &mut S, identity: &Identity, box_key: &[u8; 32], takeover: bool) -> Result<(), RelayError>
+/// Asks for the box and waits on the socket until it is ours.
+async fn wait_for_box<S>(socket: &mut S, wait: Wait<'_>) -> Result<(), RelayError>
+where
+    S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+{
+    let first = if wait.takeover.swap(false, Ordering::Relaxed) { "takeover" } else { "link" };
+    send(socket, json!({"t": first})).await?;
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut pinged = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            message = socket.next() => match message {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                    match value["t"].as_str() {
+                        Some("linked") => return Ok(()),
+                        Some("busy") => {
+                            let text = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+                            (wait.busy)(text("owner"), text("reason"));
+                        }
+                        // The owner or the box changed: if nobody holds the box now, ask again. The Relay
+                        // decides about the grace period, so a busy answer just means keep waiting.
+                        Some("status") if value["owner"].is_null() || value["owner"]["linked"] == false => {
+                            send(socket, json!({"t": "link"})).await?;
+                        }
+                        Some("error") if value["code"] == "upgrade" => return Err(RelayError::Upgrade),
+                        Some("error") => return Err(RelayError::Refused(value["code"].as_str().unwrap_or("error").to_owned())),
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Close(frame))) => return Err(closed(frame.as_ref())),
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(RelayError::Unreachable(error.to_string())),
+                None => return Err(RelayError::Unreachable("closed".to_owned())),
+            },
+            _ = tick.tick() => {
+                if wait.takeover.swap(false, Ordering::Relaxed) {
+                    send(socket, json!({"t": "takeover"})).await?;
+                }
+                if (wait.give_up)() {
+                    return Err(RelayError::Unreachable("no longer needed".to_owned()));
+                }
+                // The Relay counts this as a sign of life without waking for it.
+                if pinged.elapsed() >= PING_EVERY {
+                    socket.send(Message::text(PING)).await.map_err(|error| RelayError::Unreachable(error.to_string()))?;
+                    pinged = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
+}
+
+/// A close frame with 1000, so the Relay can tell a socket given up on purpose from a network drop.
+async fn close_normally<S>(socket: &mut S)
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let frame = CloseFrame { code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal, reason: "".into() };
+    let _ = socket.send(Message::Close(Some(frame))).await;
+    let _ = socket.close().await;
+}
+
+async fn handshake<S>(socket: &mut S, identity: &Identity, box_key: &[u8; 32]) -> Result<(), RelayError>
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
@@ -155,12 +235,6 @@ where
     let sig = URL_SAFE_NO_PAD.encode(identity.sign(&signed_message("computer", &box_id, &nonce)));
     send(socket, json!({"t": "hello", "role": "computer", "key": identity.public_key(), "sig": sig, "v": PROTOCOL_VERSION})).await?;
     expect(socket, &["welcome"]).await?;
-    send(socket, json!({"t": if takeover { "takeover" } else { "link" }})).await?;
-    let answer = expect(socket, &["linked", "busy"]).await?;
-    if answer["t"] == "busy" {
-        let text = |name: &str| answer[name].as_str().unwrap_or_default().to_owned();
-        return Err(RelayError::Busy { reason: text("reason"), owner: text("owner") });
-    }
     Ok(())
 }
 
@@ -287,7 +361,7 @@ where
                     // The session let go of the stream: give the box up.
                     _ => {
                         let _ = sink.send(Message::text(json!({"t": "unlink"}).to_string())).await;
-                        let _ = sink.close().await;
+                        close_normally(&mut sink).await;
                         return;
                     }
                 }
@@ -303,7 +377,7 @@ where
             }
         }
     }
-    let _ = sink.close().await;
+    close_normally(&mut sink).await;
     // Dropping the write half ends the stream for the session, which then reconnects.
     let _ = write.shutdown().await;
 }
@@ -347,8 +421,21 @@ mod tests {
             socket.send(say(json!({"t": "status", "box": true, "owner": null}))).await.unwrap();
             let Some(Ok(Message::Text(_link))) = socket.next().await else { return };
             match answer {
+                "busy-forever" => {
+                    socket.send(say(json!({"t": "busy", "reason": "linked", "owner": "omarchy"}))).await.unwrap();
+                    while socket.next().await.is_some() {}
+                }
+                // Busy first; then the owner leaves, and the daemon asks again on the same socket.
                 "busy" => {
-                    socket.send(say(json!({"t": "busy", "reason": "usb", "owner": "omarchy"}))).await.unwrap();
+                    socket.send(say(json!({"t": "busy", "reason": "linked", "owner": "omarchy"}))).await.unwrap();
+                    socket.send(say(json!({"t": "status", "box": true, "owner": null}))).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = socket.next().await {
+                        if serde_json::from_str::<Value>(&text).unwrap()["t"] == "link" {
+                            break;
+                        }
+                    }
+                    socket.send(say(json!({"t": "linked"}))).await.unwrap();
+                    while socket.next().await.is_some() {}
                 }
                 _ => {
                     socket.send(say(json!({"t": "linked"}))).await.unwrap();
@@ -377,10 +464,17 @@ mod tests {
         format!("ws://{address}")
     }
 
+    /// Links without waiting for anything: no takeover, busy ignored, never gives up.
+    async fn link_now(config: &RelayConfig) -> Result<DuplexStream, RelayError> {
+        let takeover = AtomicBool::new(false);
+        let mut busy = |_: String, _: String| {};
+        link(config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false }).await
+    }
+
     #[tokio::test]
     async fn lines_go_through_the_relay_both_ways_until_the_box_is_taken() {
         let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("linked").await));
-        let mut stream = link(&config, &[5; 32], false).await.unwrap();
+        let mut stream = link_now(&config).await.unwrap();
         stream.write_all(b"{\"version\":1,\"event\":\"device.hello\"}\n").await.unwrap();
         let mut received = String::new();
         stream.read_to_string(&mut received).await.unwrap();
@@ -390,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn the_box_coming_back_starts_the_session_over() {
         let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("restart").await));
-        let mut stream = link(&config, &[5; 32], false).await.unwrap();
+        let mut stream = link_now(&config).await.unwrap();
         stream.write_all(b"{\"version\":1,\"event\":\"x\"}\n").await.unwrap();
         let mut received = String::new();
         stream.read_to_string(&mut received).await.unwrap();
@@ -398,12 +492,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_names_the_owner() {
+    async fn a_busy_link_waits_on_the_socket_and_gets_the_box_when_it_frees_up() {
         let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy").await));
-        assert_eq!(
-            link(&config, &[5; 32], false).await.err(),
-            Some(RelayError::Busy { reason: "usb".to_owned(), owner: "omarchy".to_owned() })
-        );
+        let takeover = AtomicBool::new(false);
+        let owners = std::sync::Mutex::new(Vec::new());
+        let mut busy = |owner: String, reason: String| owners.lock().unwrap().push((owner, reason));
+        let linked = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false }).await;
+        assert!(linked.is_ok());
+        assert_eq!(owners.lock().unwrap().as_slice(), [("omarchy".to_owned(), "linked".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn waiting_stops_when_no_longer_needed() {
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy-forever").await));
+        let takeover = AtomicBool::new(false);
+        let mut busy = |_: String, _: String| {};
+        let result = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| true }).await;
+        assert!(matches!(result, Err(RelayError::Unreachable(_))));
     }
 
     #[test]

@@ -268,13 +268,15 @@ async fn serial_worker(
         };
         let Some(PortChoice { name: port_name, paced, usb_serial }) = choice else {
             // No box on the cable: try the local network, then the Relay, if this computer is paired with a box.
-            let takeover = config.takeover.swap(false, Ordering::Relaxed);
+            // Taken here only for the local network; the Relay takes it on its socket, even mid-wait.
+            let takeover = config.takeover.load(Ordering::Relaxed);
             let mut busy = None;
             if let Some(lan) = &config.lan
                 && let Some(target) = lan.target()
             {
                 match lan::connect(&target, &lan.identity, takeover).await {
                     Ok(mut stream) => {
+                        config.takeover.store(false, Ordering::Relaxed);
                         info!(address = %target.address, "linked over the local network");
                         busy_logged = None;
                         let _ = device_event_sender.send(DeviceMessage::ConnectedNetwork { address: target.address.clone() }).await;
@@ -311,7 +313,21 @@ async fn serial_worker(
                 && let (Some(relay_config), Some(box_key)) = (&config.relay, box_key)
                 && (takeover || relay_retry.is_none_or(|at| Instant::now() >= at))
             {
-                match relay::link(relay_config, &box_key, takeover).await {
+                let reported_busy = std::sync::Mutex::new(busy_logged.clone());
+                let mut on_busy = |owner: String, reason: String| {
+                    let mut reported = reported_busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if reported.as_ref() != Some(&format!("{owner}/{reason}")) {
+                        info!(%owner, %reason, "the box is linked elsewhere; waiting on the Relay");
+                        *reported = Some(format!("{owner}/{reason}"));
+                        let _ = device_event_sender.try_send(DeviceMessage::Busy { owner, reason });
+                    }
+                };
+                // Waiting on the socket ends when the box turns up on the cable or the user turns the Relay off.
+                let give_up = || matches!(find_port(&config), Ok(Found::One(_))) || !config.relay_enabled.load(Ordering::Relaxed);
+                let wait = relay::Wait { takeover: &config.takeover, busy: &mut on_busy, give_up: &give_up };
+                let relay_link = relay::link(relay_config, &box_key, wait).await;
+                busy_logged = reported_busy.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+                match relay_link {
                     Ok(mut stream) => {
                         let url = relay_config.url();
                         info!(%url, "linked through the Relay");
@@ -342,10 +358,6 @@ async fn serial_worker(
                             _ => {}
                         }
                         continue;
-                    }
-                    Err(RelayError::Busy { reason, owner }) => {
-                        busy = Some((owner, reason));
-                        relay_retry = Some(Instant::now() + RelayError::Busy { reason: String::new(), owner: String::new() }.backoff(0));
                     }
                     Err(RelayError::Upgrade) => {
                         warn!("the Relay no longer speaks this version of VibeBuddy; update to reach the box through it");
