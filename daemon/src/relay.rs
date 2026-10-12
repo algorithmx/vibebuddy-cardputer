@@ -130,6 +130,8 @@ pub struct Wait<'a> {
     pub busy: &'a mut (dyn FnMut(String, String) + Send),
     /// True when waiting no longer makes sense: the box turned up on the cable, or the Relay was turned off.
     pub give_up: &'a (dyn Fn() -> bool + Sync),
+    /// Told, once linked, whenever the box goes off or comes back on the Relay (`status` box, or `linked` again).
+    pub presence: Arc<dyn Fn(bool) + Send + Sync>,
 }
 
 /// Connects, proves this computer's key, and asks for the box, waiting on the socket while someone else has
@@ -145,13 +147,14 @@ pub async fn link(config: &RelayConfig, box_key: &[u8; 32], wait: Wait<'_>) -> R
         Ok(Err(error)) => return Err(RelayError::Unreachable(error.to_string())),
         Ok(Ok(connected)) => connected,
     };
+    let presence = wait.presence.clone();
     let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut socket, &config.identity, box_key)).await {
         Err(_) => Err(RelayError::Unreachable("handshake timed out".to_owned())),
         Ok(Err(error)) => Err(error),
         Ok(Ok(())) => wait_for_box(&mut socket, wait).await,
     };
     match result {
-        Ok(()) => Ok(bridge(socket)),
+        Ok(()) => Ok(bridge(socket, presence)),
         Err(error) => {
             close_normally(&mut socket).await;
             Err(error)
@@ -289,13 +292,13 @@ where
 /// Runs the linked socket behind a byte stream: lines written to the stream go out as `data`, `data`
 /// from the box comes back as lines. The stream ends when the box is taken away, the Relay closes, or
 /// it goes quiet for [`DEAD_AFTER`].
-fn bridge(socket: Socket) -> DuplexStream {
+fn bridge(socket: Socket, presence: Arc<dyn Fn(bool) + Send + Sync>) -> DuplexStream {
     let (ours, theirs) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(run_bridge(socket, theirs));
+    tokio::spawn(run_bridge(socket, theirs, presence));
     ours
 }
 
-async fn run_bridge<S>(socket: S, stream: DuplexStream)
+async fn run_bridge<S>(socket: S, stream: DuplexStream, presence: Arc<dyn Fn(bool) + Send + Sync>)
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
@@ -307,6 +310,8 @@ where
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heard = tokio::time::Instant::now();
+    // The Relay links a computer even while the box is away; its first status says whether it is there.
+    let mut box_here = true;
     loop {
         tokio::select! {
             message = source.next() => {
@@ -324,6 +329,10 @@ where
                             // Linked again while linked: the box reconnected to the Relay (it restarted, say), so
                             // the session starts over with hello, as on a new cable connection.
                             Some("linked") => {
+                                if !box_here {
+                                    box_here = true;
+                                    presence(true);
+                                }
                                 let hello = vibebuddy_protocol::Event::named("device.hello");
                                 let Ok(frame) = serde_json::to_string(&hello) else { continue };
                                 if sink.send(Message::text(json!({"t": "data", "line": frame}).to_string())).await.is_err() {
@@ -335,7 +344,15 @@ where
                                 break;
                             }
                             Some("error") => warn!(code = value["code"].as_str().unwrap_or("?"), "the Relay reported an error"),
-                            Some("status") => debug!(%value, "Relay status"),
+                            // The box went away (its power, its Wi-Fi) while this computer stays linked: the link
+                            // is down until the Relay says linked again.
+                            Some("status") => {
+                                debug!(%value, "Relay status");
+                                if value["box"] == false && box_here {
+                                    box_here = false;
+                                    presence(false);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -421,6 +438,14 @@ mod tests {
             socket.send(say(json!({"t": "status", "box": true, "owner": null}))).await.unwrap();
             let Some(Ok(Message::Text(_link))) = socket.next().await else { return };
             match answer {
+                // Linked; then the box loses power and comes back.
+                "away" => {
+                    socket.send(say(json!({"t": "linked"}))).await.unwrap();
+                    socket.send(say(json!({"t": "status", "box": false, "owner": {"key": "k", "name": "n", "via": "relay", "linked": true}}))).await.unwrap();
+                    socket.send(say(json!({"t": "linked"}))).await.unwrap();
+                    socket.send(say(json!({"t": "unlinked", "reason": "takeover"}))).await.unwrap();
+                    while socket.next().await.is_some() {}
+                }
                 "busy-forever" => {
                     socket.send(say(json!({"t": "busy", "reason": "linked", "owner": "omarchy"}))).await.unwrap();
                     while socket.next().await.is_some() {}
@@ -468,7 +493,7 @@ mod tests {
     async fn link_now(config: &RelayConfig) -> Result<DuplexStream, RelayError> {
         let takeover = AtomicBool::new(false);
         let mut busy = |_: String, _: String| {};
-        link(config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false }).await
+        link(config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false, presence: Arc::new(|_| {}) }).await
     }
 
     #[tokio::test]
@@ -497,9 +522,23 @@ mod tests {
         let takeover = AtomicBool::new(false);
         let owners = std::sync::Mutex::new(Vec::new());
         let mut busy = |owner: String, reason: String| owners.lock().unwrap().push((owner, reason));
-        let linked = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false }).await;
+        let linked = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false, presence: Arc::new(|_| {}) }).await;
         assert!(linked.is_ok());
         assert_eq!(owners.lock().unwrap().as_slice(), [("omarchy".to_owned(), "linked".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn the_box_going_away_and_coming_back_is_reported() {
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("away").await));
+        let takeover = AtomicBool::new(false);
+        let mut busy = |_: String, _: String| {};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let presence: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(move |here| record.lock().unwrap().push(here));
+        let mut stream = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false, presence }).await.unwrap();
+        let mut rest = String::new();
+        stream.read_to_string(&mut rest).await.unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), [false, true]);
     }
 
     #[tokio::test]
@@ -507,7 +546,7 @@ mod tests {
         let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy-forever").await));
         let takeover = AtomicBool::new(false);
         let mut busy = |_: String, _: String| {};
-        let result = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| true }).await;
+        let result = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| true, presence: Arc::new(|_| {}) }).await;
         assert!(matches!(result, Err(RelayError::Unreachable(_))));
     }
 

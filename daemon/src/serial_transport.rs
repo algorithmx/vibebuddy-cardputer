@@ -324,7 +324,14 @@ async fn serial_worker(
                 };
                 // Waiting on the socket ends when the box turns up on the cable or the user turns the Relay off.
                 let give_up = || matches!(find_port(&config), Ok(Found::One(_))) || !config.relay_enabled.load(Ordering::Relaxed);
-                let wait = relay::Wait { takeover: &config.takeover, busy: &mut on_busy, give_up: &give_up };
+                let events = device_event_sender.clone();
+                let url = relay_config.url();
+                let presence: Arc<dyn Fn(bool) + Send + Sync> = Arc::new(move |here| {
+                    let message = if here { DeviceMessage::ConnectedRelay { url: url.clone() } } else { DeviceMessage::Disconnected };
+                    info!(here, "the box's presence on the Relay changed");
+                    let _ = events.try_send(message);
+                });
+                let wait = relay::Wait { takeover: &config.takeover, busy: &mut on_busy, give_up: &give_up, presence };
                 let relay_link = relay::link(relay_config, &box_key, wait).await;
                 busy_logged = reported_busy.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match relay_link {
