@@ -240,8 +240,10 @@ fn relay(url: String, box_id: String, sender: mpsc::Sender<Input>, outgoing: mps
                         break;
                     }
                 }
+                // A ping frame for NATs, and the text ping the Relay counts as a sign of life.
                 if pinged.elapsed() >= Duration::from_secs(30) {
                     let _ = socket.send(Message::Ping(Vec::new().into()));
+                    let _ = socket.send(Message::text(vibebuddy_firmware_core::relay_box::PING));
                     pinged = Instant::now();
                 }
             }

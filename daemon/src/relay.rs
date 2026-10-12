@@ -22,6 +22,9 @@ use tracing::{debug, info, warn};
 
 use crate::identity::Identity;
 
+/// The Relay protocol version this daemon speaks (docs/relay-protocol.md).
+const PROTOCOL_VERSION: u32 = 1;
+
 /// Where the Relay is when nothing overrides it. Staging while builds are internal; production
 /// (`wss://relay.korekore.ai`) once it is deployed.
 pub const DEFAULT_URL: &str = "wss://relay-staging.korekore.ai";
@@ -77,6 +80,8 @@ pub enum RelayError {
     Refused(String),
     /// The box is linked elsewhere: `usb` or `linked`, and by whom.
     Busy { reason: String, owner: String },
+    /// Close 4005: the Relay no longer speaks this daemon's protocol version. Only an update helps.
+    Upgrade,
 }
 
 impl RelayError {
@@ -87,6 +92,8 @@ impl RelayError {
             Self::Refused(_) => Duration::from_secs(60),
             Self::Busy { .. } => Duration::from_secs(10),
             Self::Unreachable(_) => Duration::from_secs(2),
+            // Not again in this run: the next try would be refused the same way.
+            Self::Upgrade => return Duration::from_secs(365 * 24 * 3600),
         };
         (base * 2u32.saturating_pow(attempt.min(5))).min(Duration::from_secs(300))
     }
@@ -146,7 +153,7 @@ where
     let challenge = expect(socket, &["challenge"]).await?;
     let nonce = challenge["nonce"].as_str().unwrap_or_default().to_owned();
     let sig = URL_SAFE_NO_PAD.encode(identity.sign(&signed_message("computer", &box_id, &nonce)));
-    send(socket, json!({"t": "hello", "role": "computer", "key": identity.public_key(), "sig": sig})).await?;
+    send(socket, json!({"t": "hello", "role": "computer", "key": identity.public_key(), "sig": sig, "v": PROTOCOL_VERSION})).await?;
     expect(socket, &["welcome"]).await?;
     send(socket, json!({"t": if takeover { "takeover" } else { "link" }})).await?;
     let answer = expect(socket, &["linked", "busy"]).await?;
@@ -170,6 +177,9 @@ where
                 if wanted.contains(&kind) {
                     return Ok(value);
                 }
+                if kind == "error" && value["code"] == "upgrade" {
+                    return Err(RelayError::Upgrade);
+                }
                 if kind == "error" {
                     return Err(RelayError::Refused(value["code"].as_str().unwrap_or("error").to_owned()));
                 }
@@ -189,6 +199,7 @@ fn closed(frame: Option<&CloseFrame>) -> RelayError {
         Some(1008) => RelayError::RateLimited,
         // Silent too long, as a sleeping laptop is: a drop like any other, and the box may still be ours.
         Some(4004) => RelayError::Unreachable("silent".to_owned()),
+        Some(4005) => RelayError::Upgrade,
         Some(code) => RelayError::Unreachable(format!("closed with {code}")),
         None => RelayError::Unreachable("closed".to_owned()),
     }
@@ -414,6 +425,12 @@ mod tests {
         let fixed = RelayConfig::new(Arc::new(identity()), Some("ws://127.0.0.1:8787".to_owned()));
         fixed.offer("wss://relay2.korekore.ai");
         assert_eq!(fixed.url(), "ws://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn an_old_protocol_is_not_retried() {
+        assert!(RelayError::Upgrade.backoff(0) > Duration::from_secs(300 * 24 * 3600));
+        assert_eq!(closed(Some(&CloseFrame { code: 4005.into(), reason: "".into() })), RelayError::Upgrade);
     }
 
     #[test]
