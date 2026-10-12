@@ -858,3 +858,61 @@ mod lan {
         assert_eq!(firmware.wifi(), None);
     }
 }
+
+mod relay {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use serde_json::{Value, json};
+    use vibebuddy_firmware_core::lan::USB_QUIET_MS;
+    use vibebuddy_firmware_core::link;
+    use vibebuddy_firmware_core::relay_box::{RelayBox, RelayLines, signed_message};
+
+    fn parse(text: &str) -> Value {
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn the_box_signs_reports_and_carries_lines() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{COMPUTER}","name":"a"}}"#));
+        let mut relay = RelayBox::new();
+
+        let hello = parse(&relay.hello(&firmware, "abc").unwrap());
+        let box_id = hello["key"].as_str().unwrap().to_owned();
+        let key = VerifyingKey::from_bytes(&link::decode_key(&box_id).unwrap()).unwrap();
+        let sig = Signature::from_bytes(&link::decode::<64>(hello["sig"].as_str().unwrap()).unwrap());
+        assert!(key.verify(&signed_message("box", &box_id, "abc"), &sig).is_ok());
+        assert!(relay.report(&firmware, board.now_ms()).is_empty(), "nothing before welcome");
+
+        relay.message(&mut firmware, &mut board, &json!({"t": "welcome"}));
+        let reports: Vec<Value> = relay.report(&firmware, board.now_ms()).iter().map(|text| parse(text)).collect();
+        assert_eq!(reports[0], json!({"t": "paired", "computers": [{"key": COMPUTER, "name": "a"}]}));
+        assert_eq!(reports[1], json!({"t": "linked", "via": "usb", "computer": COMPUTER}), "it was just paired over the cable");
+        assert!(relay.report(&firmware, board.now_ms()).is_empty(), "only changes");
+
+        board.advance(USB_QUIET_MS);
+        assert_eq!(relay.report(&firmware, board.now_ms()), [r#"{"t":"unlinked"}"#]);
+
+        relay.message(&mut firmware, &mut board, &json!({"t": "linked", "computer": COMPUTER}));
+        assert!(relay.has_peer());
+        board.take_lines();
+        relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": r#"{"version":1,"event":"device.hello"}"#}));
+        let output = board.take_lines().join("\n") + "\n";
+        let data: Vec<Value> = RelayLines::default().lines(output.as_bytes()).iter().map(|text| parse(text)).collect();
+        assert!(data.contains(&json!({"t": "data", "line": "MODE DUTY"})), "{data:?}");
+
+        relay.message(&mut firmware, &mut board, &json!({"t": "unlinked", "reason": "takeover"}));
+        assert!(!relay.has_peer());
+    }
+
+    #[test]
+    fn pairing_over_the_relay_is_refused() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut relay = RelayBox::new();
+        relay.hello(&firmware, "n");
+        relay.message(&mut firmware, &mut board, &json!({"t": "linked", "computer": COMPUTER}));
+        board.take_lines();
+        relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": format!(r#"{{"version":1,"event":"device.pair","key":"{COMPUTER}"}}"#)}));
+        assert_eq!(board.take_lines(), ["ERROR cable_only"]);
+    }
+}

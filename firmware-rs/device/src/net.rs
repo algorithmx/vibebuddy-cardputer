@@ -26,6 +26,8 @@ use static_cell::StaticCell;
 const PORT: u16 = 7340;
 /// Connections served at once: the linked computer, and one more so a takeover can get through.
 const SLOTS: usize = 2;
+/// Sockets beyond the servers: DHCP, DNS, SNTP and the Relay.
+const EXTRA_SOCKETS: usize = 4;
 const SOCKET_RX_BYTES: usize = 2048;
 const SOCKET_TX_BYTES: usize = 4096;
 /// Output waiting for a connection; a screenshot is the biggest burst.
@@ -67,15 +69,19 @@ pub fn close(conn: u32) {
     }
 }
 
-/// Starts Wi-Fi and the server. Nothing joins a network until [`CREDENTIALS`] names one.
-pub fn start(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) {
-    let Ok(controller) = WifiController::new(wifi, ControllerConfig::default()) else {
+/// Starts Wi-Fi and the server. Nothing joins a network until [`CREDENTIALS`] names one. Returns the
+/// network stack for the Relay task, or None if Wi-Fi didn't start.
+pub fn start(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) -> Option<Stack<'static>> {
+    let Ok(mut controller) = WifiController::new(wifi, ControllerConfig::default()) else {
         let _ = EVENTS.try_send(NetEvent::Line(String::from("WIFI FAILED init")));
-        return;
+        return None;
     };
+    // esp-radio's default ceiling is 5 dBm, too weak for some access points to hear the handshake;
+    // 80 (quarter dBm) is ESP-IDF's default of 20 dBm.
+    let _ = controller.set_max_tx_power(80);
     let rng = Rng::new();
     let seed = u64::from(rng.random()) << 32 | u64::from(rng.random());
-    static RESOURCES: StaticCell<StackResources<{ SLOTS + 2 }>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<{ SLOTS + EXTRA_SOCKETS }>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(
         Interface::station(),
         embassy_net::Config::dhcpv4(Default::default()),
@@ -88,6 +94,7 @@ pub fn start(spawner: &Spawner, wifi: esp_hal::peripherals::WIFI<'static>) {
     for slot in 0..SLOTS {
         spawner.spawn(server(stack, slot).expect("server task"));
     }
+    Some(stack)
 }
 
 fn line(text: String) {
