@@ -347,6 +347,10 @@ async fn serial_worker(
                         busy = Some((owner, reason));
                         relay_retry = Some(Instant::now() + RelayError::Busy { reason: String::new(), owner: String::new() }.backoff(0));
                     }
+                    Err(RelayError::Upgrade) => {
+                        warn!("the Relay no longer speaks this version of VibeBuddy; update to reach the box through it");
+                        relay_retry = Some(Instant::now() + RelayError::Upgrade.backoff(0));
+                    }
                     Err(error) => {
                         debug!(?error, "no Relay link");
                         relay_retry = Some(Instant::now() + error.backoff(relay_attempts));

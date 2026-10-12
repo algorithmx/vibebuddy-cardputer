@@ -18,8 +18,9 @@ use vibebuddy_firmware_core::audio::Sound;
 use vibebuddy_firmware_core::buttons::Levels;
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
-use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, LocalLink, VolumeError};
+use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
 use vibebuddy_firmware_core::link;
+use vibebuddy_firmware_core::relay_box::{RelayBox, RelayLines};
 use vibebuddy_firmware_core::storage::{Flash, FlashError};
 
 struct MemoryFlash(Vec<u8>);
@@ -54,8 +55,7 @@ struct SimulatedBoard {
     /// Messages for the Relay thread, and whether a computer is linked through it.
     relay: Option<mpsc::Sender<String>>,
     relay_peer: bool,
-    /// Output not yet ended by a newline: the firmware writes one line in pieces, and the Relay carries whole lines.
-    relay_partial: Vec<u8>,
+    relay_lines: RelayLines,
 }
 
 /// What the main loop hears from the stdin and network threads.
@@ -94,14 +94,12 @@ impl Board for SimulatedBoard {
         }
         // Through the Relay, every line goes as one data message.
         if self.relay_peer && let Some(relay) = &self.relay {
-            self.relay_partial.extend_from_slice(bytes);
-            while let Some(end) = self.relay_partial.iter().position(|&byte| byte == b'\n') {
-                let line: Vec<u8> = self.relay_partial.drain(..=end).collect();
-                let line = String::from_utf8_lossy(&line[..end]).into_owned();
-                let _ = relay.send(serde_json::json!({"t": "data", "line": line}).to_string());
+            for message in self.relay_lines.lines(bytes) {
+                let _ = relay.send(message);
             }
         }
     }
+
     fn lan_send(&mut self, conn: u32, bytes: &[u8]) {
         if let Some(stream) = self.conns.get_mut(&conn) {
             let _ = stream.write_all(bytes);
@@ -242,8 +240,10 @@ fn relay(url: String, box_id: String, sender: mpsc::Sender<Input>, outgoing: mps
                         break;
                     }
                 }
+                // A ping frame for NATs, and the text ping the Relay counts as a sign of life.
                 if pinged.elapsed() >= Duration::from_secs(30) {
                     let _ = socket.send(Message::Ping(Vec::new().into()));
+                    let _ = socket.send(Message::text(vibebuddy_firmware_core::relay_box::PING));
                     pinged = Instant::now();
                 }
             }
@@ -253,40 +253,6 @@ fn relay(url: String, box_id: String, sender: mpsc::Sender<Input>, outgoing: mps
             std::thread::sleep(backoff);
         }
     });
-}
-
-/// What the box last told the Relay, so it says only what changed.
-#[derive(Default, PartialEq)]
-struct Reported {
-    welcomed: bool,
-    paired: Vec<(String, String)>,
-    local: Option<LocalLink>,
-}
-
-fn report_to_relay(firmware: &Firmware, now: u32, relay: &mpsc::Sender<String>, reported: &mut Reported) {
-    if !reported.welcomed {
-        return;
-    }
-    let Some(link) = firmware.link() else { return };
-    let paired: Vec<(String, String)> = link.paired.iter().map(|paired| (link::encode(&paired.key), paired.name.clone())).collect();
-    if paired != reported.paired {
-        let computers: Vec<_> = paired.iter().map(|(key, name)| serde_json::json!({"key": key, "name": name})).collect();
-        let _ = relay.send(serde_json::json!({"t": "paired", "computers": computers}).to_string());
-        reported.paired = paired;
-    }
-    let local = firmware.local_link(now);
-    if reported.local != Some(local) {
-        let message = match local {
-            LocalLink::Usb(key) => serde_json::json!({"t": "linked", "via": "usb", "computer": key.map(|key| link::encode(&key))}),
-            LocalLink::Lan(key) => serde_json::json!({"t": "linked", "via": "lan", "computer": link::encode(&key)}),
-            LocalLink::None => serde_json::json!({"t": "unlinked"}),
-        };
-        // Nothing to undo on a fresh connection that was never linked.
-        if reported.local.is_some() || local != LocalLink::None {
-            let _ = relay.send(message.to_string());
-        }
-        reported.local = Some(local);
-    }
 }
 
 fn main() {
@@ -316,12 +282,12 @@ fn main() {
         peer: None,
         relay: None,
         relay_peer: false,
-        relay_partial: Vec::new(),
+        relay_lines: RelayLines::default(),
     };
     let build = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../device/build/build.txt")).unwrap_or_else(|_| "simulator".to_owned());
     let mut firmware = Firmware::new(1, board.now_ms(), build.trim().as_bytes(), "0.0.0");
     firmware.boot(&mut board);
-    let mut reported = Reported::default();
+    let mut relay_box = RelayBox::new();
     if let (Some(url), Some(link)) = (relay_url, firmware.link()) {
         let (outgoing, from_main) = mpsc::channel();
         relay(url, link::encode(&link.public_key()), sender, from_main);
@@ -343,41 +309,26 @@ fn main() {
                     firmware.lan_closed(&mut board, conn);
                 }
                 Input::RelayChallenge(nonce) => {
-                    reported = Reported::default();
-                    if let (Some(link), Some(relay)) = (firmware.link(), &board.relay) {
-                        let box_id = link::encode(&link.public_key());
-                        let sig = link.sign(format!("vibebuddy-relay-v1\nbox\n{box_id}\n{nonce}").as_bytes());
-                        let _ = relay.send(serde_json::json!({"t": "hello", "role": "box", "key": box_id, "sig": link::encode(&sig)}).to_string());
+                    if let (Some(hello), Some(relay)) = (relay_box.hello(&firmware, &nonce), &board.relay) {
+                        let _ = relay.send(hello);
                     }
                 }
-                Input::RelayMessage(value) => match value["t"].as_str() {
-                    Some("welcome") => reported.welcomed = true,
-                    Some("linked") => {
-                        let key = value["computer"].as_str().and_then(link::decode_key);
-                        firmware.relay_linked(board.now_ms(), key);
-                        board.relay_peer = key.is_some();
-                    }
-                    Some("unlinked") => {
-                        firmware.relay_linked(board.now_ms(), None);
-                        board.relay_peer = false;
-                    }
-                    Some("data") => {
-                        if let Some(line) = value["line"].as_str() {
-                            firmware.relay_line(&mut board, line.as_bytes());
-                        }
-                    }
-                    _ => {}
-                },
+                Input::RelayMessage(value) => {
+                    relay_box.message(&mut firmware, &mut board, &value);
+                    board.relay_peer = relay_box.has_peer();
+                }
                 Input::RelayGone => {
-                    firmware.relay_linked(board.now_ms(), None);
+                    relay_box.gone(&mut firmware, board.now_ms());
                     board.relay_peer = false;
-                    reported = Reported::default();
+                    board.relay_lines.clear();
                 }
             }
         }
         firmware.poll(&mut board);
         if let Some(relay) = &board.relay {
-            report_to_relay(&firmware, board.now_ms(), relay, &mut reported);
+            for message in relay_box.report(&firmware, board.now_ms()) {
+                let _ = relay.send(message);
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }

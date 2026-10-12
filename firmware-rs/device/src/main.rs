@@ -17,6 +17,8 @@ extern crate alloc;
 
 mod audio;
 mod lcd;
+mod net;
+mod relay;
 mod serial;
 mod storage;
 
@@ -45,6 +47,7 @@ use vibebuddy_firmware_core::buttons::Levels;
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
 use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
+use vibebuddy_firmware_core::relay_box::{RelayBox, RelayLines};
 use vibebuddy_firmware_core::storage::Flash;
 
 use crate::audio::{PLAYING, PlayCommand, QUEUE, STOP, STREAM_BYTES, STREAM_CHUNK};
@@ -136,6 +139,11 @@ struct DeviceBoard {
     _lcd_read: Output<'static>,
     /// Only the ES8311 variant has a codec; the NS4168 variant has no adjustable volume.
     has_codec: bool,
+    /// The computer linked over the network, which gets the box's output too.
+    lan_peer: Option<u32>,
+    /// A computer is linked through the Relay, and the box's output goes there as whole lines.
+    relay_peer: bool,
+    relay_lines: RelayLines,
 }
 
 impl DeviceBoard {
@@ -169,6 +177,26 @@ impl Board for DeviceBoard {
 
     fn write(&mut self, bytes: &[u8]) {
         self.transport.write(bytes);
+        if let Some(conn) = self.lan_peer {
+            net::send(conn, bytes);
+        }
+        if self.relay_peer {
+            for message in self.relay_lines.lines(bytes) {
+                let _ = relay::OUT.try_send(message);
+            }
+        }
+    }
+
+    fn lan_send(&mut self, conn: u32, bytes: &[u8]) {
+        net::send(conn, bytes);
+    }
+
+    fn lan_close(&mut self, conn: u32) {
+        net::close(conn);
+    }
+
+    fn lan_peer(&mut self, conn: Option<u32>) {
+        self.lan_peer = conn;
     }
 
     fn flash(&mut self) -> &mut dyn Flash {
@@ -247,6 +275,14 @@ impl Board for DeviceBoard {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
+    // The module's 8 MB octal PSRAM comes first, so the firmware's own allocations (JSON, looks, network
+    // buffers) land there and internal RAM stays for the Wi-Fi driver, which asks for internal memory
+    // explicitly. The flash runs at 40 MHz (the bootloader's header), and the PSRAM timing must agree.
+    esp_alloc::psram_allocator!(
+        peripherals.PSRAM,
+        esp_hal::psram,
+        esp_hal::psram::PsramConfig { flash_frequency: esp_hal::psram::FlashFreq::FlashFreq40m, ..Default::default() }
+    );
     // JSON parsing and the few lines of text in a frame live on the heap; 72 KB is enough.
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
     // A Character's look lives on the heap too (about 6 KB, plus as much again while it is read from
@@ -266,6 +302,8 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(serial::usb_rx_task(usb_rx).expect("USB read task"));
 
     storage::install(FlashStorage::new(peripherals.FLASH));
+    // Wi-Fi starts idle; it joins a network once the firmware below names one.
+    let stack = net::start(&spawner, peripherals.WIFI);
 
     let i2c = I2c::new(peripherals.I2C0, I2cConfig::default().with_frequency(Rate::from_khz(400)))
         .expect("I2C0 config")
@@ -320,6 +358,9 @@ async fn main(spawner: Spawner) -> ! {
         k0,
         _lcd_read: lcd_read,
         has_codec: false,
+        lan_peer: None,
+        relay_peer: false,
+        relay_lines: RelayLines::default(),
     };
 
     // Let the audio task run once to start the I2S stream: the ES8311 is clocked by BCLK, and the C
@@ -329,15 +370,23 @@ async fn main(spawner: Spawner) -> ! {
     let seed = Rng::new().random();
     // The box's pairing key is made from this on its first boot, so it must be true randomness: the
     // RNG only gets that with the radio on or the ADC sampling noise, and nothing else uses ADC1.
+    // The source stays on: TLS for the Relay draws on the TRNG too.
+    static TRNG_SOURCE: static_cell::StaticCell<TrngSource<'static>> = static_cell::StaticCell::new();
+    TRNG_SOURCE.init(TrngSource::new(peripherals.RNG, peripherals.ADC1));
+    static TRNG: static_cell::StaticCell<Trng> = static_cell::StaticCell::new();
+    let trng = TRNG.init(Trng::try_new().expect("TRNG with the ADC entropy source"));
     let mut entropy = [0u8; 32];
-    {
-        let _source = TrngSource::new(peripherals.RNG, peripherals.ADC1);
-        Trng::try_new().expect("TRNG with the ADC entropy source").read(&mut entropy);
-    }
+    trng.read(&mut entropy);
     let mut firmware = Firmware::new(seed, board.now_ms(), BUILD.as_bytes(), env!("CARGO_PKG_VERSION")).with_entropy(entropy);
     firmware.boot(&mut board);
     // Booting got this far, so an image installed over the air keeps its slot.
     storage::confirm_running_image();
+    net::CREDENTIALS.signal(wifi_credentials(&firmware));
+    report_memory(&mut board);
+    if let Some(stack) = stack {
+        start_relay(&spawner, stack, trng, &firmware);
+    }
+    let mut relay_box = RelayBox::new();
 
     let mut input = [0u8; 256];
     loop {
@@ -355,8 +404,86 @@ async fn main(spawner: Spawner) -> ! {
             }
             firmware.receive(&mut board, &input[..count]);
         }
+        while let Ok(event) = net::EVENTS.try_receive() {
+            match event {
+                net::NetEvent::Line(line) => {
+                    board.write(line.as_bytes());
+                    board.write(b"\n");
+                    // Once on the network, the Wi-Fi driver has taken what it needs (#108).
+                    if line.starts_with("WIFI ADDRESS") {
+                        report_memory(&mut board);
+                    }
+                }
+                net::NetEvent::Opened(conn, nonce) => firmware.lan_opened(&mut board, conn, nonce),
+                net::NetEvent::Received(conn, bytes) => firmware.lan_received(&mut board, conn, &bytes),
+                net::NetEvent::Closed(conn) => firmware.lan_closed(&mut board, conn),
+            }
+        }
+        while let Ok(event) = relay::IN.try_receive() {
+            match event {
+                relay::RelayIn::Challenge(nonce) => {
+                    if let Some(hello) = relay_box.hello(&firmware, &nonce) {
+                        let _ = relay::OUT.try_send(hello);
+                    }
+                }
+                relay::RelayIn::Message(text) => {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        relay_box.message(&mut firmware, &mut board, &value);
+                        board.relay_peer = relay_box.has_peer();
+                    }
+                }
+                relay::RelayIn::Gone => {
+                    relay_box.gone(&mut firmware, board.now_ms());
+                    board.relay_peer = false;
+                    board.relay_lines.clear();
+                }
+                relay::RelayIn::Line(line) => {
+                    board.write(line.as_bytes());
+                    board.write(b"\n");
+                    // With TLS up, what is left (#108).
+                    if line == "RELAY CONNECTED" {
+                        report_memory(&mut board);
+                    }
+                }
+            }
+        }
+        for message in relay_box.report(&firmware, board.now_ms()) {
+            let _ = relay::OUT.try_send(message);
+        }
+        if firmware.take_wifi_change() {
+            net::CREDENTIALS.signal(wifi_credentials(&firmware));
+        }
         firmware.poll(&mut board);
         // This wait is the key sampling period: too long would miss quick taps.
         Timer::after_millis(10).await;
     }
+}
+
+fn wifi_credentials(firmware: &Firmware) -> Option<(alloc::string::String, alloc::string::String)> {
+    firmware.wifi().map(|wifi| (wifi.ssid.clone(), wifi.password.clone()))
+}
+
+/// `MEMORY INTERNAL <free>/<total> PSRAM <free>/<total>` in bytes: what the heaps have left (#108).
+fn report_memory(board: &mut DeviceBoard) {
+    let stats = esp_alloc::HEAP.stats();
+    let internal = esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::Internal.into());
+    let external = esp_alloc::HEAP.free_caps(esp_alloc::MemoryCapability::External.into());
+    let line = alloc::format!("MEMORY INTERNAL {internal} PSRAM {external} TOTAL {}/{}\n", stats.size - stats.current_usage, stats.size);
+    board.write(line.as_bytes());
+}
+
+/// TLS for the Relay (ADR-0012): mbedtls with the TRNG, embassy's clock for timeouts, and the SNTP wall
+/// clock for certificate dates. The task waits for Wi-Fi and the box's id.
+fn start_relay(spawner: &Spawner, stack: embassy_net::Stack<'static>, trng: &'static mut Trng, firmware: &Firmware) {
+    static TIMER: mbedtls_rs::sys::hook::backend::embassy::timer::EmbassyTimer = mbedtls_rs::sys::hook::backend::embassy::timer::EmbassyTimer;
+    static CLOCK: relay::WallClock = relay::WallClock;
+    // SAFETY: both hooks are statics, installed before any TLS session starts.
+    unsafe {
+        mbedtls_rs::sys::hook::timer::hook_timer(Some(&TIMER));
+        mbedtls_rs::sys::hook::wall_clock::hook_wall_clock(Some(&CLOCK));
+    }
+    let Ok(tls) = mbedtls_rs::Tls::new(trng) else { return };
+    let Some(link) = firmware.link() else { return };
+    relay::BOX_ID.signal(vibebuddy_firmware_core::link::encode(&link.public_key()));
+    spawner.spawn(relay::task(stack, tls).expect("Relay task"));
 }
