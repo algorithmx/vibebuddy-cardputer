@@ -305,6 +305,12 @@ On 2026-10-09 I had dragon run `just install` in a worktree branched before #99,
 
 Before installing anything meant for daily use, fetch and check out `origin/main` (or confirm the branch contains it). `git log -1 origin/main` against `HEAD` takes a second; cleaning up a second app bundle does not.
 
+## A release step that runs offline needs its dependencies fetched first
+
+On 2026-10-12 the first `just release 0.4.2` stopped halfway: it updates the firmware's lockfile with `--offline`, and the machine had never built the firmware, so `embassy-executor` wasn't in the cargo cache. Nothing had been committed or pushed, but `Cargo.toml` and `Cargo.lock` were left changed and had to be reverted by hand before the retry.
+
+A step that only runs at release time is the one nobody exercises (see the v0.3.0 lockfile lesson above). The release recipe now runs `cargo fetch` for the workspace and the firmware before it changes anything, so a missing crate is fetched, or fails while the tree is still clean.
+
 ## A boot step that reads flash structures must run on the real layout before it ships
 
 On 2026-10-12 the first OTA-layout firmware reset in a loop right after READY on a box: confirming the running image went through esp-bootloader-esp-idf's `OtaUpdater`, which parses the whole partition table and panics on our custom data subtypes (voices 0x40, link 0x41). Every host test passed, because the fake boards' flash had no otadata and the device-only code never ran there. The box flickered and clicked until the fix was flashed.

@@ -69,9 +69,9 @@ Five tabs, styled like System Settings: tabs across the top, grouped forms, syst
 ## Onboarding
 
 1. Welcome.
-2. Find the box: prompts you to plug in the box, lists the ports it finds, and once connected has the box blink to confirm. Can be skipped, after which the menu bar keeps showing "Box not found".
-3. Connect agents: detects Codex and Claude Code, writes the hooks in one click, and prompts you to trust them in Codex's `/hooks`. You can choose "Not now", but you can't skip this page.
-4. Pick a voice: preview and write it to the box. Can be skipped.
+2. Find the box: prompts you to plug in the box, lists the ports it finds, and once connected has the box blink to confirm. A box that left the factory on older firmware is offered the newer one right here, with the same confirmation as the Device tab; a box on other firmware is offered VibeBuddy firmware. Can be skipped, after which the menu bar keeps showing "Box not found".
+3. Connect agents: detects Codex, Claude Code, OpenCode, GitHub Copilot CLI and Pi, writes the hooks in one click, and prompts you to trust them in Codex's `/hooks`. You can choose "Not now", but you can't skip this page.
+4. Pick a character: preview and write it to the box; the default robot comes first. Can be skipped.
 5. Launch at login.
 6. Done.
 
