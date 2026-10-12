@@ -92,6 +92,43 @@ pub enum LinkError {
     Refused(String),
 }
 
+/// Data the box hasn't acknowledged for this long means it is gone. The box sends nothing on its own, so a link
+/// whose other end vanished without a word (this computer moved to another network, the box lost power) would
+/// otherwise look alive for minutes while the kernel retransmits. The daemon's heartbeat every 5 s always leaves
+/// something to acknowledge.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(20);
+
+/// Has the kernel drop the connection once sent data stays unacknowledged for `after`; the read then fails and the
+/// daemon tries the next way to the box.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn drop_when_unacknowledged(stream: &TcpStream, after: Duration) {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "macos")]
+    let (option, value) = {
+        // TCP_RXT_CONNDROPTIME from <netinet/tcp.h>, in seconds; libc doesn't export it.
+        const TCP_RXT_CONNDROPTIME: libc::c_int = 0x80;
+        (TCP_RXT_CONNDROPTIME, after.as_secs() as libc::c_int)
+    };
+    #[cfg(target_os = "linux")]
+    let (option, value) = (libc::TCP_USER_TIMEOUT, after.as_millis() as libc::c_int);
+    // SAFETY: a valid socket descriptor and a c_int option value of the right size.
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            option,
+            (&raw const value).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        tracing::debug!(error = %std::io::Error::last_os_error(), "couldn't set the connection's give-up time");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn drop_when_unacknowledged(_stream: &TcpStream, _after: Duration) {}
+
 /// Connects and runs the handshake; on success the stream carries the VibeBuddy Protocol.
 pub async fn connect(target: &Target, identity: &Identity, takeover: bool) -> Result<TcpStream, LinkError> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&target.address))
@@ -99,6 +136,7 @@ pub async fn connect(target: &Target, identity: &Identity, takeover: bool) -> Re
         .map_err(|_| LinkError::Unreachable("timed out".to_owned()))?
         .map_err(|error| LinkError::Unreachable(error.to_string()))?;
     let _ = stream.set_nodelay(true);
+    drop_when_unacknowledged(&stream, GIVE_UP_AFTER);
     tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, target, identity, takeover))
         .await
         .map_err(|_| LinkError::Unreachable("handshake timed out".to_owned()))??;
@@ -176,6 +214,20 @@ fn verify(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_link_gives_up_on_data_the_box_never_acknowledges() {
+        use std::os::fd::AsRawFd;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        drop_when_unacknowledged(&stream, GIVE_UP_AFTER);
+        let mut value: libc::c_int = 0;
+        let mut length = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: a valid socket and a c_int-sized buffer.
+        let result = unsafe { libc::getsockopt(stream.as_raw_fd(), libc::IPPROTO_TCP, 0x80, (&raw mut value).cast(), &mut length) };
+        assert_eq!((result, value), (0, 20));
+    }
     use ed25519_dalek::{Signer, SigningKey};
     use tokio::io::AsyncBufReadExt;
 
