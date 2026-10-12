@@ -118,6 +118,18 @@ impl RelayError {
     }
 }
 
+/// A link that lasted this long was fine, and the next try starts the backoff over.
+const LINK_WAS_FINE: Duration = Duration::from_secs(60);
+
+/// When to try the Relay again after a link through it ended, and the attempt count to carry: soon after a link
+/// that lasted, and backing off like an unreachable Relay after one that ended quickly.
+pub fn after_link(lasted: Duration, attempts: u32) -> (Duration, u32) {
+    if lasted >= LINK_WAS_FINE {
+        return (RelayError::Unreachable(String::new()).backoff(0), 0);
+    }
+    (RelayError::Unreachable(String::new()).backoff(attempts), attempts.saturating_add(1))
+}
+
 pub fn box_url(base: &str, box_key: &[u8; 32]) -> String {
     format!("{}/v1/boxes/{}", base.trim_end_matches('/'), URL_SAFE_NO_PAD.encode(box_key))
 }
@@ -566,6 +578,19 @@ mod tests {
         let mut busy = |_: String, _: String| {};
         let result = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| true, presence: Arc::new(|_| {}) }).await;
         assert!(matches!(result, Err(RelayError::Unreachable(_))));
+    }
+
+    #[test]
+    fn links_that_end_quickly_back_off() {
+        // Thirty quick ends in a row stay well under the Relay's 30 new connections a minute.
+        let (mut total, mut attempts) = (Duration::ZERO, 0);
+        for _ in 0..30 {
+            let (wait, next) = after_link(Duration::from_millis(200), attempts);
+            total += wait + Duration::from_millis(200);
+            attempts = next;
+        }
+        assert!(total > Duration::from_secs(60 * 30 / 30), "{total:?}");
+        assert_eq!(after_link(Duration::from_secs(600), 7), (Duration::from_secs(2), 0), "a long link starts over");
     }
 
     #[test]

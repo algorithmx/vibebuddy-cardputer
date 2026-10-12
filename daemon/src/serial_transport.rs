@@ -339,8 +339,8 @@ async fn serial_worker(
                         let url = relay_config.url();
                         info!(%url, "linked through the Relay");
                         busy_logged = None;
-                        relay_attempts = 0;
                         relay_retry = None;
+                        let linked_at = Instant::now();
                         let _ = device_event_sender.send(DeviceMessage::ConnectedRelay { url: url.clone() }).await;
                         linked = true;
                         let probe = config.lan.as_ref().and_then(|lan| lan.target()).map(|target| target.address);
@@ -362,7 +362,13 @@ async fn serial_worker(
                             SessionEnd::Shutdown => return,
                             SessionEnd::Usb => info!("the box is on the cable, leaving the Relay"),
                             SessionEnd::Lan => info!("the box is on the local network, leaving the Relay"),
-                            _ => {}
+                            _ => {
+                                // The Relay counts new connections per IP (docs/relay-protocol.md): a link that keeps
+                                // ending right after it starts must not become a tight reconnect loop.
+                                let (wait, attempts) = relay::after_link(linked_at.elapsed(), relay_attempts);
+                                relay_retry = Some(Instant::now() + wait);
+                                relay_attempts = attempts;
+                            }
                         }
                         continue;
                     }
