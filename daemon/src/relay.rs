@@ -29,9 +29,14 @@ const PROTOCOL_VERSION: u32 = 1;
 /// The exact text the Relay counts as a sign of life and answers without waking.
 const PING: &str = r#"{"t":"ping"}"#;
 
-/// Where the Relay is when nothing overrides it; development points at `wss://relay-staging.korekore.ai`
-/// with `VIBEBUDDY_RELAY_URL`.
-pub const DEFAULT_URL: &str = "wss://relay.korekore.ai";
+/// The Relay releases use, and the one every other build uses (docs/relay-protocol.md, "Which Relay").
+pub const PRODUCTION_URL: &str = "wss://relay.korekore.ai";
+pub const STAGING_URL: &str = "wss://relay-staging.korekore.ai";
+/// A build CI made from a release tag (`VIBEBUDDY_RELEASE_TAG=1` at compile time). Builds from main and
+/// from source use staging, so development never touches the production Relay.
+pub fn release() -> bool {
+    option_env!("VIBEBUDDY_RELEASE_TAG") == Some("1")
+}
 /// Pings go out this often, and a Relay silent this long is taken for gone (docs/relay-protocol.md).
 const PING_EVERY: Duration = Duration::from_secs(30);
 const DEAD_AFTER: Duration = Duration::from_secs(75);
@@ -42,27 +47,40 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 pub struct RelayConfig {
     pub identity: Arc<Identity>,
-    /// `wss://relay.korekore.ai`, or `ws://127.0.0.1:8787` under `wrangler dev`; the update manifest may move it.
+    /// Production or staging by build, or `ws://127.0.0.1:8787` under `wrangler dev`; the update manifest may
+    /// move a release's.
     url: Arc<std::sync::RwLock<String>>,
-    /// Set by `VIBEBUDDY_RELAY_URL`, which the manifest doesn't override.
-    fixed: bool,
+    /// The update manifest may move the Relay: a release build on its compiled default.
+    movable: bool,
 }
 
 impl RelayConfig {
-    /// `fixed` is an address given by hand; None means the compiled default, which the manifest may move.
-    pub fn new(identity: Arc<Identity>, fixed: Option<String>) -> Self {
-        let url = fixed.clone().unwrap_or_else(|| DEFAULT_URL.to_owned());
-        Self { identity, url: Arc::new(std::sync::RwLock::new(url)), fixed: fixed.is_some() }
+    /// `fixed` is an address given by hand (`VIBEBUDDY_RELAY_URL`); None means the default for a release or
+    /// for any other build, of which only a release's may be moved by the manifest.
+    pub fn new(identity: Arc<Identity>, fixed: Option<String>, release: bool) -> Self {
+        let default = if release { PRODUCTION_URL } else { STAGING_URL };
+        let movable = release && fixed.is_none();
+        let url = fixed.unwrap_or_else(|| default.to_owned());
+        Self { identity, url: Arc::new(std::sync::RwLock::new(url)), movable }
     }
 
     pub fn url(&self) -> String {
-        self.url.read().map(|url| url.clone()).unwrap_or_else(|_| DEFAULT_URL.to_owned())
+        self.url.read().map(|url| url.clone()).unwrap_or_default()
+    }
+
+    /// The URL to give the box over the cable, so it uses the same Relay: only `wss://` and a host, the
+    /// only kind it takes (docs/protocol.md, "Relay"). None for a local Relay such as `wrangler dev`.
+    pub fn for_box(&self) -> Option<String> {
+        let url = self.url();
+        let host = url.strip_prefix("wss://")?.trim_end_matches('/');
+        let valid = !host.is_empty() && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-');
+        valid.then(|| format!("wss://{host}"))
     }
 
     /// The signed update manifest names the Relay: used from the next connection on. Only `wss://`, and never over
     /// an address given by hand.
     pub fn offer(&self, url: &str) {
-        if self.fixed || !url.starts_with("wss://") {
+        if !self.movable || !url.starts_with("wss://") {
             return;
         }
         if let Ok(mut current) = self.url.write()
@@ -498,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn lines_go_through_the_relay_both_ways_until_the_box_is_taken() {
-        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("linked").await));
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("linked").await), false);
         let mut stream = link_now(&config).await.unwrap();
         stream.write_all(b"{\"version\":1,\"event\":\"device.hello\"}\n").await.unwrap();
         let mut received = String::new();
@@ -508,7 +526,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_box_coming_back_starts_the_session_over() {
-        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("restart").await));
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("restart").await), false);
         let mut stream = link_now(&config).await.unwrap();
         stream.write_all(b"{\"version\":1,\"event\":\"x\"}\n").await.unwrap();
         let mut received = String::new();
@@ -518,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_link_waits_on_the_socket_and_gets_the_box_when_it_frees_up() {
-        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy").await));
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy").await), false);
         let takeover = AtomicBool::new(false);
         let owners = std::sync::Mutex::new(Vec::new());
         let mut busy = |owner: String, reason: String| owners.lock().unwrap().push((owner, reason));
@@ -529,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_box_going_away_and_coming_back_is_reported() {
-        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("away").await));
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("away").await), false);
         let takeover = AtomicBool::new(false);
         let mut busy = |_: String, _: String| {};
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -543,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_stops_when_no_longer_needed() {
-        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy-forever").await));
+        let config = RelayConfig::new(Arc::new(identity()), Some(fake_relay("busy-forever").await), false);
         let takeover = AtomicBool::new(false);
         let mut busy = |_: String, _: String| {};
         let result = link(&config, &[5; 32], Wait { takeover: &takeover, busy: &mut busy, give_up: &|| true, presence: Arc::new(|_| {}) }).await;
@@ -559,16 +577,32 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_moves_the_relay_unless_it_was_given_by_hand() {
-        let config = RelayConfig::new(Arc::new(identity()), None);
+    fn the_manifest_moves_a_releases_relay_unless_it_was_given_by_hand() {
+        let config = RelayConfig::new(Arc::new(identity()), None, true);
         assert_eq!(config.url(), "wss://relay.korekore.ai");
         config.offer("ws://plain.example");
-        assert_eq!(config.url(), DEFAULT_URL, "never off TLS");
+        assert_eq!(config.url(), PRODUCTION_URL, "never off TLS");
         config.offer("wss://relay2.korekore.ai");
         assert_eq!(config.url(), "wss://relay2.korekore.ai");
-        let fixed = RelayConfig::new(Arc::new(identity()), Some("ws://127.0.0.1:8787".to_owned()));
+        let fixed = RelayConfig::new(Arc::new(identity()), Some("ws://127.0.0.1:8787".to_owned()), true);
         fixed.offer("wss://relay2.korekore.ai");
         assert_eq!(fixed.url(), "ws://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn other_builds_use_staging_and_keep_it() {
+        let config = RelayConfig::new(Arc::new(identity()), None, false);
+        assert_eq!(config.url(), STAGING_URL);
+        config.offer("wss://relay.korekore.ai");
+        assert_eq!(config.url(), STAGING_URL, "the manifest is the releases'");
+    }
+
+    #[test]
+    fn the_box_is_given_only_a_wss_host() {
+        let config = |url: &str| RelayConfig::new(Arc::new(identity()), Some(url.to_owned()), false);
+        assert_eq!(config("wss://relay-staging.korekore.ai/").for_box().as_deref(), Some(STAGING_URL));
+        assert_eq!(config("ws://127.0.0.1:8787").for_box(), None);
+        assert_eq!(config("wss://127.0.0.1:8787").for_box(), None);
     }
 
     #[test]

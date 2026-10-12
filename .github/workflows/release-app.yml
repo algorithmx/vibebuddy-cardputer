@@ -47,6 +47,8 @@ jobs:
       RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
       # Builds CI makes check for updates by default; builds from source don't (ADR-0010).
       VIBEBUDDY_RELEASE_BUILD: "1"
+      # Only a tag's build uses the production Relay; main's and source builds use staging (docs/relay-protocol.md).
+      VIBEBUDDY_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,6 +136,8 @@ jobs:
       RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
       # Builds CI makes check for updates by default; builds from source don't (ADR-0010).
       VIBEBUDDY_RELEASE_BUILD: "1"
+      # Only a tag's build uses the production Relay; main's and source builds use staging (docs/relay-protocol.md).
+      VIBEBUDDY_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:

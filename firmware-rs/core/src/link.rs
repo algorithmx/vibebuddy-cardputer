@@ -36,6 +36,9 @@ pub struct Link {
     pub paired: Vec<Paired>,
     /// The Wi-Fi network to join, name and password; set only over USB.
     pub wifi: Option<Wifi>,
+    /// The Relay to use, `wss://host`, as the computer on the cable last said; None means the
+    /// firmware's own default (docs/relay-protocol.md, "Which Relay").
+    pub relay: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +50,8 @@ pub struct Wifi {
 /// Wi-Fi's own limits: a network name is at most 32 bytes, a WPA passphrase at most 63.
 pub const MAX_SSID_BYTES: usize = 32;
 pub const MAX_PASSWORD_BYTES: usize = 63;
+/// Longest Relay URL kept: its length is stored in one byte.
+pub const MAX_RELAY_BYTES: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairError {
@@ -56,7 +61,7 @@ pub enum PairError {
 impl Link {
     /// A box with a new key and nobody paired.
     pub fn new(entropy: [u8; 32]) -> Self {
-        Self { seed: entropy, paired: Vec::new(), wifi: None }
+        Self { seed: entropy, paired: Vec::new(), wifi: None, relay: None }
     }
 
     /// The box's public key, which is also its id on the Relay.
@@ -106,12 +111,18 @@ impl Link {
             payload.push(paired.name.len() as u8);
             payload.extend_from_slice(paired.name.as_bytes());
         }
-        // The network is an optional tail, so a record written before it existed still reads.
-        if let Some(wifi) = &self.wifi {
-            for field in [&wifi.ssid, &wifi.password] {
-                payload.push(field.len() as u8);
-                payload.extend_from_slice(field.as_bytes());
-            }
+        // The network, then the Relay, are an optional tail, so a record written before either existed
+        // still reads. An empty network name means none: no network has one.
+        let (ssid, password) = self.wifi.as_ref().map_or(("", ""), |wifi| (wifi.ssid.as_str(), wifi.password.as_str()));
+        let mut fields = alloc::vec![ssid, password];
+        if let Some(relay) = &self.relay {
+            fields.push(relay);
+        } else if self.wifi.is_none() {
+            fields.clear();
+        }
+        for field in fields {
+            payload.push(field.len() as u8);
+            payload.extend_from_slice(field.as_bytes());
         }
         payload
     }
@@ -135,10 +146,11 @@ impl Link {
             Some(String::from(text))
         };
         let wifi = match (field(), field()) {
-            (Some(ssid), Some(password)) => Some(Wifi { ssid, password }),
+            (Some(ssid), Some(password)) if !ssid.is_empty() => Some(Wifi { ssid, password }),
             _ => None,
         };
-        Some(Self { seed, paired, wifi })
+        let relay = field().filter(|relay| !relay.is_empty());
+        Some(Self { seed, paired, wifi, relay })
     }
 }
 
@@ -379,6 +391,34 @@ mod tests {
         store.save(&mut flash, &link).unwrap();
         let (_, found) = LinkStore::open(&mut flash, REGION).unwrap();
         assert_eq!(found, Some(link));
+    }
+
+    #[test]
+    fn the_relay_is_kept_with_or_without_a_network() {
+        let mut flash = flash();
+        let (mut store, _) = LinkStore::open(&mut flash, REGION).unwrap();
+        let mut link = Link::new([7; 32]);
+        link.relay = Some(String::from("wss://relay-staging.korekore.ai"));
+        store.save(&mut flash, &link).unwrap();
+        assert_eq!(LinkStore::open(&mut flash, REGION).unwrap().1, Some(link.clone()));
+        link.wifi = Some(Wifi { ssid: String::from("Home"), password: String::new() });
+        store.save(&mut flash, &link).unwrap();
+        assert_eq!(LinkStore::open(&mut flash, REGION).unwrap().1, Some(link));
+    }
+
+    #[test]
+    fn a_record_from_before_the_relay_still_reads() {
+        // seed, no computers, then the network as firmware before the Relay setting wrote it.
+        let mut payload = alloc::vec![7u8; 32];
+        payload.push(0);
+        for field in ["Home", "pass"] {
+            payload.push(field.len() as u8);
+            payload.extend_from_slice(field.as_bytes());
+        }
+        let link = Link::decode(&payload).unwrap();
+        assert_eq!(link.wifi, Some(Wifi { ssid: String::from("Home"), password: String::from("pass") }));
+        assert_eq!(link.relay, None);
+        assert_eq!(Link::decode(&payload[..33]).unwrap().wifi, None);
     }
 
     #[test]

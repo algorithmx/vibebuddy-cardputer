@@ -185,6 +185,8 @@ impl Board for FakeBoard {
 /// The key the box makes from the entropy `Firmware::new(7, …)` derives.
 const BOX_KEY: &str = "BOX KEY 1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE";
 
+const RELAY_URL: &str = "RELAY URL wss://relay.korekore.ai";
+
 fn booted(flash: MemoryFlash) -> (Firmware, FakeBoard, Vec<String>) {
     let mut board = FakeBoard::new(flash);
     let mut firmware = Firmware::new(7, board.now_ms(), b"abc1234 2026-09-26 10:00", "1.2.3");
@@ -209,6 +211,7 @@ fn boot_reports_like_the_c_firmware() {
             "DISPLAY READY BUILD abc1234 2026-09-26 10:00",
             "FIRMWARE VERSION 1.2.3",
             BOX_KEY,
+            RELAY_URL,
             "VOICES builtin",
             "AUDIO READY",
             "AUDIO CODEC ES8311",
@@ -459,7 +462,7 @@ fn echo_reports_length_and_crc() {
 fn hello_repeats_the_static_state() {
     let (mut firmware, mut board, _) = booted(blank_flash());
     let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
-    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", BOX_KEY, "MODE DUTY", "VOICES builtin", "VOLUME 65"]);
+    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", BOX_KEY, RELAY_URL, "MODE DUTY", "VOICES builtin", "VOLUME 65"]);
 }
 
 #[test]
@@ -827,6 +830,7 @@ mod lan {
         for line in [
             r#"{"version":1,"event":"device.pair","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
             r#"{"version":1,"event":"device.wifi.set","ssid":"evil","password":"x"}"#,
+            r#"{"version":1,"event":"device.relay.set","url":"wss://evil.example"}"#,
         ] {
             firmware.lan_received(&mut board, 1, format!("{line}\n").as_bytes());
             assert_eq!(board.take_lines(), ["ERROR cable_only"]);
@@ -869,6 +873,27 @@ mod lan {
         assert_eq!(firmware.wifi().map(|wifi| wifi.password.as_str()), Some("secret"));
         assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.forget"}"#), ["WIFI FORGOTTEN"]);
         assert_eq!(firmware.wifi(), None);
+    }
+
+    #[test]
+    fn the_relay_follows_the_computer_on_the_cable() {
+        let (mut firmware, mut board, lines) = booted(blank_flash());
+        assert!(lines.contains(&"RELAY URL wss://relay.korekore.ai".to_owned()), "{lines:?}");
+        let staging = r#"{"version":1,"event":"device.relay.set","url":"wss://relay-staging.korekore.ai"}"#;
+        assert_eq!(send(&mut firmware, &mut board, staging), ["RELAY URL wss://relay-staging.korekore.ai"]);
+        assert!(firmware.take_relay_change());
+        let saved = board.flash.bytes.clone();
+        send(&mut firmware, &mut board, staging);
+        assert!(!firmware.take_relay_change(), "the same Relay again changes nothing");
+        assert!(board.flash.bytes == saved, "and writes nothing");
+        assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.relay.set","url":"ws://plain"}"#), ["RELAY INVALID"]);
+
+        let (mut firmware, mut board, lines) = booted(board.flash);
+        assert!(lines.contains(&"RELAY URL wss://relay-staging.korekore.ai".to_owned()), "{lines:?}");
+        assert_eq!(firmware.relay_url(), "wss://relay-staging.korekore.ai");
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"device.relay.set","url":"wss://relay.korekore.ai"}"#);
+        assert!(firmware.take_relay_change());
+        assert_eq!(firmware.relay_url(), "wss://relay.korekore.ai");
     }
 }
 

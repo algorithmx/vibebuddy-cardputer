@@ -152,6 +152,16 @@ The apps set it through `POST /v1/device/wifi` with `{"ssid", "password"}` and `
 
 Replies: `WIFI NETWORK <ssid>`, `WIFI FORGOTTEN`, `WIFI INVALID` (an empty name, a name over 32 bytes, or a password over 63), or `WIFI UNAVAILABLE` (no `link` partition).
 
+## Relay
+
+Set only over USB, like Wi-Fi: the Relay the box connects to (docs/relay-protocol.md, "Which Relay"). The daemon sends it on every USB link, so a development build and its box use the staging Relay and a release and its box use production.
+
+```json
+{"version":1,"event":"device.relay.set","url":"wss://relay-staging.korekore.ai"}
+```
+
+`url` is `wss://` and a host name, nothing else; the box connects on port 443 to `/v1/boxes/<box-id>`. The box writes flash only when the Relay changes, and then drops its Relay socket and connects to the new one. It reports the Relay it uses as `RELAY URL <url>` at boot, in answer to hello, and in reply to `device.relay.set`; `wss://relay.korekore.ai` until a computer sets another. Other replies: `RELAY INVALID` (not a `wss://` host) and `RELAY UNAVAILABLE` (no `link` partition). Over the network or the Relay it is refused with `ERROR cable_only`.
+
 ## Local network link
 
 Over the local network the box is the TCP server and the computer connects. The bytes are the same NDJSON as over USB, after a handshake in which both ends prove their keys (`firmware-rs/core/src/lan.rs`):
@@ -164,7 +174,7 @@ Over the local network the box is the TCP server and the computer connects. The 
 
 The computer signs `vibebuddy-lan-v1\ncomputer\n<box key>\n<box nonce>`, and the box signs `vibebuddy-lan-v1\nbox\n<box key>\n<computer nonce>`. Keys, nonces and signatures are unpadded base64url. The computer checks the box's key against the `BOX KEY` it learned over USB, so it won't drive another box. The box refuses with `link.error` (`auth`, `bad_message`, `timeout` after 10 s) and closes. If it is linked elsewhere, it sends `link.busy` with `reason` `usb` (a computer talked over the cable in the last 15 s) or `linked` (another computer has the box), and `owner`, that computer's name when the box knows it, and closes.
 
-A box links to one computer at a time (ADR-0011). A paired computer gets the box when it is free, when it was the last one linked, or once the last one has been gone 10 minutes. `"takeover":true`, which the user asked for, always gets it unless the cable is in use. Whoever loses the box gets `link.unlinked` with `reason` `takeover`, `usb` or `unpaired`, and is closed. Pairing and Wi-Fi messages that come over the network are refused with `ERROR cable_only`.
+A box links to one computer at a time (ADR-0011). A paired computer gets the box when it is free, when it was the last one linked, or once the last one has been gone 10 minutes. `"takeover":true`, which the user asked for, always gets it unless the cable is in use. Whoever loses the box gets `link.unlinked` with `reason` `takeover`, `usb` or `unpaired`, and is closed. Pairing, Wi-Fi and Relay messages that come over the network are refused with `ERROR cable_only`.
 
 On the computer's side, `vibebuddyd` remembers the box's key when it sees `BOX KEY` over USB (`box-key` in its state directory), and the address the box reports over USB once it is on Wi-Fi, `WIFI ADDRESS <ip>` (`box-address`). It connects to port 7340 there; `VIBEBUDDY_LAN_ADDR=host:port` fixes the address instead, as for the simulator (`tools/simulate-device.py --tcp 7340`). It tries the network only while no box is on the cable, and checks the cable every 2 s while linked over the network. Moving between the two is not a drop: `/v1/status` goes from one connection to the other with no `connected: false` in between, and `device.network` says which it is. Flashing needs the cable.
 

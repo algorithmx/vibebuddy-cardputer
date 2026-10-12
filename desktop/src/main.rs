@@ -772,6 +772,16 @@ impl App {
                     .label(tr("Reach the box through the VibeBuddy Relay when it's away from this computer", &[]))
                     .on_toggle_maybe(self.status.is_some().then_some(Message::Relay)),
             )
+            // Development builds use the staging Relay and releases production; the box follows the computer on its cable.
+            .push(self.status.as_ref().and_then(|status| {
+                let device = &status.device;
+                let server = device.relay_server.as_deref()?;
+                let mut lines = column![text(tr("Relay: %@", &[&status::relay_host(server)])).size(13)];
+                if let Some(other) = device.box_relay.as_deref().filter(|other| *other != server) {
+                    lines = lines.push(text(tr("The box uses %@ until it's plugged into this computer.", &[&status::relay_host(other)])).size(13));
+                }
+                Some(lines)
+            }))
             .push(
                 toggler(check)
                     .label(tr("Check for updates", &[]))

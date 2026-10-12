@@ -453,6 +453,9 @@ async fn main(spawner: Spawner) -> ! {
         if firmware.take_scan_request() {
             net::SCAN.signal(());
         }
+        if firmware.take_relay_change() {
+            relay::URL.signal(firmware.relay_url().into());
+        }
         if firmware.take_wifi_change() {
             net::CREDENTIALS.signal(wifi_credentials(&firmware));
         }
@@ -488,5 +491,6 @@ fn start_relay(spawner: &Spawner, stack: embassy_net::Stack<'static>, trng: &'st
     let Ok(tls) = mbedtls_rs::Tls::new(trng) else { return };
     let Some(link) = firmware.link() else { return };
     relay::BOX_ID.signal(vibebuddy_firmware_core::link::encode(&link.public_key()));
+    relay::URL.signal(firmware.relay_url().into());
     spawner.spawn(relay::task(stack, tls).expect("Relay task"));
 }

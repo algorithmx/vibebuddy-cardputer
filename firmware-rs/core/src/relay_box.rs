@@ -27,6 +27,22 @@ pub struct RelayBox {
 /// The Relay protocol version the box speaks (docs/relay-protocol.md).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The Relay a box uses until the computer on the cable names another (docs/relay-protocol.md, "Which Relay").
+pub const DEFAULT_URL: &str = "wss://relay.korekore.ai";
+
+/// The host of a Relay URL the box can use: `wss://` and a host name, nothing else. The box always
+/// connects on port 443 to `/v1/boxes/<box-id>`.
+pub fn url_host(url: &str) -> Option<&str> {
+    let host = url.strip_prefix("wss://")?;
+    let host = host.strip_suffix('/').unwrap_or(host);
+    let valid = !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        && !host.starts_with(['.', '-'])
+        && !host.ends_with(['.', '-']);
+    valid.then_some(host)
+}
+
 /// The exact text the box sends every 30 s as a sign of life; the Relay answers it without waking.
 pub const PING: &str = r#"{"t":"ping"}"#;
 
@@ -109,6 +125,20 @@ impl RelayBox {
             self.local = Some(local);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_wss_host_is_a_relay_url() {
+        assert_eq!(url_host(DEFAULT_URL), Some("relay.korekore.ai"));
+        assert_eq!(url_host("wss://relay-staging.korekore.ai/"), Some("relay-staging.korekore.ai"));
+        for bad in ["ws://relay.korekore.ai", "wss://", "wss://host:8443", "wss://host/v1", "https://host", "wss://-host", "wss://a b"] {
+            assert_eq!(url_host(bad), None, "{bad}");
+        }
     }
 }
 
