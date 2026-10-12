@@ -37,7 +37,7 @@ A `v` that isn't an integer gets `{"t":"error","code":"auth"}` and close 4001. A
 
 - `{"t":"paired","computers":[{"key":"…","name":"…"}]}`: the full paired list, at most 16, sent after every welcome and whenever it changes. Computers no longer in it are dropped (`unlinked`, reason `unpaired`, close 4003).
 - `{"t":"linked","via":"usb"|"lan","computer":"<key>"|null}`: the box linked to a computer without the Relay (`null` for an unpaired computer over USB). Any Relay link ends.
-- `{"t":"unlinked"}`: that link ended.
+- `{"t":"unlinked"}`: that link ended. If that computer wasn't paired (`computer: null`), the Relay frees the box at once, since such a computer can't come back through it; a paired one keeps the 10-minute grace.
 - `{"t":"data","line":"…"}`: one VibeBuddy Protocol line for the computer linked through the Relay.
 
 The Relay sends the box `{"t":"linked","computer":"<key>","name":"…"}` when a computer links through it (also right after welcome, if one is linked), `{"t":"unlinked","reason":…}` when that link ends, and `data` from that computer. Reasons for `unlinked` to the box: `gone` (the computer's socket closed or was dropped), `released` (it sent `unlink`), `unpaired`.
