@@ -53,9 +53,9 @@ Pomodoro runs entirely on the box: its timer and today's tally keep going withou
 1. Install with Homebrew: `brew install --cask second-state/tap/vibebuddy`. Or download `VibeBuddy-<version>-arm64.dmg` from the [latest release](https://github.com/second-state/vibebuddy/releases/latest) and drag VibeBuddy to Applications. Either way the app then updates itself.
 2. Plug the box into the Mac.
 3. Open VibeBuddy. First-run setup walks you through:
-   - finding the box (it blinks so you know it's the right one);
-   - connecting Codex and Claude Code (you see the exact change to their hook config before it's written);
-   - picking an announcement voice and writing it to the box;
+   - finding the box (it blinks so you know it's the right one), and updating its firmware if a newer one is out;
+   - connecting your agents: Codex, Claude Code, OpenCode, GitHub Copilot CLI and Pi (you see the exact change to their hook config before it's written);
+   - picking a character and writing it to the box (the default robot comes first);
    - launching at login.
 
 After that VibeBuddy lives in the menu bar; open the app again any time to bring up Settings. Its icon tells you whether the box is online, which mode it's in and how much got done today. Settings has five tabs: General (including the interface language), Character (who the buddy is, and the volume), Agents, Device (firmware updates, screenshots) and Advanced. Firmware is released on its own: when a newer one the app can run is out, VibeBuddy downloads it and Settings → Device offers to update the box, which you confirm.
@@ -225,7 +225,13 @@ The Mac app is a menu bar app. It carries `vibebuddyd` and `vibebuddy-hook` insi
 just install    # build the app, install it to /Applications and launch it
 ```
 
-The app builds with SwiftPM and only needs the command-line tools. `swift run --package-path app SelfTest` runs the view-model self-test.
+The app builds with SwiftPM and only needs the command-line tools. Packaging also collects third-party license notices with `cargo-about`; install the same version CI uses once, or the build stops at the license step:
+
+```bash
+cargo install cargo-about --version 0.9.2 --locked --features cli
+```
+
+`swift run --package-path app SelfTest` runs the view-model self-test.
 
 ### The daemon
 
@@ -252,7 +258,7 @@ CI builds releases. The App and the firmware release separately (ADR-0010). [`re
 - [`release-firmware`](.github/workflows/release-firmware.yml) builds the firmware on Linux. A `firmware-vX.Y.Z` tag publishes its own Release, never marked latest, with `VibeBuddy-firmware-vX.Y.Z.zip`: the three images, `build.txt`, `version.txt` and the firmware's license notices. That zip is what the daemon downloads, and anyone can flash it from Settings → Device → Flash from file…. The tag must match `version` in `firmware-rs/device/Cargo.toml`.
 - Before a firmware release, write `docs/releases/firmware-vX.Y.Z.md`: front matter naming the oldest App it runs with (`min_app: 0.4.0` between two `---` lines), then what it does. `just release-firmware 0.3.3` checks that file, bumps the version, commits, tags and pushes.
 - Releasing the App and the firmware together: commit both sets of notes before either tag. Each release's manifest job checks out its own tag and needs notes for every published release, so a firmware Release whose notes came after the App's tag fails the App's manifest (v0.4.1 did; rerun `update-manifest` by hand from main to recover).
-- Builds are arm64 for the Mac and x86_64 for Linux. After a release, `packaging/aur/README.md` says how to update the AUR package. The Homebrew cask in [second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) follows new releases on its own within the hour.
+- Builds are arm64 for the Mac and x86_64 for Linux. The AUR package isn't published yet (see above): its source in `packaging/aur/` is still at 0.3.2, and nothing needs updating there after a release until it is. The Homebrew cask in [second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) follows new releases on its own within the hour.
 
 With the five signing secrets set on the repository, releases are signed with a Developer ID and notarized, so they open straight after download. Without them the build falls back to ad-hoc signing, and the first launch has to be allowed under Privacy & Security. [`tools/setup-release-signing.sh`](tools/setup-release-signing.sh) sets the secrets up: it walks you through requesting the certificate, packing the p12 and creating an app-specific password, then checks each one before writing it to GitHub.
 
