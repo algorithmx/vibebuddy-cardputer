@@ -409,6 +409,11 @@ async fn main(spawner: Spawner) -> ! {
                 net::NetEvent::Line(line) => {
                     board.write(line.as_bytes());
                     board.write(b"\n");
+                    if line == "WIFI CONNECTED" {
+                        firmware.set_wifi_joined(true);
+                    } else if line == "WIFI DISCONNECTED" || line.starts_with("WIFI FAILED") || line.starts_with("WIFI CONNECTING") {
+                        firmware.set_wifi_joined(false);
+                    }
                     // Once on the network, the Wi-Fi driver has taken what it needs (#108).
                     if line.starts_with("WIFI ADDRESS") {
                         report_memory(&mut board);

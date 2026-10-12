@@ -41,6 +41,7 @@ Muse manages with two keys because many of its boards only have two. This box ha
 | VOLUME | always | steps 20 → 35 → 50 → 65 → 80 → 100 → 20 and plays the "All done!" line at the new level, as the app's preview does |
 | MUTE | always | toggles mute, like K2 long |
 | COMPUTERS | only while computers are paired with the box (ADR-0012); shows how many | asks FORGET ALL?; K0 there forgets every paired computer, K1 goes back. For a box changing hands; each computer pairs again the next time it's plugged in |
+| NETWORK | always | opens the network view; K0 there goes back |
 | STATUS | always | opens the status view; K0 there goes back |
 
 ![VOLUME stepped to 80](images/menu-volume.png) ![STOP FOCUS during a focus session](images/menu-focus.png)
@@ -51,7 +52,27 @@ Volume steps are coarse on purpose: six presses cover the range, and the app's s
 
 ![The status view](images/menu-status.png)
 
-What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), whether the Mac is linked, the voice pack and today's focus tally. Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the Mac?" gets answered without opening the app.
+What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), how it is linked to its computer (LINK, as in the network view), the voice pack and today's focus tally. Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the computer?" gets answered without opening the app.
+
+### Network
+
+![The network view](images/menu-network.png)
+
+How the box reaches its computer, as rows a glance can read; anything dimmed isn't working:
+
+| Row | Shows |
+|---|---|
+| LINK | `USB`, `LAN` or `RELAY`, the way the computer is linked now (USB wins, then the local network, then the Relay); `NO LINK` dimmed without one |
+| WIFI | the network's name, dimmed until the box has joined it; `OFF` with none set |
+| RELAY | `PROD` or `STAGING` for the Relay the box uses (docs/relay-protocol.md, "Which Relay"), the host for any other; `DOWN` after it, dimmed, while not connected; `OFF` without Wi-Fi |
+
+### The link icon
+
+![The plug in the top left](images/screen-link.png)
+
+Every screen shows how the box is linked as a small icon in its top left: a plug for USB, Wi-Fi waves for the local network, a cloud for the Relay. While that link goes through the staging Relay, `STG` follows the cloud in orange, so a development build is never mistaken for a release; over USB or the local network the Relay isn't in the way, so no `STG` shows (the NETWORK view still names the Relay). No icon shows without a link: the screen already says NO LINK. MUTE, when on, comes after them.
+
+![USB, local network and Relay icons](images/link-icons.png)
 
 ## Behavior around the menu
 

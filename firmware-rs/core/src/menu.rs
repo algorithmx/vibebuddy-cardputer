@@ -21,12 +21,15 @@ pub enum Row {
     Mute,
     /// The computers paired with the box; K0 asks whether to forget them all.
     Computers,
+    /// How the box is linked, its Wi-Fi and its Relay.
+    Network,
     Status,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     List,
+    Network,
     Status,
     /// Asks before forgetting every paired computer: K0 forgets, K1 goes back.
     Forget,
@@ -84,7 +87,7 @@ impl Menu {
     }
 
     pub fn rows(context: Context) -> Vec<Row> {
-        let mut rows = Vec::with_capacity(5);
+        let mut rows = Vec::with_capacity(6);
         if context.phase_active {
             rows.push(Row::StopPhase);
         }
@@ -92,7 +95,7 @@ impl Menu {
         if context.paired > 0 {
             rows.push(Row::Computers);
         }
-        rows.push(Row::Status);
+        rows.extend([Row::Network, Row::Status]);
         rows
     }
 
@@ -135,9 +138,10 @@ impl Menu {
                 Row::Volume => Action::StepVolume,
                 Row::Mute => Action::ToggleMute,
                 Row::Computers => self.show(View::Forget),
+                Row::Network => self.show(View::Network),
                 Row::Status => self.show(View::Status),
             },
-            (View::Status, ButtonEvent::K0Short) | (View::Forget, ButtonEvent::K1Short) => self.show(View::List),
+            (View::Network | View::Status, ButtonEvent::K0Short) | (View::Forget, ButtonEvent::K1Short) => self.show(View::List),
             (View::Forget, ButtonEvent::K0Short) => {
                 self.view = Some(View::List);
                 Action::ForgetComputers
@@ -245,8 +249,8 @@ mod tests {
 
     #[test]
     fn rows_follow_the_context() {
-        assert_eq!(Menu::rows(PLAIN), [Row::Volume, Row::Mute, Row::Status]);
-        assert_eq!(Menu::rows(FULL), [Row::StopPhase, Row::Volume, Row::Mute, Row::Computers, Row::Status]);
+        assert_eq!(Menu::rows(PLAIN), [Row::Volume, Row::Mute, Row::Network, Row::Status]);
+        assert_eq!(Menu::rows(FULL), [Row::StopPhase, Row::Volume, Row::Mute, Row::Computers, Row::Network, Row::Status]);
     }
 
     #[test]
@@ -277,6 +281,7 @@ mod tests {
         assert_eq!(menu.key(ButtonEvent::K1Short, PLAIN, 20), Action::Redraw);
         assert_eq!(menu.selected(PLAIN), 2);
         menu.key(ButtonEvent::K1Short, PLAIN, 30);
+        menu.key(ButtonEvent::K1Short, PLAIN, 30);
         assert_eq!(menu.selected(PLAIN), 0);
         assert_eq!(menu.key(ButtonEvent::K2Short, PLAIN, 40), Action::Close);
         assert!(!menu.is_open());
@@ -292,11 +297,15 @@ mod tests {
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::ToggleMute);
         menu.key(ButtonEvent::K1Short, PLAIN, 0);
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
+        assert_eq!(menu.view(), Some(View::Network));
+        assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
+        menu.key(ButtonEvent::K1Short, PLAIN, 0);
+        assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
         assert_eq!(menu.view(), Some(View::Status));
         assert_eq!(menu.key(ButtonEvent::K1Short, PLAIN, 0), Action::None, "the status view has no rows");
         assert_eq!(menu.key(ButtonEvent::K0Short, PLAIN, 0), Action::Redraw);
         assert_eq!(menu.view(), Some(View::List));
-        assert_eq!(menu.selected(PLAIN), 2, "back on STATUS");
+        assert_eq!(menu.selected(PLAIN), 3, "back on STATUS");
     }
 
     #[test]

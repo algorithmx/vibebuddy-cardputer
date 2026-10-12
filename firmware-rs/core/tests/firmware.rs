@@ -689,9 +689,9 @@ fn an_agent_needing_the_user_closes_the_menu_and_quiet_closes_it_too() {
 #[test]
 fn k1_wraps_around_the_rows() {
     let (mut firmware, mut board, _) = booted(blank_flash());
-    // VOLUME, MUTE, STATUS, and back to VOLUME.
+    // VOLUME, MUTE, NETWORK, STATUS, and back to VOLUME.
     press(&mut firmware, &mut board, Key::K1, 1100);
-    for _ in 0..3 {
+    for _ in 0..4 {
         press(&mut firmware, &mut board, Key::K1, 50);
     }
     assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["VOLUME 80", "AUDIO QUEUED DONE"]);
@@ -873,6 +873,41 @@ mod lan {
         assert_eq!(firmware.wifi().map(|wifi| wifi.password.as_str()), Some("secret"));
         assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.forget"}"#), ["WIFI FORGOTTEN"]);
         assert_eq!(firmware.wifi(), None);
+    }
+
+    #[test]
+    fn the_screen_and_the_network_view_say_how_the_box_is_linked() {
+        use vibebuddy_firmware_core::display::{LinkPath, Tone};
+        use vibebuddy_firmware_core::menu::View;
+        let values = |firmware: &Firmware, now| -> Vec<(String, Tone)> {
+            firmware
+                .menu_panel(View::Network, now)
+                .lines
+                .into_iter()
+                .map(|(_, value, tone)| (String::from_utf8(value).unwrap(), tone))
+                .collect()
+        };
+        let (mut firmware, mut board) = paired_box();
+        let now = board.now_ms();
+        assert_eq!(firmware.link_mark(now), (None, false), "no link shows nothing");
+        assert_eq!(values(&firmware, now), [("NO LINK".to_owned(), Tone::Dim), ("OFF".to_owned(), Tone::Dim), ("OFF".to_owned(), Tone::Dim)]);
+
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.set","ssid":"Home","password":"secret"}"#);
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"device.relay.set","url":"wss://relay-staging.korekore.ai"}"#);
+        let now = board.now_ms();
+        assert!(firmware.on_staging());
+        assert_eq!(firmware.link_mark(now), (Some(LinkPath::Usb), false), "the cable doesn't go through the Relay");
+        assert_eq!(values(&firmware, now)[1..], [("Home".to_owned(), Tone::Dim), ("STAGING DOWN".to_owned(), Tone::Dim)]);
+        firmware.set_wifi_joined(true);
+        firmware.set_relay_up(true);
+        assert_eq!(values(&firmware, now), [("USB".to_owned(), Tone::Plain), ("Home".to_owned(), Tone::Plain), ("STAGING".to_owned(), Tone::Plain)]);
+
+        board.advance(USB_QUIET_MS);
+        link_up(&mut firmware, &mut board, 1);
+        assert_eq!(firmware.link_mark(board.now_ms()), (Some(LinkPath::Lan), false));
+        firmware.lan_closed(&mut board, 1);
+        firmware.relay_linked(board.now_ms(), Some(computer().verifying_key().to_bytes()));
+        assert_eq!(firmware.link_mark(board.now_ms()), (Some(LinkPath::Relay), true), "STG marks a link through staging");
     }
 
     #[test]

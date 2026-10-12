@@ -91,6 +91,11 @@ impl Lan {
         self.owner.filter(|owner| owner.gone_since.is_none() && owner.conn.is_some()).map(|owner| owner.key)
     }
 
+    /// A computer is linked through the Relay right now.
+    pub fn relay_link_active(&self) -> bool {
+        self.owner.is_some_and(|owner| owner.conn.is_none() && owner.gone_since.is_none())
+    }
+
     /// A computer talked over the cable in the last [`USB_QUIET_MS`].
     pub fn cable_in_use(&self, now: u32) -> bool {
         self.usb_at.is_some_and(|at| now.wrapping_sub(at) < USB_QUIET_MS)
