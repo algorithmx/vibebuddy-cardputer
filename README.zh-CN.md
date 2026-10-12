@@ -258,7 +258,7 @@ daemon 平时由 App 看管。没有 App 的开发机可以用 [`packaging/com.v
 - [`release-firmware`](.github/workflows/release-firmware.yml) 在 Linux 上构建固件。打 `firmware-vX.Y.Z` 标签会发一个单独的 Release（不标为最新版），里面是 `VibeBuddy-firmware-vX.Y.Z.zip`：固件三件套、`build.txt`、`version.txt` 和固件自己的许可证声明。daemon 下载的就是这个 zip，任何人也可以在设置 → 设备「从文件刷入…」里选它。标签必须与 `firmware-rs/device/Cargo.toml` 的 `version` 一致。
 - 固件发版前先写 `docs/releases/firmware-vX.Y.Z.md`：开头用 front matter 写明它能配合的最低 App 版本（两行 `---` 之间写 `min_app: 0.4.0`），然后写它做了什么。`just release-firmware 0.3.3` 检查那份文件，改版本号，提交、打标签、推送。
 - App 和固件一起发时，先把两边的发布说明都提交，再打任何一个标签。每次发布的清单任务都检出自己的标签，并且要求每个已发布的 release 都有说明；固件 Release 的说明若晚于 App 标签提交，App 的清单任务就会失败（v0.4.1 就是这样；从 main 手动重跑 `update-manifest` 即可恢复）。
-- Mac 出 arm64，Linux 出 x86_64。发布后怎么更新 AUR 包，见 `packaging/aur/README.md`。[second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) 里的 Homebrew cask 会在一小时内自动跟上新版本。
+- Mac 出 arm64，Linux 出 x86_64。AUR 包还没上架（见上文）：`packaging/aur/` 里的打包文件还停在 0.3.2，上架之前发布后不用管它。[second-state/homebrew-tap](https://github.com/second-state/homebrew-tap) 里的 Homebrew cask 会在一小时内自动跟上新版本。
 
 仓库配齐五个签名 secrets 后用 Developer ID 签名并公证，下载即可打开；没配时退回 ad-hoc 签名，首次打开要在「隐私与安全性」里放行。secrets 用 [`tools/setup-release-signing.sh`](tools/setup-release-signing.sh) 配：它带着走完申请证书、打包 p12、生成 App 专用密码，并逐项验证后写进 GitHub。
 
