@@ -3,6 +3,10 @@
 # The Relay sits on Cloudflare's Universal SSL, whose CA can be Let's Encrypt, Google Trust Services or
 # SSL.com, with a backup certificate from Sectigo deployed on revocation (#110). Each CA's ECDSA and RSA
 # roots are taken from macOS's system root store. Replacing the bundle needs a firmware release.
+#
+# Not yet included: Let's Encrypt's ISRG Root YE and YR. Today their chains are cross-signed to ISRG Root
+# X2/X1, which are here. Add them (dragon, 2026-10-12) when they enter Apple's or Mozilla's root store, or
+# when Let's Encrypt announces an end date for those cross-signs, whichever comes first (#110).
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
