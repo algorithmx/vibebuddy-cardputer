@@ -158,6 +158,8 @@ final class AppModel: ObservableObject {
 
     func unpair(key: String) { run { try await self.client.unpair(key: key) } }
 
+    func takeOver() { run { try await self.client.takeOver() } }
+
     func setWifi(ssid: String, password: String) { run { try await self.client.setWifi(ssid: ssid, password: password) } }
 
     func forgetWifi() { run { try await self.client.forgetWifi() } }
@@ -165,6 +167,12 @@ final class AppModel: ObservableObject {
     func setNotifyLink(_ enabled: Bool) {
         guard var config = status?.config else { return }
         config.notifyLink = enabled
+        run { _ = try await self.client.putConfig(config) }
+    }
+
+    func setRelay(_ enabled: Bool) {
+        guard var config = status?.config else { return }
+        config.relay = enabled
         run { _ = try await self.client.putConfig(config) }
     }
 

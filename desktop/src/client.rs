@@ -105,6 +105,11 @@ pub async fn unpair(key: String) -> Result<(), String> {
     post("/v1/device/unpair", Some(serde_json::json!({ "key": key }))).await
 }
 
+/// Takes the box from the computer that has it; the daemon's next try over the network or the Relay asks outright.
+pub async fn take_over() -> Result<(), String> {
+    post("/v1/device/takeover", None).await
+}
+
 /// The password goes to the box over the cable and is kept nowhere else.
 pub async fn set_wifi(ssid: String, password: String) -> Result<(), String> {
     post("/v1/device/wifi", Some(serde_json::json!({ "ssid": ssid, "password": password }))).await

@@ -77,6 +77,7 @@ pub fn manifest(releases: &[Release], notes: impl Fn(&str) -> Option<String>, mi
         min_supported_app: min_supported_app.to_owned(),
         app,
         firmware: firmware.into_iter().map(|(_, firmware)| firmware).collect(),
+        relay: None,
     })
 }
 

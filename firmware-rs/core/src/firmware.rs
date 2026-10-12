@@ -88,6 +88,15 @@ pub trait Board: Screen {
     fn lan_peer(&mut self, _conn: Option<Conn>) {}
 }
 
+/// What the box is linked to without the Relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalLink {
+    None,
+    /// A computer talks over the cable; its key once it has paired.
+    Usb(Option<[u8; 32]>),
+    Lan([u8; 32]),
+}
+
 pub struct Firmware {
     pomodoro: Pomodoro,
     leisure: Leisure,
@@ -106,6 +115,8 @@ pub struct Firmware {
     remote: bool,
     /// The Wi-Fi network changed and the device layer hasn't picked it up yet.
     wifi_changed: bool,
+    /// The computer on the cable, once it has paired: what the box reports to the Relay as its USB link.
+    cable_key: Option<[u8; 32]>,
     volume: u32,
     audio_ready: bool,
     build: Vec<u8>,
@@ -221,6 +232,7 @@ impl Firmware {
             lan: Lan::new(),
             remote: false,
             wifi_changed: false,
+            cable_key: None,
             volume: VOLUME_DEFAULT,
             audio_ready: false,
             build: build.to_vec(),
@@ -384,6 +396,32 @@ impl Firmware {
     pub fn lan_closed<B: Board>(&mut self, board: &mut B, conn: Conn) {
         let outputs = self.lan.closed(conn, board.now_ms());
         self.apply_lan(board, outputs);
+    }
+
+    /// What the box is linked to on its own, without the Relay: the Relay client reports it (docs/relay-protocol.md).
+    pub fn local_link(&self, now: u32) -> LocalLink {
+        if self.lan.cable_in_use(now) {
+            LocalLink::Usb(self.cable_key)
+        } else if let Some(key) = self.lan.linked_key() {
+            LocalLink::Lan(key)
+        } else {
+            LocalLink::None
+        }
+    }
+
+    /// The box's key and pairings, for the Relay client.
+    pub fn link(&self) -> Option<&Link> {
+        self.link.as_ref().map(|(_, link)| link)
+    }
+
+    /// The Relay linked a computer to the box, or ended that link.
+    pub fn relay_linked(&mut self, now: u32, key: Option<[u8; 32]>) {
+        self.lan.relay_linked(key, now);
+    }
+
+    /// A line from the computer linked through the Relay; like a line over the network, never cable-only commands.
+    pub fn relay_line<B: Board>(&mut self, board: &mut B, line: &[u8]) {
+        self.apply_lan(board, alloc::vec![LanOutput::Line(line.to_vec())]);
     }
 
     /// The network to join, for the device layer.
@@ -1101,7 +1139,7 @@ impl Firmware {
     }
 
     fn handle_pairing<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
-        let Some((store, link)) = self.link.as_mut() else {
+        let Some((_, link)) = &self.link else {
             return Self::write_literal(board, "PAIR UNAVAILABLE\n");
         };
         if event == "device.pairs" {
@@ -1117,6 +1155,10 @@ impl Firmware {
         let Some(key) = string(fields, "key").and_then(link::decode_key) else {
             return Self::write_literal(board, "PAIR INVALID\n");
         };
+        if event == "device.pair" {
+            self.cable_key = Some(key);
+        }
+        let Some((store, link)) = self.link.as_mut() else { return };
         let changed = if event == "device.pair" {
             match link.pair(key, string(fields, "name").unwrap_or("")) {
                 Ok(changed) => changed,

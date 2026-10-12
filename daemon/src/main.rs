@@ -6,6 +6,7 @@ mod codex_hooks;
 mod config;
 mod identity;
 mod lan;
+mod relay;
 mod link_alert;
 mod occasions;
 mod rom_flasher;
@@ -82,6 +83,8 @@ struct AppState {
     serial: Option<Arc<SerialTransport>>,
     /// This computer's pairing key; None when it couldn't be read or made, and then nothing is paired.
     identity: Option<Arc<identity::Identity>>,
+    /// Where the Relay is; the update manifest may move it.
+    relay: Option<relay::RelayConfig>,
     /// The update manifest and the firmware it offers; with no source, nothing is ever checked.
     updates: Arc<Mutex<Updates>>,
     /// "Check for updates" pressed: checks now instead of waiting for the daily one.
@@ -115,6 +118,7 @@ impl AppState {
             app_version: env::var("VIBEBUDDY_APP_VERSION").ok().filter(|value| !value.is_empty()),
             serial: None,
             identity: None,
+            relay: None,
             updates: Arc::new(Mutex::new(Updates::new(None, None))),
             check_updates: Arc::new(Notify::new()),
         }
@@ -194,6 +198,7 @@ async fn main() {
         None => None,
     };
     let mut serial_config = SerialConfig::from_env(known_box_file());
+    let mut relay_config = None;
     // Paired, the box can also be reached over the local network when it isn't on the cable (ADR-0012).
     if let (Some(identity), Some(state_dir)) = (&identity, config::state_dir()) {
         serial_config = serial_config.with_lan(lan::LanConfig {
@@ -201,6 +206,10 @@ async fn main() {
             state_dir,
             fixed_address: std::env::var("VIBEBUDDY_LAN_ADDR").ok(),
         });
+        // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok());
+        serial_config = serial_config.with_relay(relay.clone());
+        relay_config = Some(relay);
     }
     let pin = serial_config.pin();
     if let Some(pin) = &pin {
@@ -219,16 +228,21 @@ async fn main() {
         SessionTitles::from_home(),
         config::config_file(),
     );
+    serial_transport.set_relay_enabled(state.config.lock().await.relay);
     state.serial = Some(serial_transport);
     if let Some(identity) = &identity {
         state.device.lock().await.computer_key = Some(identity.public_key());
     }
     state.identity = identity;
+    state.relay = relay_config;
     state.device.lock().await.pin = pin;
     state.updates = Arc::new(Mutex::new(Updates::new(
         updates::Source::configured(),
         config::state_dir().map(|dir| dir.join("updates")),
     )));
+    if let (Some(relay), Some(url)) = (&state.relay, state.updates.lock().await.relay_url()) {
+        relay.offer(&url);
+    }
     tokio::spawn(watch_parent());
     tokio::spawn(sweep_expired_activities(state.clone()));
     tokio::spawn(send_heartbeats(state.clone()));
@@ -307,7 +321,7 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     }
     let _ = state.device_bus.send(message.clone());
     // Ask right after connecting; the device reports its mode, firmware build and voice again.
-    if matches!(message, DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. }) {
+    if matches!(message, DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. } | DeviceMessage::ConnectedRelay { .. }) {
         send_event(state, device_command("device.hello"));
     }
     let DeviceMessage::Event(event) = message else {
@@ -428,6 +442,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/device/identify", post(post_identify))
         .route("/v1/device/volume", post(post_volume))
         .route("/v1/device/unpair", post(post_unpair))
+        .route("/v1/device/takeover", post(post_takeover))
         .route("/v1/device/wifi", post(post_wifi))
         .route("/v1/device/wifi/forget", post(post_wifi_forget))
         .route("/v1/device/choice", post(post_choice))
@@ -512,7 +527,11 @@ async fn check_once(state: &AppState) {
     let wanted = match fetched {
         Ok((text, manifest)) => {
             let mut updates = state.updates.lock().await;
-            updates.accept(&text, manifest).map(|firmware| (firmware, updates.firmware_root()))
+            let accepted = updates.accept(&text, manifest).map(|firmware| (firmware, updates.firmware_root()));
+            if let (Some(relay), Some(url)) = (&state.relay, updates.relay_url()) {
+                relay.offer(&url);
+            }
+            accepted
         }
         Err(error) => Err(error),
     };
@@ -549,6 +568,9 @@ async fn post_check_updates(State(state): State<AppState>) -> (StatusCode, Json<
 }
 
 async fn put_config(State(state): State<AppState>, Json(config): Json<Config>) -> Json<Config> {
+    if let Some(serial) = &state.serial {
+        serial.set_relay_enabled(config.relay);
+    }
     state.save_config(|current| *current = config).await;
     Json(state.config.lock().await.clone())
 }
@@ -667,6 +689,28 @@ async fn post_unpair(
     let mut event = device_command("device.unpair");
     event.extra.insert("key".to_owned(), request.key.into());
     post_event(State(state), Json(event)).await
+}
+
+/// The user chose to take the box from the computer that has it: the next try over the network or the Relay
+/// asks for it outright (ADR-0011). Not from another computer's cable, which the box refuses.
+async fn post_takeover(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let refusal = {
+        let device = state.device.lock().await;
+        match &device.busy {
+            _ if device.connected => Some("this computer already has the box"),
+            Some(busy) if busy.reason == "usb" => Some("the box is on another computer's cable"),
+            None => Some("the box isn't linked elsewhere"),
+            Some(_) => None,
+        }
+    };
+    if let Some(message) = refusal {
+        return (StatusCode::CONFLICT, Json(ApiResponse { accepted: false, message: message.to_owned() }));
+    }
+    let Some(serial) = &state.serial else {
+        return (StatusCode::NOT_IMPLEMENTED, Json(ApiResponse { accepted: false, message: "no link worker".to_owned() }));
+    };
+    serial.request_takeover();
+    (StatusCode::ACCEPTED, Json(ApiResponse { accepted: true, message: "taking the box over".to_owned() }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1352,7 +1396,7 @@ mod tests {
             SessionTitles::disabled(),
             Some(path.clone()),
         );
-        let wanted = Config { voice: Some("hsiaochen".to_owned()), notify_link: false, check_updates: Some(true) };
+        let wanted = Config { voice: Some("hsiaochen".to_owned()), notify_link: false, check_updates: Some(true), relay: false };
         let Json(returned) = put_config(State(state.clone()), Json(wanted.clone())).await;
         assert_eq!(returned, wanted);
         assert_eq!(Config::load(&path), wanted);

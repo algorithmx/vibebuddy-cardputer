@@ -162,6 +162,11 @@ impl Updates {
         Ok(wanted.filter(|firmware| self.firmware_dir(&firmware.download.version).is_some_and(|dir| !unpacked(&dir))))
     }
 
+    /// The Relay's address, if the manifest moves it.
+    pub fn relay_url(&self) -> Option<String> {
+        self.manifest.as_ref()?.relay.clone()
+    }
+
     pub fn finish(&mut self, error: Option<String>) {
         self.last_check = Some(Local::now());
         self.error = error;
@@ -354,7 +359,7 @@ mod tests {
                 BTreeMap::from([(platform.to_owned(), app)])
             })
             .unwrap_or_default();
-        Manifest { schema: SCHEMA, generated_at: generated_at.to_owned(), min_supported_app: "0.1.0".to_owned(), app, firmware }
+        Manifest { schema: SCHEMA, generated_at: generated_at.to_owned(), min_supported_app: "0.1.0".to_owned(), app, firmware, relay: None }
     }
 
     fn keys() -> (SigningKey, VerifyingKey) {

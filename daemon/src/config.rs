@@ -14,6 +14,8 @@ pub struct Config {
     pub notify_link: bool,
     /// Whether to check for updates; None follows the build: on in releases, off when built from source (ADR-0010).
     pub check_updates: Option<bool>,
+    /// Whether to reach the box through the Relay when neither the cable nor the local network does (ADR-0012).
+    pub relay: bool,
 }
 
 impl Default for Config {
@@ -22,6 +24,7 @@ impl Default for Config {
             voice: None,
             notify_link: true,
             check_updates: None,
+            relay: true,
         }
     }
 }
@@ -99,6 +102,12 @@ mod tests {
     }
 
     #[test]
+    fn a_config_from_before_the_relay_switch_keeps_the_relay_on() {
+        let config: Config = serde_json::from_str(r#"{"voice":null,"notify_link":true,"check_updates":null}"#).unwrap();
+        assert!(config.relay);
+    }
+
+    #[test]
     fn saved_config_round_trips() {
         let dir = std::env::temp_dir().join(format!("beacon-config-rt-{}", std::process::id()));
         let path = dir.join("nested").join("config.json");
@@ -106,6 +115,7 @@ mod tests {
             voice: Some("wanwanxiaohe".to_owned()),
             notify_link: false,
             check_updates: Some(false),
+            relay: false,
         };
         config.save(&path).expect("save config");
         assert_eq!(Config::load(&path), config);

@@ -85,6 +85,7 @@ enum Message {
     Tab(Tab),
     NotifyLink(bool),
     CheckUpdates(bool),
+    Relay(bool),
     CheckForUpdatesNow,
     OpenReleases,
     ReportProblem,
@@ -100,6 +101,7 @@ enum Message {
     ChooseBox(String),
     /// Forget another computer on the box, by its key.
     Unpair(String),
+    TakeOver,
     WifiSsid(String),
     WifiPassword(String),
     JoinWifi,
@@ -408,6 +410,11 @@ impl App {
                 config.notify_link = enabled;
                 return Task::perform(client::put_config(config), Message::ConfigSaved);
             }
+            Message::Relay(enabled) => {
+                let mut config = self.status.as_ref().map(|status| status.config.clone()).unwrap_or_default();
+                config.relay = enabled;
+                return Task::perform(client::put_config(config), Message::ConfigSaved);
+            }
             Message::CheckUpdates(enabled) => {
                 let mut config = self.status.as_ref().map(|status| status.config.clone()).unwrap_or_default();
                 config.check_updates = Some(enabled);
@@ -484,6 +491,7 @@ impl App {
             }
             Message::ChooseBox(usb_serial) => return Task::perform(client::choose_box(usb_serial), Message::Done),
             Message::Unpair(key) => return Task::perform(client::unpair(key), Message::Done),
+            Message::TakeOver => return Task::perform(client::take_over(), Message::Done),
             Message::WifiSsid(ssid) => self.wifi_ssid = ssid,
             Message::WifiPassword(password) => self.wifi_password = password,
             Message::JoinWifi => {
@@ -755,6 +763,12 @@ impl App {
                 toggler(notify)
                     .label(tr("Notify me when the box disconnects or the daemon fails", &[]))
                     .on_toggle_maybe(self.status.is_some().then_some(Message::NotifyLink)),
+            )
+            // ADR-0012: the Relay carries the box's messages through VibeBuddy's server, so it can be turned off.
+            .push(
+                toggler(self.status.as_ref().is_none_or(|status| status.config.relay))
+                    .label(tr("Reach the box through the VibeBuddy Relay when it's away from this computer", &[]))
+                    .on_toggle_maybe(self.status.is_some().then_some(Message::Relay)),
             )
             .push(
                 toggler(check)
@@ -1074,6 +1088,7 @@ impl App {
             None => tr("daemon isn't running", &[]),
             Some(device) if !device.connected && !device.candidates.is_empty() => tr("Several devices found", &[]),
             Some(device) if !device.connected => tr("Box not found", &[]),
+            Some(device) if device.relay => tr("Relay", &[]),
             Some(device) => {
                 let kind = match (device.network, device.bridge) {
                     (true, _) => tr("Wi-Fi", &[]),
@@ -1306,7 +1321,22 @@ impl App {
                 .into(),
             (None, false) => on_frame(tr("Click Refresh to see what the box is showing", &[])).into(),
         };
+        // Another computer has the box (ADR-0011): say who, and offer to take it unless it's on their cable.
+        let busy_row = device.filter(|_| !online).and_then(|device| device.busy.as_ref()).map(|busy| {
+            let owner = if busy.owner.is_empty() { tr("another computer", &[]) } else { busy.owner.clone() };
+            if busy.reason == "usb" {
+                row![text(tr("The box is plugged into %@.", &[&owner])).size(13)]
+            } else {
+                row![
+                    text(tr("The box is with %@.", &[&owner])).size(13),
+                    space::horizontal(),
+                    button(text(tr("Take over", &[]))).on_press(Message::TakeOver),
+                ]
+                .spacing(12)
+            }
+        });
         column![row![text(tr("Link", &[])).width(140), text(link)].spacing(12)]
+            .push(busy_row)
             .push(pin)
             .push(choice)
             .push(not_found)

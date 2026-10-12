@@ -39,6 +39,9 @@ struct GeneralView: View {
             Toggle("Launch at login", isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }))
             Toggle("Notify me when the box disconnects or the daemon fails", isOn: Binding(get: { model.status?.config.notifyLink ?? true }, set: { model.setNotifyLink($0) }))
                 .disabled(model.status == nil)
+            // ADR-0012: the Relay carries the box's messages through VibeBuddy's server, so it can be turned off.
+            Toggle("Reach the box through the VibeBuddy Relay when it's away from this computer", isOn: Binding(get: { model.status?.config.relay ?? true }, set: { model.setRelay($0) }))
+                .disabled(model.status == nil)
             Section("Updates") {
                 Toggle("Check for updates", isOn: Binding(get: { model.status?.config.checkUpdates ?? model.updates?.enabled ?? false }, set: { model.setCheckUpdates($0) }))
                     .disabled(model.status == nil)
@@ -484,6 +487,19 @@ struct DeviceView: View {
         Form {
             Section {
                 LabeledContent("Link", value: connectionText)
+                // Another computer has the box (ADR-0011): say who, and offer to take it unless it's on their cable.
+                if !connected, let busy = model.status?.device.busy {
+                    let owner = busy.owner.isEmpty ? String(localized: "another computer") : busy.owner
+                    if busy.reason == "usb" {
+                        Text("The box is plugged into \(owner).").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        HStack {
+                            Text("The box is with \(owner).").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Take over") { model.takeOver() }
+                        }
+                    }
+                }
                 // Not while a flash waits for a replug: that row says not to hold K0 this time.
                 if let pin = model.status?.device.pin {
                     PinNotice(pin: pin)
@@ -573,6 +589,7 @@ struct DeviceView: View {
         guard device.connected else {
             return device.candidates?.isEmpty == false ? String(localized: "Several devices found") : String(localized: "Box not found")
         }
+        if device.relay == true { return String(localized: "Relay") }
         if device.network == true { return "\(device.port ?? "") · \(String(localized: "Wi-Fi"))" }
         return "\(device.port ?? "") · \(device.bridge ? String(localized: "UART bridge") : String(localized: "native USB"))"
     }

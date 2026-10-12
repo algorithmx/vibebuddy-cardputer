@@ -91,6 +91,28 @@ impl Lan {
         self.owner.filter(|owner| owner.gone_since.is_none() && owner.conn.is_some()).map(|owner| owner.key)
     }
 
+    /// A computer talked over the cable in the last [`USB_QUIET_MS`].
+    pub fn cable_in_use(&self, now: u32) -> bool {
+        self.usb_at.is_some_and(|at| now.wrapping_sub(at) < USB_QUIET_MS)
+    }
+
+    /// A computer linked through the Relay, or that link ended. The Relay decides that link (ADR-0012); this
+    /// only keeps the local network from taking the box from it without a takeover, and lets the same
+    /// computer move to the local network.
+    pub fn relay_linked(&mut self, key: Option<[u8; 32]>, now: u32) {
+        match key {
+            Some(key) => self.owner = Some(Owner { key, conn: None, gone_since: None }),
+            None => {
+                if let Some(owner) = &mut self.owner
+                    && owner.conn.is_none()
+                    && owner.gone_since.is_none()
+                {
+                    owner.gone_since = Some(now);
+                }
+            }
+        }
+    }
+
     /// A new connection. `nonce` must be fresh randomness.
     pub fn opened(&mut self, link: &Link, conn: Conn, nonce: [u8; 32], now: u32) -> Vec<Output> {
         self.sessions.push(Session { conn, state: State::Waiting { nonce, since: now }, partial: Vec::new() });
@@ -209,8 +231,12 @@ impl Lan {
             Some(owner) => owner.key == key || owner.gone_since.is_some_and(|since| now.wrapping_sub(since) >= GRACE_MS),
         };
         if usb_in_use || !(free || takeover) {
-            let reason = if usb_in_use { "usb" } else { "linked" };
-            let busy = alloc::format!(r#"{{"version":1,"event":"link.busy","reason":"{reason}"}}"#);
+            let (reason, owner) = match self.owner {
+                _ if usb_in_use => ("usb", ""),
+                Some(owner) => ("linked", link.paired.iter().find(|paired| paired.key == owner.key).map_or("", |paired| paired.name.as_str())),
+                None => ("linked", ""),
+            };
+            let busy = serde_json::to_string(&serde_json::json!({"version": 1, "event": "link.busy", "reason": reason, "owner": owner})).unwrap_or_default();
             return self.refused(conn, alloc::vec![Output::Send(conn, busy), Output::Close(conn)]);
         }
 
@@ -375,6 +401,7 @@ mod tests {
         connect(&mut lan, &link, 1, &a, false, 0);
         let out = connect(&mut lan, &link, 2, &b, false, 1000);
         assert_eq!(event(&sent(&out, 2)[0]), "link.busy");
+        assert!(sent(&out, 2)[0].contains(r#""owner":"a""#), "names who has the box");
 
         let out = connect(&mut lan, &link, 3, &b, true, 2000);
         assert_eq!(sent(&out, 1), [unlinked("takeover")]);
@@ -407,6 +434,16 @@ mod tests {
         let busy = &sent(&connect(&mut lan, &link, 2, &a, true, 200), 2)[0];
         assert!(busy.contains(r#""reason":"usb""#), "not even a takeover while the cable talks: {busy}");
         assert_eq!(event(&sent(&connect(&mut lan, &link, 3, &a, false, 100 + USB_QUIET_MS), 3)[0]), "link.welcome");
+    }
+
+    #[test]
+    fn a_relay_link_holds_off_other_computers_but_not_its_own() {
+        let a = Computer::new(2);
+        let b = Computer::new(3);
+        let (mut lan, link) = setup(&[&a, &b]);
+        lan.relay_linked(Some(a.public()), 0);
+        assert_eq!(event(&sent(&connect(&mut lan, &link, 1, &b, false, 10), 1)[0]), "link.busy");
+        assert_eq!(event(&sent(&connect(&mut lan, &link, 2, &a, false, 20), 2)[0]), "link.welcome", "the same computer moves to the network");
     }
 
     #[test]

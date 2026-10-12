@@ -25,8 +25,12 @@ pub struct DeviceState {
     pub port: Option<String>,
     /// Connected through the UART bridge (rather than Espressif's native USB port).
     pub bridge: bool,
-    /// Linked over the local network rather than the cable; `port` is then the box's address.
+    /// Linked over the local network or the Relay rather than the cable; `port` is then the box's address.
     pub network: bool,
+    /// Linked through the Relay; `port` is then the Relay's address.
+    pub relay: bool,
+    /// The box is linked to another computer, so this one can only take it over (ADR-0011).
+    pub busy: Option<Busy>,
     /// duty / pomodoro / leisure
     pub mode: Option<String>,
     pub firmware_build: Option<String>,
@@ -65,6 +69,14 @@ pub struct DeviceState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Busy {
+    /// The computer that has the box, by name; empty when the box didn't say.
+    pub owner: String,
+    /// `usb`: it is on that computer's cable, and can't be taken. `linked`: it can be taken over.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PairedComputer {
     pub key: String,
     pub name: String,
@@ -85,6 +97,8 @@ impl DeviceState {
                 // 2026-10-06 a leftover voice made another product look like the box, and it nearly got flashed.
                 self.usb_serial = usb_serial.clone();
                 self.network = false;
+                self.relay = false;
+                self.busy = None;
                 self.unsupported_board = None;
                 self.candidates.clear();
                 self.foreign_firmware = false;
@@ -103,6 +117,12 @@ impl DeviceState {
                 self.apply(&DeviceMessage::Connected { port: address.clone(), bridge: false, usb_serial: None });
                 self.network = true;
             }
+            DeviceMessage::ConnectedRelay { url } => {
+                self.apply(&DeviceMessage::Connected { port: url.clone(), bridge: false, usb_serial: None });
+                self.network = true;
+                self.relay = true;
+            }
+            DeviceMessage::Busy { owner, reason } => self.busy = Some(Busy { owner: owner.clone(), reason: reason.clone() }),
             DeviceMessage::ForeignFirmware => {
                 // Over the bridge the port survives a reset into other firmware, so what ours reported must go too.
                 self.foreign_firmware = true;
@@ -121,6 +141,8 @@ impl DeviceState {
             DeviceMessage::Disconnected => {
                 self.connected = false;
                 self.port = None;
+                self.network = false;
+                self.relay = false;
                 self.foreign_firmware = false;
             }
             DeviceMessage::Line(line) => {
@@ -293,6 +315,8 @@ mod tests {
                 port: Some("/dev/cu.x".to_owned()),
                 bridge: true,
                 network: false,
+                relay: false,
+                busy: None,
                 mode: Some("pomodoro".to_owned()),
                 firmware_build: Some("21a8360-dirty 2026-09-16 10:23".to_owned()),
                 firmware_version: Some("0.2.2".to_owned()),
@@ -333,6 +357,17 @@ mod tests {
         assert_eq!((state.wifi_network.as_deref(), state.wifi_address.as_deref()), (Some("Home 5G"), Some("192.168.1.23")));
         state.apply(&line("WIFI FORGOTTEN"));
         assert_eq!((state.wifi_network, state.wifi_address), (None, None));
+    }
+
+    #[test]
+    fn busy_lasts_until_a_link_comes_up() {
+        let mut state = DeviceState::default();
+        state.apply(&DeviceMessage::Busy { owner: "omarchy".to_owned(), reason: "linked".to_owned() });
+        assert_eq!(state.busy.as_ref().map(|busy| busy.owner.as_str()), Some("omarchy"));
+        state.apply(&DeviceMessage::ConnectedRelay { url: "wss://relay.korekore.ai".to_owned() });
+        assert!(state.busy.is_none() && state.relay && state.network);
+        state.apply(&DeviceMessage::Disconnected);
+        assert!(!state.relay && !state.network, "a dropped link isn't through anything");
     }
 
     #[test]

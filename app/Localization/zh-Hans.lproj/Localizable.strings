@@ -285,6 +285,15 @@
 "With Wi-Fi, a paired computer on the same network can drive the box without the cable." = "连上 Wi-Fi 后，同一网络里已配对的电脑不插线也能使用盒子。";
 "Setting Wi-Fi was rejected (%lld)" = "设置 Wi-Fi 被拒绝（%lld）";
 "Forgetting Wi-Fi was rejected (%lld)" = "忘记 Wi-Fi 被拒绝（%lld）";
+
+/* Busy and takeover (ADR-0011) */
+"another computer" = "另一台电脑";
+"The box is plugged into %@." = "盒子正插在 %@ 上。";
+"The box is with %@." = "盒子正连着 %@。";
+"Take over" = "接管";
+"Relay" = "中转";
+"Taking the box over was rejected (%lld)" = "接管盒子被拒绝（%lld）";
+"Reach the box through the VibeBuddy Relay when it's away from this computer" = "盒子不在本机旁边时，通过 VibeBuddy 中转连接它";
 "Newer firmware is available: %@" = "有新固件：%@";
 "You can also skip this and update later on the Device tab in Settings." = "也可以先跳过，之后在设置的「设备」页更新。";
 "Downloading firmware %@…" = "正在下载固件 %@…";

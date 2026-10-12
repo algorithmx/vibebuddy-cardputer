@@ -126,6 +126,7 @@ mod tests {
             min_supported_app: "0.3.2".to_owned(),
             app: BTreeMap::from([(PLATFORM.to_owned(), app)]),
             firmware: vec![],
+            relay: None,
         }
     }
 

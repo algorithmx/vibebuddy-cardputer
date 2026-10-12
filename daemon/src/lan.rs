@@ -37,9 +37,14 @@ pub struct Target {
 }
 
 impl LanConfig {
+    /// The key of the box this computer paired with, learned over USB.
+    pub fn box_key(&self) -> Option<[u8; 32]> {
+        read_key(&box_key_file(&self.state_dir))
+    }
+
     /// The remembered box, if this computer has been paired with one and knows where it is.
     pub fn target(&self) -> Option<Target> {
-        let box_key = read_key(&box_key_file(&self.state_dir))?;
+        let box_key = self.box_key()?;
         let address = match &self.fixed_address {
             Some(address) => address.clone(),
             None => {
@@ -81,8 +86,8 @@ pub fn signed_message(role: &str, box_key: &[u8; 32], nonce: &[u8; 32]) -> Vec<u
 pub enum LinkError {
     /// Couldn't reach it, or the connection broke.
     Unreachable(String),
-    /// The box is linked elsewhere: `usb` or `linked` (docs/protocol.md).
-    Busy(String),
+    /// The box is linked elsewhere: `usb` or `linked` (docs/protocol.md), and to whom when it says.
+    Busy { reason: String, owner: String },
     /// It refused us (`auth`, `bad_message`, `timeout`), or it isn't the box we paired with.
     Refused(String),
 }
@@ -138,7 +143,7 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
             let proven = signature.is_some_and(|signature| verify(&target.box_key, &signed_message("box", &target.box_key, &ours), &signature));
             if proven { Ok(()) } else { Err(LinkError::Refused("the box didn't prove its key".to_owned())) }
         }
-        Some("link.busy") => Err(LinkError::Busy(text(&answer, "reason").unwrap_or_default())),
+        Some("link.busy") => Err(LinkError::Busy { reason: text(&answer, "reason").unwrap_or_default(), owner: text(&answer, "owner").unwrap_or_default() }),
         _ => Err(LinkError::Refused(text(&answer, "code").unwrap_or_else(|| "unexpected reply".to_owned()))),
     }
 }
@@ -201,7 +206,7 @@ mod tests {
                 serde_json::json!({"version":1,"event":"link.welcome","sig":URL_SAFE_NO_PAD.encode(sig)})
             }
             "forged" => serde_json::json!({"version":1,"event":"link.welcome","sig":URL_SAFE_NO_PAD.encode([0u8; 64])}),
-            _ => serde_json::json!({"version":1,"event":"link.busy","reason":"usb"}),
+            _ => serde_json::json!({"version":1,"event":"link.busy","reason":"usb","owner":""}),
         };
         write.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
     }
@@ -231,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn busy_says_why() {
-        assert_eq!(run("busy", None).await, Err(LinkError::Busy("usb".to_owned())));
+        assert_eq!(run("busy", None).await, Err(LinkError::Busy { reason: "usb".to_owned(), owner: String::new() }));
     }
 
     #[test]

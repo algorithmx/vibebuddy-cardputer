@@ -71,6 +71,12 @@ struct DaemonClient {
         guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Removing the computer was rejected (\(code))")) }
     }
 
+    /// Takes the box from the computer that has it; the daemon's next try over the network or the Relay asks outright.
+    func takeOver() async throws {
+        let (code, data) = try await post("/v1/device/takeover", body: Data(), contentType: "application/json")
+        guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Taking the box over was rejected (\(code))")) }
+    }
+
     /// The password goes to the box over the cable and is kept nowhere else.
     func setWifi(ssid: String, password: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["ssid": ssid, "password": password])
