@@ -163,15 +163,15 @@
 /* Onboarding */
 "Welcome" = "欢迎";
 "Find the box" = "找设备";
-"Pick a voice" = "选音色";
+"Pick a character" = "选角色";
 "Done" = "完成";
 "Back" = "上一步";
 "Skip" = "跳过";
 "Not now" = "先不接";
 "Next" = "下一步";
 "Get started" = "开始使用";
-"VibeBuddy turns what Codex and Claude Code are doing into pictures and sounds on the box." = "VibeBuddy 把 Codex 和 Claude Code 的状态变成盒子上的画面和声音。";
-"Next: plug in the box, connect your agents, pick an announcement voice, and choose whether to launch at login. Everything can be changed or skipped." = "接下来几步：插上盒子，接入 Agent，挑一个播报音色，决定要不要开机就启动。都能改，都能跳过。";
+"VibeBuddy turns what your coding agents are doing into pictures and sounds on the box." = "VibeBuddy 把你的编程 Agent 的状态变成盒子上的画面和声音。";
+"Next: plug in the box, connect your agents, pick a character, and choose whether to launch at login. Everything can be changed or skipped." = "接下来几步：插上盒子，接入 Agent，挑一个角色，决定要不要开机就启动。都能改，都能跳过。";
 "Connect the box to this Mac with a USB cable." = "把盒子用 USB 线插到这台 Mac。";
 "Flashing VibeBuddy firmware…" = "正在刷入 VibeBuddy 固件…";
 "Hold K0 on the box and replug the cable to put it in download mode, then retry." = "按住盒子的 K0 再插一次线，让它进入下载模式，然后重试。";
@@ -190,7 +190,7 @@
 "Starting the daemon…" = "daemon 正在启动…";
 "Connect your agents so their progress shows up on the box." = "接入 Agent：让它们的进展传到盒子上。";
 "Only session IDs, event names and working directories are forwarded. After writing Codex's config, trust it once on its /hooks page." = "只转发会话标识、事件名和工作目录。Codex 写入后要在它的 /hooks 页面信任一次。";
-"Pick an announcement voice." = "挑一个播报音色。";
+"Pick a character." = "挑一个角色。";
 "The box's built-in voice speaks English (Jessica); pick a Chinese voice above to hear announcements in Chinese." = "盒子内置的是英文音色（Jessica）；想听中文播报，在上面挑一个中文音色。";
 "If you skip this, the box uses its built-in voice, Jessica (English)." = "不选就用盒子内置的英文音色 Jessica。";
 "Start VibeBuddy automatically when you log in?" = "登录时自动启动 VibeBuddy？";
@@ -298,3 +298,6 @@
 "Choose…" = "选择…";
 "Scan" = "扫描";
 "Scanning for networks was rejected (%lld)" = "扫描网络被拒绝（%lld）";
+"Newer firmware is available: %@" = "有新固件：%@";
+"You can also skip this and update later on the Device tab in Settings." = "也可以先跳过，之后在设置的「设备」页更新。";
+"Downloading firmware %@…" = "正在下载固件 %@…";
