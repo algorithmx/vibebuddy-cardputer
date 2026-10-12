@@ -107,6 +107,8 @@ enum Message {
     WifiSsid(String),
     WifiPassword(String),
     JoinWifi,
+    /// Show the fields again to join another network.
+    ChangeWifi,
     ForgetWifi,
     ScanWifi,
     Identify,
@@ -199,6 +201,8 @@ struct App {
     /// What is typed into the Wi-Fi fields; the password is cleared once sent.
     wifi_ssid: String,
     wifi_password: String,
+    /// The fields are open again for another network; once one is set they fold away.
+    wifi_editing: bool,
     /// Read from the autostart entry at start, then kept as the toggle writes it.
     launch_at_login: bool,
     /// The Character being previewed, and how to stop it.
@@ -253,6 +257,7 @@ impl App {
             file_firmware: None,
             wifi_ssid: String::new(),
             wifi_password: String::new(),
+            wifi_editing: false,
             launch_at_login: launch_at_login(),
             previewing: None,
             agents: Vec::new(),
@@ -504,7 +509,9 @@ impl App {
             Message::TakeOver => return Task::perform(client::take_over(), Message::Done),
             Message::WifiSsid(ssid) => self.wifi_ssid = ssid,
             Message::WifiPassword(password) => self.wifi_password = password,
+            Message::ChangeWifi => self.wifi_editing = true,
             Message::JoinWifi => {
+                self.wifi_editing = false;
                 let password = std::mem::take(&mut self.wifi_password);
                 return Task::perform(client::set_wifi(self.wifi_ssid.clone(), password), Message::Done);
             }
@@ -1478,14 +1485,32 @@ impl App {
         // the password goes to the box and is kept nowhere else, so it is never shown again.
         device.filter(|device| online && device.box_key.is_some()).map(|device| {
             let network = device.wifi_network.clone().unwrap_or_else(|| tr("Not set", &[]));
+            // After Join the fields fold away and this says how it's going: joining, joined, or why not.
+            let state = device.wifi_network.as_ref().map(|_| {
+                let state = match (&device.wifi_error, &device.wifi_address) {
+                    (Some(why), _) => text(tr("Couldn't join (%@). Check the network name and password, then join again.", &[why])).style(text::danger),
+                    (None, Some(address)) => text(tr("Joined · %@", &[address])).style(text::success),
+                    (None, None) => text(tr("Joining…", &[])),
+                };
+                row![text(tr("Status", &[])).width(140), state].spacing(12)
+            });
             let mut wifi = column![
                 text(tr("Wi-Fi", &[])),
                 row![text(tr("Network", &[])).width(140), text(network)].spacing(12),
             ]
-            .push(device.wifi_address.as_ref().map(|address| row![text(tr("Address", &[])).width(140), text(address.clone())].spacing(12)))
+            .push(state)
             .spacing(6);
+            let fields = device.wifi_network.is_none() || device.wifi_error.is_some() || self.wifi_editing;
             if device.network {
                 wifi = wifi.push(text(tr("Plug in the cable to change the box's network.", &[])).size(13));
+            } else if !fields {
+                wifi = wifi.push(
+                    row![
+                        button(text(tr("Change network", &[]))).style(button::secondary).on_press(Message::ChangeWifi),
+                        button(text(tr("Forget network", &[]))).style(button::secondary).on_press_maybe((!busy).then_some(Message::ForgetWifi)),
+                    ]
+                    .spacing(8),
+                );
             } else {
                 let valid = !self.wifi_ssid.is_empty() && self.wifi_ssid.len() <= 32 && self.wifi_password.len() <= 63;
                 // Names are case-sensitive, so the box's own scan is the way to pick one; typing stays for hidden networks.

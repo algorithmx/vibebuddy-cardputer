@@ -105,9 +105,11 @@ public struct DeviceState: Codable, Equatable {
     /// The Wi-Fi network the box is set to join, and the address it got there. Absent from older daemons.
     public var wifiNetwork: String?
     public var wifiAddress: String?
+    /// Why the box couldn't join the network, until it does. Absent from older daemons.
+    public var wifiError: String?
     /// What the box heard on its last scan, strongest first. Absent from older daemons.
     public var wifiSeen: [SeenNetwork]?
-    enum CodingKeys: String, CodingKey { case wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
+    enum CodingKeys: String, CodingKey { case wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiError = "wifi_error", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
     public init(connected: Bool, port: String? = nil, bridge: Bool = false, mode: String? = nil, firmwareBuild: String? = nil, firmwareVersion: String? = nil, voice: String? = nil, volume: Int? = nil, foreignFirmware: Bool? = nil) {
         self.connected = connected; self.port = port; self.bridge = bridge; self.mode = mode; self.firmwareBuild = firmwareBuild; self.firmwareVersion = firmwareVersion; self.voice = voice; self.volume = volume
         self.foreignFirmware = foreignFirmware

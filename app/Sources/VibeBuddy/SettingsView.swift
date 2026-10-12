@@ -421,15 +421,31 @@ struct WifiSection: View {
     let device: DeviceState
     @State private var ssid = ""
     @State private var password = ""
+    /// The fields are open again for another network; once one is set they fold away.
+    @State private var editing = false
 
     var body: some View {
         Section {
             LabeledContent("Network", value: device.wifiNetwork ?? String(localized: "Not set"))
-            if let address = device.wifiAddress {
-                LabeledContent("Address", value: address)
+            // After Join the fields fold away and this says how it's going: joining, joined, or why not.
+            if device.wifiNetwork != nil {
+                LabeledContent("Status") {
+                    if let why = device.wifiError {
+                        Text("Couldn't join (\(why)). Check the network name and password, then join again.").foregroundStyle(.red)
+                    } else if let address = device.wifiAddress {
+                        Text("Joined · \(address)").foregroundStyle(.green)
+                    } else {
+                        Text("Joining…")
+                    }
+                }
             }
             if device.network == true {
                 Text("Plug in the cable to change the box's network.").font(.caption).foregroundStyle(.secondary)
+            } else if device.wifiNetwork != nil && device.wifiError == nil && !editing {
+                HStack {
+                    Button("Change network") { editing = true }
+                    Button("Forget network") { model.forgetWifi() }.disabled(model.operationRunning)
+                }
             } else {
                 // Names are case-sensitive, so the box's own scan is the way to pick one; typing stays for hidden networks.
                 HStack {
@@ -451,6 +467,7 @@ struct WifiSection: View {
                     Button("Join") {
                         model.setWifi(ssid: ssid, password: password)
                         password = ""
+                        editing = false
                     }
                     .disabled(ssid.isEmpty || ssid.utf8.count > 32 || password.utf8.count > 63 || model.operationRunning)
                     if device.wifiNetwork != nil {

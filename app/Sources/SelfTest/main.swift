@@ -76,9 +76,9 @@ do {
     check(paired.boxKey == "BOX" && paired.computerKey == "MINE", "pairing keys decode")
     check(paired.pairedComputers?.map(\.name) == ["dragon's MacBook", "omarchy"], "paired computers decode")
     let wifi = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
-    {"connected":true,"bridge":false,"network":true,"port":"192.168.1.23:7340","wifi_network":"Home","wifi_address":"192.168.1.23"}
+    {"connected":true,"bridge":false,"network":true,"port":"192.168.1.23:7340","wifi_network":"Home","wifi_address":"192.168.1.23","wifi_error":"password"}
     """.utf8))
-    check(wifi.network == true && wifi.wifiNetwork == "Home" && wifi.wifiAddress == "192.168.1.23", "Wi-Fi fields decode")
+    check(wifi.network == true && wifi.wifiNetwork == "Home" && wifi.wifiAddress == "192.168.1.23" && wifi.wifiError == "password", "Wi-Fi fields decode")
     let busy = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
     {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
     """.utf8))

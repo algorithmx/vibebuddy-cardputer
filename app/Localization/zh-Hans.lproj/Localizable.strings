@@ -279,7 +279,6 @@
 /* Wi-Fi (ADR-0012) */
 "Network" = "网络";
 "Not set" = "未设置";
-"Address" = "地址";
 "Plug in the cable to change the box's network." = "要更换盒子的网络，请插上数据线。";
 "Network name" = "网络名称";
 "Password" = "密码";
@@ -308,3 +307,8 @@
 "Connect the box to this computer with a USB cable." = "用 USB 线把盒子接到这台电脑上。";
 "Then this computer reaches the box without the cable: over the local network, or through the VibeBuddy Relay when you're elsewhere." = "这样不插线也能连到盒子：在同一个网络里走局域网，人在别处时通过 VibeBuddy 中转。";
 "VibeBuddy lives in the tray, or in Omarchy's bar: the buddy's face, with its eyes open while the box is online. To change anything, open Settings from there, or run VibeBuddy again." = "VibeBuddy 待在托盘里，或者 Omarchy 的状态栏上：图标是小伙伴的脸，盒子在线时睁着眼。想改什么设置，从那里打开设置，或者再运行一次 VibeBuddy。";
+"Couldn't join (%@). Check the network name and password, then join again." = "没能加入（%@）。检查一下网络名和密码，再加入一次。";
+"Joined · %@" = "已加入 · %@";
+"Joining…" = "正在加入…";
+"Status" = "状态";
+"Change network" = "更换网络";

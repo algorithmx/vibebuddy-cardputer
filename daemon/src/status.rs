@@ -54,6 +54,8 @@ pub struct DeviceState {
     pub wifi_network: Option<String>,
     /// The address the box got on that network.
     pub wifi_address: Option<String>,
+    /// Why the box couldn't join it, from its last `WIFI FAILED <why>`; None once it joins or the network changes.
+    pub wifi_error: Option<String>,
     /// The Relay this computer uses, `wss://host`; None without a key. Set by the daemon, not the box.
     pub relay_server: Option<String>,
     /// The Relay the box uses, as it last said (`RELAY URL`); it follows the computer on the cable.
@@ -125,6 +127,7 @@ impl DeviceState {
                 self.paired_computers.clear();
                 self.wifi_network = None;
                 self.wifi_address = None;
+                self.wifi_error = None;
                 self.wifi_seen.clear();
                 self.box_relay = None;
             }
@@ -152,6 +155,7 @@ impl DeviceState {
                 self.paired_computers.clear();
                 self.wifi_network = None;
                 self.wifi_address = None;
+                self.wifi_error = None;
                 self.wifi_seen.clear();
                 self.box_relay = None;
             }
@@ -191,9 +195,23 @@ impl DeviceState {
                 } else if let Some(url) = line.strip_prefix("RELAY URL ") {
                     self.box_relay = Some(url.trim().to_owned());
                 } else if let Some(network) = line.strip_prefix("WIFI NETWORK ") {
-                    self.wifi_network = Some(network.trim().to_owned());
+                    // Another network: the address and any failure were the old one's. The same name comes again
+                    // with every hello and changes nothing.
+                    let network = network.trim();
+                    if self.wifi_network.as_deref() != Some(network) {
+                        self.wifi_address = None;
+                        self.wifi_error = None;
+                    }
+                    self.wifi_network = Some(network.to_owned());
                 } else if line.trim() == "WIFI FORGOTTEN" {
                     self.wifi_network = None;
+                    self.wifi_address = None;
+                    self.wifi_error = None;
+                } else if let Some(why) = line.strip_prefix("WIFI FAILED ") {
+                    self.wifi_error = Some(why.trim().to_owned());
+                } else if line.trim() == "WIFI CONNECTED" {
+                    self.wifi_error = None;
+                } else if line.trim() == "WIFI DISCONNECTED" {
                     self.wifi_address = None;
                 } else if let Some(seen) = line.strip_prefix("WIFI SEEN ") {
                     // `WIFI SEEN <count>` starts a scan; `WIFI SEEN <rssi> <channel> <ssid>` is one network.
@@ -212,6 +230,7 @@ impl DeviceState {
                     }
                 } else if let Some(address) = line.strip_prefix("WIFI ADDRESS ") {
                     self.wifi_address = Some(address.trim().to_owned());
+                    self.wifi_error = None;
                 } else if line.starts_with("PAIRS ") {
                     self.paired_computers.clear();
                 } else if let Some((key, name)) = line.strip_prefix("PAIR ").and_then(|rest| rest.split_once(' '))
@@ -373,6 +392,7 @@ mod tests {
                 paired_computers: Vec::new(),
                 wifi_network: None,
                 wifi_address: None,
+                wifi_error: None,
                 relay_server: None,
                 box_relay: None,
                 wifi_seen: Vec::new(),
@@ -418,6 +438,25 @@ mod tests {
         assert_eq!(state.wifi_network.as_deref(), Some("Home"), "the same key again changes nothing");
         state.apply(&line("BOX KEY pm3f5yT3yi4s2P90TalP1NcUZD3xBTfETdlii-KnvWM"));
         assert_eq!((state.wifi_network, state.wifi_address), (None, None));
+    }
+
+    #[test]
+    fn joining_a_network_shows_how_it_went() {
+        let mut state = DeviceState::default();
+        state.apply(&line("WIFI NETWORK Home"));
+        state.apply(&line("WIFI ADDRESS 192.168.1.23"));
+        state.apply(&line("WIFI NETWORK Office"));
+        assert_eq!(state.wifi_address, None, "the old network's address");
+        state.apply(&line("WIFI CONNECTING Office"));
+        state.apply(&line("WIFI FAILED password"));
+        assert_eq!(state.wifi_error.as_deref(), Some("password"));
+        state.apply(&line("WIFI NETWORK Office"));
+        assert_eq!(state.wifi_error.as_deref(), Some("password"), "a hello repeats the name, nothing changed");
+        state.apply(&line("WIFI CONNECTED"));
+        assert_eq!(state.wifi_error, None);
+        state.apply(&line("WIFI ADDRESS 10.0.0.7"));
+        state.apply(&line("WIFI DISCONNECTED"));
+        assert_eq!(state.wifi_address, None);
     }
 
     #[test]
