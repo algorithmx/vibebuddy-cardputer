@@ -199,6 +199,20 @@ impl Board for DeviceBoard {
         self.lan_peer = conn;
     }
 
+    // With the radio on, the RNG draws on real noise.
+    fn random(&mut self) -> Option<[u8; 32]> {
+        let mut bytes = [0u8; 32];
+        esp_hal::rng::Rng::new().read(&mut bytes);
+        Some(bytes)
+    }
+
+    fn restart(&mut self) {
+        // Let the NEW IDENTITY line reach the computer first.
+        let start = esp_hal::time::Instant::now();
+        while start.elapsed() < esp_hal::time::Duration::from_millis(200) {}
+        esp_hal::system::software_reset()
+    }
+
     fn flash(&mut self) -> &mut dyn Flash {
         &mut self.flash
     }

@@ -15,7 +15,7 @@ use crate::audio::{Occasion, Sound, clamp_volume, VOLUME_DEFAULT};
 use crate::buttons::{ButtonEvent, Buttons, Levels};
 use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, Scene, Screen, State, TaskInput, Tone};
 use crate::leisure::{Leisure, Tier};
-use crate::menu::{self, Action as MenuAction, Context as MenuContext, Menu, Row, View};
+use crate::menu::{self, Action as MenuAction, ComputersRow, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
 use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
@@ -87,6 +87,12 @@ pub trait Board: Screen {
     fn lan_close(&mut self, _conn: Conn) {}
     /// From now on [`Board::write`] also goes to this connection, the computer linked over the network.
     fn lan_peer(&mut self, _conn: Option<Conn>) {}
+    /// 32 bytes of hardware randomness for a new key; None where there is none, and then the box keeps its key.
+    fn random(&mut self) -> Option<[u8; 32]> {
+        None
+    }
+    /// Starts the box again from the top, as after power-on.
+    fn restart(&mut self) {}
 }
 
 /// What the box is linked to without the Relay.
@@ -759,6 +765,7 @@ impl Firmware {
         MenuContext {
             phase_active: !self.pomodoro.view(now).is_idle(),
             paired: self.link.as_ref().map_or(0, |(_, link)| link.paired.len()),
+            identity: self.link.is_some(),
         }
     }
 
@@ -779,6 +786,11 @@ impl Firmware {
             }
             MenuAction::ToggleMute => self.toggle_mute(board),
             MenuAction::ForgetComputers => self.forget_computers(board),
+            MenuAction::NewIdentity => {
+                Self::write_literal(board, "MENU CLOSED\n");
+                self.show_menu(board);
+                return self.new_identity(board);
+            }
         }
         self.show_menu(board);
     }
@@ -816,7 +828,7 @@ impl Firmware {
                         Row::StopPhase => line(b"STOP FOCUS", b"", Tone::Plain),
                         Row::Volume => line(b"VOLUME", volume.as_bytes(), Tone::Accent),
                         Row::Mute => line(b"MUTE", if self.muted { b"ON" } else { b"OFF" }, Tone::Accent),
-                        Row::Computers => line(b"COMPUTERS", paired.as_bytes(), Tone::Accent),
+                        Row::Computers => line(b"COMPUTERS", paired.as_bytes(), Tone::Dim),
                         Row::Network => line(b"NETWORK", b"OPEN", Tone::Dim),
                         Row::Status => line(b"STATUS", b"OPEN", Tone::Dim),
                     })
@@ -825,7 +837,7 @@ impl Firmware {
                     Row::StopPhase => b"STOP",
                     Row::Volume => b"CHANGE",
                     Row::Mute => b"TOGGLE",
-                    Row::Computers => b"FORGET",
+                    Row::Computers => b"OPEN",
                     Row::Network | Row::Status => b"OPEN",
                 };
                 Panel {
@@ -836,6 +848,50 @@ impl Firmware {
                     hints: alloc::vec![(b"K1", b"NEXT"), (b"K0", verb), (b"K2", b"CLOSE")],
                 }
             }
+            View::Computers => {
+                let context = self.menu_context(now);
+                let rows = Menu::computers_rows(context);
+                let selected = self.menu.computers_selected(context);
+                let paired = text!(4, "{}", context.paired % 100);
+                let lines = rows
+                    .iter()
+                    .map(|row| match row {
+                        ComputersRow::ForgetAll => line(b"FORGET ALL", paired.as_bytes(), Tone::Accent),
+                        ComputersRow::NewIdentity => line(b"NEW ID", b"", Tone::Plain),
+                        ComputersRow::Back => line(b"BACK", b"", Tone::Dim),
+                    })
+                    .collect();
+                let verb: &'static [u8] = match rows[selected] {
+                    ComputersRow::Back => b"BACK",
+                    _ => b"OPEN",
+                };
+                Panel {
+                    kind: PanelKind::List,
+                    title: b"COMPUTERS".to_vec(),
+                    lines,
+                    selected: Some(selected),
+                    hints: alloc::vec![(b"K1", b"NEXT"), (b"K0", verb), (b"K2", b"CLOSE")],
+                }
+            }
+            // What a new identity costs, then a second ask (#122). The look, voice and settings stay.
+            View::NewIdentity => Panel {
+                kind: PanelKind::Facts,
+                title: b"NEW IDENTITY?".to_vec(),
+                lines: alloc::vec![
+                    line(b"COMPUTERS", b"PAIR AGAIN", Tone::Plain),
+                    line(b"WIFI", b"SET AGAIN", Tone::Plain),
+                    line(b"KEPT", b"LOOK VOICE", Tone::Dim),
+                ],
+                selected: None,
+                hints: alloc::vec![(b"K0", b"NEXT"), (b"K1", b"BACK"), (b"K2", b"CLOSE")],
+            },
+            View::Sure => Panel {
+                kind: PanelKind::Facts,
+                title: b"SURE?".to_vec(),
+                lines: alloc::vec![line(b"THE BOX GETS", b"A NEW KEY", Tone::Warn), line(b"THEN", b"RESTARTS", Tone::Plain)],
+                selected: None,
+                hints: alloc::vec![(b"K0", b"RESET"), (b"K1", b"BACK"), (b"K2", b"CLOSE")],
+            },
             // The names are the computers' own and may not fit the 5x7 ASCII font, so only the count shows.
             View::Forget => {
                 let paired = text!(4, "{}", self.menu_context(now).paired % 100);
@@ -1353,6 +1409,24 @@ impl Firmware {
             let outputs = self.lan.unpaired(&key, board.now_ms());
             self.apply_lan(board, outputs);
         }
+    }
+
+    /// From the box's menu (#122): a new key from hardware randomness, and nothing that trusted the old one.
+    /// Paired computers, the Wi-Fi network and the Relay go; the look, voice, volume and tally stay, being
+    /// kept elsewhere. Then the box restarts, so the network and the Relay start again under the new key.
+    fn new_identity<B: Board>(&mut self, board: &mut B) {
+        let Some(seed) = board.random() else {
+            return Self::write_literal(board, "IDENTITY UNAVAILABLE\n");
+        };
+        let Some((store, link)) = self.link.as_mut() else {
+            return Self::write_literal(board, "IDENTITY UNAVAILABLE\n");
+        };
+        *link = Link::new(seed);
+        if store.save(board.flash(), link).is_err() {
+            return Self::write_literal(board, "LINK SAVE ERROR\n");
+        }
+        Self::write_value_line(board, "NEW IDENTITY ", link::encode_key(&link.public_key()).as_bytes());
+        board.restart();
     }
 
     /// Reports the device's whole static state: firmware build and version, its key, mode, voice and volume.

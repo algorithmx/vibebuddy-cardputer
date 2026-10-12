@@ -85,6 +85,9 @@ struct AppState {
     identity: Option<Arc<identity::Identity>>,
     /// Where the Relay is; the update manifest may move it.
     relay: Option<relay::RelayConfig>,
+    /// Where the box's key and address are remembered; None in tests unless one sets it, so they never write
+    /// over the user's own.
+    state_dir: Option<PathBuf>,
     /// The update manifest and the firmware it offers; with no source, nothing is ever checked.
     updates: Arc<Mutex<Updates>>,
     /// "Check for updates" pressed: checks now instead of waiting for the daily one.
@@ -119,6 +122,7 @@ impl AppState {
             serial: None,
             identity: None,
             relay: None,
+            state_dir: None,
             updates: Arc::new(Mutex::new(Updates::new(None, None))),
             check_updates: Arc::new(Notify::new()),
         }
@@ -235,6 +239,7 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
+    state.state_dir = config::state_dir();
     state.device.lock().await.pin = pin;
     state.updates = Arc::new(Mutex::new(Updates::new(
         updates::Source::configured(),
@@ -317,17 +322,19 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
             event.extra.insert("url".to_owned(), url.into());
             send_event(state, event);
         }
-        // Remembered so the box can be found and checked over the network later (ADR-0012).
-        if let Some(dir) = config::state_dir() {
-            lan::remember(&lan::box_key_file(&dir), key.trim());
+        // Remembered so the box can be found and checked over the network later (ADR-0012). Only from the cable:
+        // a key reported over the network or the Relay could be anyone's, and a new key after the box made itself
+        // a new identity is believed only from the box itself (#122).
+        if let Some(dir) = &state.state_dir {
+            lan::remember(&lan::box_key_file(dir), key.trim());
         }
     }
     if let DeviceMessage::Line(line) = &message
         && on_cable
         && let Some(address) = line.strip_prefix(WIFI_ADDRESS_PREFIX)
-        && let Some(dir) = config::state_dir()
+        && let Some(dir) = &state.state_dir
     {
-        lan::remember(&lan::box_address_file(&dir), address.trim());
+        lan::remember(&lan::box_address_file(dir), address.trim());
     }
     let _ = state.device_bus.send(message.clone());
     // Ask right after connecting; the device reports its mode, firmware build and voice again.
@@ -1321,6 +1328,38 @@ mod tests {
         publish_device_message(&state, DeviceMessage::Line("BOX KEY 1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE".to_owned())).await;
         let set = transport.events().into_iter().find(|event| event.event == "device.relay.set").expect("the Relay for the box");
         assert_eq!(set.extra["url"], relay::STAGING_URL);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn only_the_cable_changes_the_remembered_box_key() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = test_state(transport.clone());
+        let dir = std::env::temp_dir().join(format!("vibebuddy-box-key-test-{}", std::process::id()));
+        state.identity = Some(Arc::new(identity::Identity::load_or_create(&dir.join("identity"), "a".to_owned()).unwrap()));
+        state.state_dir = Some(dir.clone());
+        let remembered = || std::fs::read_to_string(lan::box_key_file(&dir)).ok().map(|key| key.trim().to_owned());
+        let old = "1Uc4Vh8Aby1bV4I08TphnmbwAm0AzHkw5RelizUGdRE";
+        let new = "pm3f5yT3yi4s2P90TalP1NcUZD3xBTfETdlii-KnvWM";
+
+        publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
+        publish_device_message(&state, DeviceMessage::Line(format!("BOX KEY {old}"))).await;
+        assert_eq!(remembered().as_deref(), Some(old));
+
+        // A box on the network or the Relay saying it has a new identity is not believed.
+        for linked in [
+            DeviceMessage::ConnectedNetwork { address: "192.168.1.23:7340".to_owned() },
+            DeviceMessage::ConnectedRelay { url: "wss://relay.example".to_owned() },
+        ] {
+            publish_device_message(&state, linked).await;
+            publish_device_message(&state, DeviceMessage::Line(format!("BOX KEY {new}"))).await;
+            assert_eq!(remembered().as_deref(), Some(old));
+        }
+
+        // The box itself, on the cable, after a reset.
+        publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
+        publish_device_message(&state, DeviceMessage::Line(format!("BOX KEY {new}"))).await;
+        assert_eq!(remembered().as_deref(), Some(new));
         std::fs::remove_dir_all(dir).ok();
     }
 
