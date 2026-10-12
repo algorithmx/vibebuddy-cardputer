@@ -169,9 +169,9 @@ pub struct Display {
     identify_until: Option<u32>,
     identify_next_toggle: u32,
     muted: bool,
-    /// How the box is linked, in the top left at all times: `USB`, `LAN` or `RELAY`, then `STG` when its Relay is
-    /// staging (docs/device-menu.md). Empty with no link and on production: NO LINK already says the first.
-    link_tag: Text<16>,
+    /// How the box is linked, as an icon in the top left at all times, and `STG` after it while its Relay is
+    /// staging (docs/device-menu.md). No icon with no link: NO LINK already says so.
+    link: (Option<LinkPath>, bool),
     /// The alarm is ringing: the phase ended and the user hasn't acted yet. Records the phase at the end;
     /// stops as soon as the view changes (start, abandon, skip) or the screen is switched away.
     ring_alarm: bool,
@@ -788,7 +788,7 @@ impl Display {
             identify_until: None,
             identify_next_toggle: 0,
             muted: false,
-            link_tag: Text::new(),
+            link: (None, false),
             ring_alarm: false,
             ring_alarm_phase: Phase::Focus,
             ring_alarm_shake_frames: 0,
@@ -1150,9 +1150,13 @@ impl Display {
         canvas.fill_rect(0, 0, WIDTH, 4, status_color);
         canvas.draw_text_centered(12, b"VibeBuddy", 2, COLOR_TEXT);
         let mut x = 8;
-        if !self.link_tag.is_empty() {
-            canvas.draw_text(x, 15, self.link_tag.as_bytes(), 1, COLOR_MUTED, 16);
-            x += text_width(self.link_tag.as_bytes(), 1) + 6;
+        if let Some(path) = self.link.0 {
+            draw_icon(&mut canvas, x, 12, path.icon(), COLOR_MUTED);
+            x += ICON_WIDTH * ICON_SCALE + 6;
+        }
+        if self.link.1 {
+            canvas.draw_text(x, 15, b"STG", 1, COLOR_WORKING, 3);
+            x += text_width(b"STG", 1) + 6;
         }
         if self.muted {
             canvas.draw_text(x, 15, b"MUTE", 1, COLOR_INPUT, 4);
@@ -1364,13 +1368,12 @@ impl Display {
         }
     }
 
-    /// The link tag in the top left; redraws only on a change.
-    pub fn set_link_tag(&mut self, screen: &mut dyn Screen, scene: &Scene, tag: &[u8]) {
-        if self.link_tag.as_bytes() == tag {
+    /// The link icon and staging mark in the top left; redraws only on a change.
+    pub fn set_link(&mut self, screen: &mut dyn Screen, scene: &Scene, path: Option<LinkPath>, staging: bool) {
+        if self.link == (path, staging) {
             return;
         }
-        self.link_tag = Text::new();
-        self.link_tag.push_bytes(tag);
+        self.link = (path, staging);
         if self.ready {
             let _ = self.render(screen, scene);
         }
@@ -1492,6 +1495,75 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
         x += text_width(key, 1) + 10;
         canvas.draw_text(x, 206, action, 1, COLOR_TEXT, 12);
         x += text_width(action, 1) + 14;
+    }
+}
+
+/// How the box is linked to its computer (USB wins, then the local network, then the Relay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkPath {
+    Usb,
+    Lan,
+    Relay,
+}
+
+impl LinkPath {
+    pub fn label(self) -> &'static [u8] {
+        match self {
+            Self::Usb => b"USB",
+            Self::Lan => b"LAN",
+            Self::Relay => b"RELAY",
+        }
+    }
+
+    /// A plug for the cable, Wi-Fi waves for the local network, a cloud for the Relay.
+    fn icon(self) -> &'static [u16; ICON_HEIGHT] {
+        match self {
+            Self::Usb => &ICON_USB,
+            Self::Lan => &ICON_LAN,
+            Self::Relay => &ICON_RELAY,
+        }
+    }
+}
+
+const ICON_WIDTH: i32 = 12;
+const ICON_HEIGHT: usize = 7;
+const ICON_SCALE: i32 = 2;
+/// One row per entry, the leftmost pixel in bit 11.
+const ICON_USB: [u16; ICON_HEIGHT] = [
+    0b000000111111,
+    0b000000100001,
+    0b111111101101,
+    0b111111100001,
+    0b111111101101,
+    0b000000100001,
+    0b000000111111,
+];
+const ICON_LAN: [u16; ICON_HEIGHT] = [
+    0b001111111100,
+    0b010000000010,
+    0b100011110001,
+    0b000100001000,
+    0b001000000100,
+    0b000001100000,
+    0b000001100000,
+];
+const ICON_RELAY: [u16; ICON_HEIGHT] = [
+    0b000001110000,
+    0b001110001000,
+    0b010000000110,
+    0b100000000001,
+    0b100000000001,
+    0b100000000001,
+    0b011111111110,
+];
+
+fn draw_icon(canvas: &mut Canvas, x: i32, y: i32, rows: &[u16; ICON_HEIGHT], color: u16) {
+    for (row, bits) in rows.iter().enumerate() {
+        for column in 0..ICON_WIDTH {
+            if bits >> (ICON_WIDTH - 1 - column) & 1 == 1 {
+                canvas.fill_rect(x + column * ICON_SCALE, y + row as i32 * ICON_SCALE, ICON_SCALE, ICON_SCALE, color);
+            }
+        }
     }
 }
 

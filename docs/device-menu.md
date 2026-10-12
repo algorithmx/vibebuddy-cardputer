@@ -66,11 +66,13 @@ How the box reaches its computer, as rows a glance can read; anything dimmed isn
 | WIFI | the network's name, dimmed until the box has joined it; `OFF` with none set |
 | RELAY | `PROD` or `STAGING` for the Relay the box uses (docs/relay-protocol.md, "Which Relay"), the host for any other; `DOWN` after it, dimmed, while not connected; `OFF` without Wi-Fi |
 
-### The link tag
+### The link icon
 
-![USB in the top left](images/screen-link.png)
+![The plug in the top left](images/screen-link.png)
 
-Every screen shows the LINK value small in its top left (`USB`, `LAN`, `RELAY`), followed by `STG` while the box uses the staging Relay, so a development build is never mistaken for a release. Nothing shows with no link on production: the screen already says NO LINK. MUTE, when on, follows the tag.
+Every screen shows how the box is linked as a small icon in its top left: a plug for USB, Wi-Fi waves for the local network, a cloud for the Relay. While the box uses the staging Relay, `STG` follows in orange, so a development build is never mistaken for a release. No icon shows without a link: the screen already says NO LINK. MUTE, when on, comes after them.
+
+![USB, local network and Relay icons](images/link-icons.png)
 
 ## Behavior around the menu
 

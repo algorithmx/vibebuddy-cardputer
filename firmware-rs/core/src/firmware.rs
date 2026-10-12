@@ -13,14 +13,13 @@ use vibebuddy_protocol::{Event, ProtocolError, VERSION};
 
 use crate::audio::{Occasion, Sound, clamp_volume, VOLUME_DEFAULT};
 use crate::buttons::{ButtonEvent, Buttons, Levels};
-use crate::display::{Display, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, Scene, Screen, State, TaskInput, Tone};
+use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, Scene, Screen, State, TaskInput, Tone};
 use crate::leisure::{Leisure, Tier};
 use crate::menu::{self, Action as MenuAction, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
 use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
-use crate::text::Text;
 use crate::voice_pack::crc32;
 use crate::lines::LinePicker;
 use crate::lan::{Conn, Lan, Output as LanOutput};
@@ -463,17 +462,22 @@ impl Firmware {
         self.relay_up = up;
     }
 
-    /// How the box is linked to its computer, for the screen: `USB`, `LAN`, `RELAY`, or None.
-    fn link_path(&self, now: u32) -> Option<&'static [u8]> {
+    /// How the box is linked to its computer, for the screen; None without a link.
+    pub fn link_path(&self, now: u32) -> Option<LinkPath> {
         if self.link_lost {
             return None;
         }
         match self.local_link(now) {
-            LocalLink::Usb(_) => Some(b"USB"),
-            LocalLink::Lan(_) => Some(b"LAN"),
-            LocalLink::None if self.lan.relay_link_active() => Some(b"RELAY"),
+            LocalLink::Usb(_) => Some(LinkPath::Usb),
+            LocalLink::Lan(_) => Some(LinkPath::Lan),
+            LocalLink::None if self.lan.relay_link_active() => Some(LinkPath::Relay),
             LocalLink::None => None,
         }
+    }
+
+    /// The box uses the staging Relay, which every screen marks (docs/device-menu.md).
+    pub fn on_staging(&self) -> bool {
+        self.relay_name() == b"STAGING"
     }
 
     /// The Relay by name: `PROD` and `STAGING` for ours, the host for any other.
@@ -484,21 +488,6 @@ impl Firmware {
             Some(host) => host.as_bytes(),
             None => b"?",
         }
-    }
-
-    /// The top-left tag on every screen (docs/device-menu.md): the link, then `STG` on the staging Relay.
-    pub fn link_tag(&self, now: u32) -> Text<16> {
-        let mut tag = Text::new();
-        if let Some(path) = self.link_path(now) {
-            tag.push_bytes(path);
-        }
-        if self.relay_name() == b"STAGING" {
-            if !tag.is_empty() {
-                tag.push_bytes(b" ");
-            }
-            tag.push_bytes(b"STG");
-        }
-        tag
     }
 
     /// True once after `device.wifi.scan`: the device layer scans and reports `WIFI SEEN` lines.
@@ -560,8 +549,8 @@ impl Firmware {
         self.tend_leisure(board);
         let now = board.now_ms();
         // The cable goes quiet and links come and go without a line to the screen; this only redraws on a change.
-        let tag = self.link_tag(now);
-        self.display.set_link_tag(board, &scene!(self, now), tag.as_bytes());
+        let (path, staging) = (self.link_path(now), self.on_staging());
+        self.display.set_link(board, &scene!(self, now), path, staging);
         self.display.tick(board, &scene!(self, now));
     }
 
@@ -914,7 +903,7 @@ impl Firmware {
     /// `LINK`: the way to the computer, or NO LINK.
     fn link_line(&self, now: u32) -> (Vec<u8>, Vec<u8>, Tone) {
         match self.link_path(now) {
-            Some(path) => (b"LINK".to_vec(), path.to_vec(), Tone::Plain),
+            Some(path) => (b"LINK".to_vec(), path.label().to_vec(), Tone::Plain),
             None => (b"LINK".to_vec(), b"NO LINK".to_vec(), Tone::Dim),
         }
     }
