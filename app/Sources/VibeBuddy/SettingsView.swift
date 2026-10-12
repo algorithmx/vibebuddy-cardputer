@@ -431,6 +431,20 @@ struct WifiSection: View {
             if device.network == true {
                 Text("Plug in the cable to change the box's network.").font(.caption).foregroundStyle(.secondary)
             } else {
+                // Names are case-sensitive, so the box's own scan is the way to pick one; typing stays for hidden networks.
+                HStack {
+                    Picker(String(localized: "Nearby networks"), selection: $ssid) {
+                        Text("Choose…").tag("")
+                        ForEach(device.wifiSeen ?? []) { network in
+                            Text(verbatim: "\(network.ssid)  \(network.rssi) dBm").tag(network.ssid)
+                        }
+                        if !ssid.isEmpty, !(device.wifiSeen ?? []).contains(where: { $0.ssid == ssid }) {
+                            Text(verbatim: ssid).tag(ssid)
+                        }
+                    }
+                    Button("Scan") { model.scanWifi() }.disabled(model.operationRunning)
+                }
+                .onAppear { if device.wifiSeen?.isEmpty ?? true { model.scanWifi() } }
                 TextField(String(localized: "Network name"), text: $ssid)
                 SecureField(String(localized: "Password"), text: $password)
                 HStack {

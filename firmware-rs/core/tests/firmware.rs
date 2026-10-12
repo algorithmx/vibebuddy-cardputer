@@ -843,6 +843,19 @@ mod lan {
     }
 
     #[test]
+    fn a_scan_is_asked_for_over_the_cable_only() {
+        let (mut firmware, mut board) = paired_box();
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.scan"}"#).is_empty());
+        assert!(firmware.take_scan_request());
+        assert!(!firmware.take_scan_request(), "once");
+        board.advance(USB_QUIET_MS);
+        link_up(&mut firmware, &mut board, 1);
+        firmware.lan_received(&mut board, 1, b"{\"version\":1,\"event\":\"device.wifi.scan\"}\n");
+        assert_eq!(board.take_lines(), ["ERROR cable_only"]);
+        assert!(!firmware.take_scan_request());
+    }
+
+    #[test]
     fn the_wifi_network_is_set_over_the_cable_and_kept() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.set","ssid":"Home","password":"secret"}"#);

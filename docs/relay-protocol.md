@@ -2,7 +2,7 @@
 
 How the daemon and the box talk to the Relay (ADR-0012). The Relay itself is the Worker `vibebuddy-relay` in the closed-source `vibebuddy-cloud` repo, which holds all of VibeBuddy's hosted services; this is the part both ends in this repo implement.
 
-The Relay lives at `wss://relay.korekore.ai`; staging will be `wss://relay-staging.korekore.ai`. That address is compiled into the daemon and the firmware, and the update manifest may override it; the Relay never depends on update checks, which can be off.
+The Relay lives at `wss://relay.korekore.ai`; staging is `wss://relay-staging.korekore.ai`. That address is compiled into the daemon and the firmware, and the update manifest may override it; the Relay never depends on update checks, which can be off.
 
 ## Connecting
 
@@ -37,7 +37,7 @@ A `v` that isn't an integer gets `{"t":"error","code":"auth"}` and close 4001. A
 
 - `{"t":"paired","computers":[{"key":"…","name":"…"}]}`: the full paired list, at most 16, sent after every welcome and whenever it changes. Computers no longer in it are dropped (`unlinked`, reason `unpaired`, close 4003).
 - `{"t":"linked","via":"usb"|"lan","computer":"<key>"|null}`: the box linked to a computer without the Relay (`null` for an unpaired computer over USB). Any Relay link ends.
-- `{"t":"unlinked"}`: that link ended.
+- `{"t":"unlinked"}`: that link ended. If that computer wasn't paired (`computer: null`), the Relay frees the box at once, since such a computer can't come back through it; a paired one keeps the 10-minute grace.
 - `{"t":"data","line":"…"}`: one VibeBuddy Protocol line for the computer linked through the Relay.
 
 The Relay sends the box `{"t":"linked","computer":"<key>","name":"…"}` when a computer links through it (also right after welcome, if one is linked), `{"t":"unlinked","reason":…}` when that link ends, and `data` from that computer. Reasons for `unlinked` to the box: `gone` (the computer's socket closed or was dropped), `released` (it sent `unlink`), `unpaired`.
@@ -59,7 +59,7 @@ When the box reconnects to the Relay while a computer is linked through it, that
 
 ## The daemon
 
-The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`). Failed tries back off: 2 s when unreachable, 10 s when busy, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes. The Relay's address is compiled in: `wss://relay-staging.korekore.ai` while builds are internal, `wss://relay.korekore.ai` once production is deployed; `VIBEBUDDY_RELAY_URL` says otherwise. The user can turn the Relay off in the App's settings (config `relay`, on by default); off, the daemon doesn't try it and leaves a link through it. The update manifest's optional `relay` field moves it from the next connection on, but only to a `wss://` address and never over the variable.
+The daemon reaches the box the closest way it can: the cable, then the local network, then the Relay (`daemon/src/relay.rs`). It moves between them without a drop: `/v1/status` goes from one connection to the next with no `connected: false` in between, and `device.network` and `device.relay` say which it is. While linked through the Relay it looks for the box on the cable every 2 s and on the local network every 30 s. It sends `link` unless the user chose Take over in the App (`POST /v1/device/takeover`), which sends `takeover` once. A `busy` answer goes to `/v1/status` as `device.busy` (`owner`, `reason`), and the daemon stays on its socket: it asks again whenever `status` shows the box free, sends `takeover` there the moment the user asks, and sends `{"t":"ping"}` every 30 s meanwhile. While linked, `status` with `box: false` means the box is gone (the link reads as down) until `linked` comes again. Failed tries back off: 2 s when unreachable, 30 s on 429 or close 1008, 60 s on a refusal, doubling up to 5 minutes; sockets the daemon gives up on purpose close with 1000. The Relay's address is compiled in as `wss://relay.korekore.ai`; `VIBEBUDDY_RELAY_URL` says otherwise, for example `wss://relay-staging.korekore.ai` for development. The user can turn the Relay off in the App's settings (config `relay`, on by default); off, the daemon doesn't try it and leaves a link through it. The update manifest's optional `relay` field moves it from the next connection on, but only to a `wss://` address and never over the variable.
 
 The simulator plays the box on the Relay with `tools/simulate-device.py --relay ws://127.0.0.1:8787`, against `wrangler dev` in vibebuddy-cloud; `npx wrangler dev --var GRACE_MS:5000` shortens the grace period for such tests (production never sets it).
 

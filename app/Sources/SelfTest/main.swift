@@ -83,6 +83,10 @@ do {
     {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
     """.utf8))
     check(busy.busy == BoxBusy(owner: "omarchy", reason: "linked"), "busy decodes")
+    let seen = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
+    {"connected":true,"bridge":false,"wifi_seen":[{"ssid":"ByteTrade","rssi":-49}]}
+    """.utf8))
+    check(seen.wifiSeen == [SeenNetwork(ssid: "ByteTrade", rssi: -49)], "scan results decode")
 } catch {
     check(false, "status decoding threw: \(error)")
 }

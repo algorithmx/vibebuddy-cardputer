@@ -164,6 +164,8 @@ final class AppModel: ObservableObject {
 
     func forgetWifi() { run { try await self.client.forgetWifi() } }
 
+    func scanWifi() { run { try await self.client.scanWifi() } }
+
     func setNotifyLink(_ enabled: Bool) {
         guard var config = status?.config else { return }
         config.notifyLink = enabled

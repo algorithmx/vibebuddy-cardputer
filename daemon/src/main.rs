@@ -445,6 +445,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/device/takeover", post(post_takeover))
         .route("/v1/device/wifi", post(post_wifi))
         .route("/v1/device/wifi/forget", post(post_wifi_forget))
+        .route("/v1/device/wifi/scan", post(post_wifi_scan))
         .route("/v1/device/choice", post(post_choice))
         .route(
             "/v1/device/voice-pack",
@@ -742,6 +743,14 @@ async fn post_wifi_forget(State(state): State<AppState>) -> (StatusCode, Json<Ap
         return refused;
     }
     post_event(State(state), Json(device_command("device.wifi.forget"))).await
+}
+
+/// Asks the box which networks it can hear; the answer comes back as `device.wifi_seen` in the status.
+async fn post_wifi_scan(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    if let Some(refused) = wifi_refusal(&state).await {
+        return refused;
+    }
+    post_event(State(state), Json(device_command("device.wifi.scan"))).await
 }
 
 async fn wifi_refusal(state: &AppState) -> Option<(StatusCode, Json<ApiResponse>)> {

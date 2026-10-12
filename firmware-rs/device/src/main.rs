@@ -182,7 +182,7 @@ impl Board for DeviceBoard {
         }
         if self.relay_peer {
             for message in self.relay_lines.lines(bytes) {
-                let _ = relay::OUT.try_send(message);
+                let _ = relay::OUT.try_send((relay::current_socket(), message));
             }
         }
     }
@@ -421,9 +421,9 @@ async fn main(spawner: Spawner) -> ! {
         }
         while let Ok(event) = relay::IN.try_receive() {
             match event {
-                relay::RelayIn::Challenge(nonce) => {
+                relay::RelayIn::Challenge(socket, nonce) => {
                     if let Some(hello) = relay_box.hello(&firmware, &nonce) {
-                        let _ = relay::OUT.try_send(hello);
+                        let _ = relay::OUT.try_send((socket, hello));
                     }
                 }
                 relay::RelayIn::Message(text) => {
@@ -448,7 +448,10 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
         for message in relay_box.report(&firmware, board.now_ms()) {
-            let _ = relay::OUT.try_send(message);
+            let _ = relay::OUT.try_send((relay::current_socket(), message));
+        }
+        if firmware.take_scan_request() {
+            net::SCAN.signal(());
         }
         if firmware.take_wifi_change() {
             net::CREDENTIALS.signal(wifi_credentials(&firmware));
