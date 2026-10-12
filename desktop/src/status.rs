@@ -160,6 +160,8 @@ pub struct Device {
     /// The Wi-Fi network the box is set to join, and the address it got there.
     pub wifi_network: Option<String>,
     pub wifi_address: Option<String>,
+    /// Why the box couldn't join the network, until it does.
+    pub wifi_error: Option<String>,
     /// What the box heard on its last scan, strongest first.
     pub wifi_seen: Vec<SeenNetwork>,
 }
