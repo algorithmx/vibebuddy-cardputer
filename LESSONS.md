@@ -304,3 +304,9 @@ Over SSH, match by something the shell's own command line can't contain: a PID k
 On 2026-10-09 I had dragon run `just install` in a worktree branched before #99, which renamed the bundle to `VibeBuddy.app`. The worktree's `build-app.sh` still installed to `/Applications/Vibe Buddy.app`, so the new build landed next to the app in daily use instead of replacing it, and two copies fought over the box and port 7331.
 
 Before installing anything meant for daily use, fetch and check out `origin/main` (or confirm the branch contains it). `git log -1 origin/main` against `HEAD` takes a second; cleaning up a second app bundle does not.
+
+## A boot step that reads flash structures must run on the real layout before it ships
+
+On 2026-10-12 the first OTA-layout firmware reset in a loop right after READY on a box: confirming the running image went through esp-bootloader-esp-idf's `OtaUpdater`, which parses the whole partition table and panics on our custom data subtypes (voices 0x40, link 0x41). Every host test passed, because the fake boards' flash had no otadata and the device-only code never ran there. The box flickered and clicked until the fix was flashed.
+
+Code that parses partitions or otadata at boot either lives in firmware-core with host tests built from the real `partitions.csv` (as `ota::confirm` now does), or is flashed to a box and watched through one full boot and a reset before the branch is called done. And back the box up first: a full `read-flash` took three minutes and made every later step low-risk.
