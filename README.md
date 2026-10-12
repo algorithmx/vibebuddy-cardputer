@@ -53,9 +53,9 @@ Pomodoro runs entirely on the box: its timer and today's tally keep going withou
 1. Install with Homebrew: `brew install --cask second-state/tap/vibebuddy`. Or download `VibeBuddy-<version>-arm64.dmg` from the [latest release](https://github.com/second-state/vibebuddy/releases/latest) and drag VibeBuddy to Applications. Either way the app then updates itself.
 2. Plug the box into the Mac.
 3. Open VibeBuddy. First-run setup walks you through:
-   - finding the box (it blinks so you know it's the right one);
-   - connecting Codex and Claude Code (you see the exact change to their hook config before it's written);
-   - picking an announcement voice and writing it to the box;
+   - finding the box (it blinks so you know it's the right one), and updating its firmware if a newer one is out;
+   - connecting your agents: Codex, Claude Code, OpenCode, GitHub Copilot CLI and Pi (you see the exact change to their hook config before it's written);
+   - picking a character and writing it to the box (the default robot comes first);
    - launching at login.
 
 After that VibeBuddy lives in the menu bar; open the app again any time to bring up Settings. Its icon tells you whether the box is online, which mode it's in and how much got done today. Settings has five tabs: General (including the interface language), Character (who the buddy is, and the volume), Agents, Device (firmware updates, screenshots) and Advanced. Firmware is released on its own: when a newer one the app can run is out, VibeBuddy downloads it and Settings → Device offers to update the box, which you confirm.
@@ -225,7 +225,13 @@ The Mac app is a menu bar app. It carries `vibebuddyd` and `vibebuddy-hook` insi
 just install    # build the app, install it to /Applications and launch it
 ```
 
-The app builds with SwiftPM and only needs the command-line tools. `swift run --package-path app SelfTest` runs the view-model self-test.
+The app builds with SwiftPM and only needs the command-line tools. Packaging also collects third-party license notices with `cargo-about`; install the same version CI uses once, or the build stops at the license step:
+
+```bash
+cargo install cargo-about --version 0.9.2 --locked --features cli
+```
+
+`swift run --package-path app SelfTest` runs the view-model self-test.
 
 ### The daemon
 

@@ -176,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func showOnboarding() {
         if onboardingWindow == nil {
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 440), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 540), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = String(localized: "Welcome to VibeBuddy")
             window.contentView = NSHostingView(rootView: OnboardingView(model: model, finish: { [weak self] in
                 UserDefaults.standard.set(true, forKey: "onboardingDone")

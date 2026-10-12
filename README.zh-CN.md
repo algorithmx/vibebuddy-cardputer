@@ -53,9 +53,9 @@ VibeBuddy 是给 AI 编程 Agent 配的桌面宠物。它住在键盘旁一个�
 1. 用 Homebrew 安装：`brew install --cask second-state/tap/vibebuddy`。也可以从[最新 Release](https://github.com/second-state/vibebuddy/releases/latest) 下载 `VibeBuddy-<版本>-arm64.dmg`，把 VibeBuddy 拖进「应用程序」。两种方式装好后，App 都会自己更新。
 2. 把盒子插上 Mac。
 3. 打开 VibeBuddy，首次启动的引导会带你：
-   - 找到盒子（它会眨眼，确认是这一台）；
-   - 接入 Codex 与 Claude Code（写 Hook 配置前先展示改动）；
-   - 挑一个播报音色写进盒子；
+   - 找到盒子（它会眨眼，确认是这一台），有新固件的话顺手升级；
+   - 接入 Agent：Codex、Claude Code、OpenCode、GitHub Copilot CLI 和 Pi（写 Hook 配置前先展示改动）；
+   - 挑一个角色写进盒子（默认的机器人排在第一个）；
    - 设置登录时启动。
 
 之后 VibeBuddy 住在菜单栏，随时再打开一次 App 就能调出设置：图标告诉你盒子在不在线、什么模式、今天干了多少。设置窗有五页：通用（含界面语言）、角色（小助手是谁，以及音量）、接入、设备（固件更新、截图）、高级。固件单独发布：有 App 能运行的新固件时，VibeBuddy 会自动下载，设置 → 设备会提示更新盒子，由你确认。
@@ -225,7 +225,13 @@ Mac 端是一个菜单栏 App，它把 `vibebuddyd` 与 `vibebuddy-hook` 带在�
 just install    # 装包、装进 /Applications 并启动
 ```
 
-App 用 SwiftPM 构建，只需要命令行工具；`swift run --package-path app SelfTest` 跑视图模型的自检。
+App 用 SwiftPM 构建，只需要命令行工具。打包时还要用 `cargo-about` 收集第三方许可证，先装一次和 CI 相同的版本，否则构建会停在许可证那一步：
+
+```bash
+cargo install cargo-about --version 0.9.2 --locked --features cli
+```
+
+`swift run --package-path app SelfTest` 跑视图模型的自检。
 
 ### daemon
 
