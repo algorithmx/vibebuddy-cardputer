@@ -70,6 +70,23 @@ impl LanConfig {
     }
 }
 
+impl LanConfig {
+    /// [`advertised`](Self::advertised), but a browse that only starts now has heard nothing yet: it gets a moment
+    /// for the box to answer its first query.
+    async fn find(&self, box_key: &[u8; 32]) -> Vec<String> {
+        let fresh = self.discovery.browser.get().is_none();
+        let mut found = self.advertised(box_key);
+        for _ in 0..20 {
+            if !fresh || !found.is_empty() || self.fixed_address.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            found = self.advertised(box_key);
+        }
+        found
+    }
+}
+
 /// The DNS-SD service type the box advertises once it is on Wi-Fi (docs/protocol.md).
 pub const SERVICE_TYPE: &str = "_vibebuddy._tcp.local.";
 
@@ -252,7 +269,7 @@ pub async fn link(lan: &LanConfig, takeover: bool) -> Option<(Target, Result<Tcp
         }
         last = Some((target.clone(), result));
     }
-    for address in lan.advertised(&box_key) {
+    for address in lan.find(&box_key).await {
         if remembered.as_ref().is_some_and(|target| target.address == address) {
             continue;
         }
