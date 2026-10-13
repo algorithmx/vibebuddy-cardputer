@@ -86,7 +86,11 @@ impl RelayBox {
                 firmware.relay_linked(board.now_ms(), key);
                 self.peer = key.is_some();
             }
-            Some("unlinked") => self.gone(firmware, board.now_ms()),
+            // Only the computer's link ended; the socket stays up and the box keeps reporting.
+            Some("unlinked") => {
+                firmware.relay_linked(board.now_ms(), None);
+                self.peer = false;
+            }
             Some("data") => {
                 if let Some(line) = value["line"].as_str() {
                     firmware.relay_line(board, line.as_bytes());
