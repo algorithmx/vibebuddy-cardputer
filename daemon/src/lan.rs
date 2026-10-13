@@ -1,6 +1,8 @@
 //! The computer's side of the local network link (ADR-0012, docs/protocol.md "Local network link"):
 //! where the box is (remembered from USB, or found by mDNS when it moved), and the handshake in which both ends prove their keys before any VibeBuddy
-//! Protocol line goes over the connection.
+//! Protocol line goes over the connection. Firmware that opens with `link.noise` gets a Noise session and every line
+//! after it is sealed (ADR-0015, [`crate::noise_link`]); older firmware opens with `link.challenge` and links in the
+//! clear, unless that box has spoken Noise before.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -15,6 +17,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::identity::Identity;
+use crate::noise_link::{self, Memory, Session};
+
+/// What a link off the cable reads and writes: a connection in the clear, or the plain side of a session.
+pub trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+pub type LinkStream = Box<dyn Duplex>;
 
 /// The port a box listens on.
 pub const PORT: u16 = 7340;
@@ -41,6 +49,11 @@ pub struct Target {
 }
 
 impl LanConfig {
+    /// Which box has spoken Noise to this computer.
+    pub fn memory(&self) -> Memory {
+        Memory::new(&self.state_dir)
+    }
+
     /// The key of the box this computer paired with, learned over USB.
     pub fn box_key(&self) -> Option<[u8; 32]> {
         read_key(&box_key_file(&self.state_dir))
@@ -242,28 +255,31 @@ fn drop_when_unacknowledged(stream: &TcpStream, after: Duration) {
 fn drop_when_unacknowledged(_stream: &TcpStream, _after: Duration) {}
 
 /// Connects and runs the handshake; on success the stream carries the VibeBuddy Protocol.
-pub async fn connect(target: &Target, identity: &Identity, takeover: bool) -> Result<TcpStream, LinkError> {
+pub async fn connect(target: &Target, identity: &Identity, takeover: bool, memory: &Memory) -> Result<LinkStream, LinkError> {
     let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&target.address))
         .await
         .map_err(|_| LinkError::Unreachable("timed out".to_owned()))?
         .map_err(|error| LinkError::Unreachable(error.to_string()))?;
     let _ = stream.set_nodelay(true);
     drop_when_unacknowledged(&stream, GIVE_UP_AFTER);
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, target, identity, takeover))
+    let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, target, identity, takeover, memory))
         .await
         .map_err(|_| LinkError::Unreachable("handshake timed out".to_owned()))??;
-    Ok(stream)
+    Ok(match session {
+        Some(session) => Box::new(noise_link::bridge(stream, session)),
+        None => Box::new(stream),
+    })
 }
 
 /// Links to the paired box over the local network: at the remembered address, or, when nothing answers there,
 /// wherever mDNS says it is now. A new address is remembered once the handshake proves the box's key. None when
 /// this computer isn't paired or knows nowhere to try; otherwise the last place tried and how it went.
-pub async fn link(lan: &LanConfig, takeover: bool) -> Option<(Target, Result<TcpStream, LinkError>)> {
+pub async fn link(lan: &LanConfig, takeover: bool) -> Option<(Target, Result<LinkStream, LinkError>)> {
     let box_key = lan.box_key()?;
     let remembered = lan.target();
     let mut last = None;
     if let Some(target) = &remembered {
-        let result = connect(target, &lan.identity, takeover).await;
+        let result = connect(target, &lan.identity, takeover, &lan.memory()).await;
         if !matches!(result, Err(LinkError::Unreachable(_))) {
             return Some((target.clone(), result));
         }
@@ -274,7 +290,7 @@ pub async fn link(lan: &LanConfig, takeover: bool) -> Option<(Target, Result<Tcp
             continue;
         }
         let target = Target { address, box_key };
-        let result = connect(&target, &lan.identity, takeover).await;
+        let result = connect(&target, &lan.identity, takeover, &lan.memory()).await;
         if result.is_ok()
             && let Ok(found) = target.address.parse::<SocketAddr>()
         {
@@ -303,16 +319,26 @@ pub async fn reachable(lan: &LanConfig) -> bool {
     false
 }
 
+/// Runs the handshake the box opens with; a session when it speaks Noise, None when it links in the clear.
 pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     target: &Target,
     identity: &Identity,
     takeover: bool,
-) -> Result<(), LinkError> {
-    let challenge = read_message(stream).await?;
+    memory: &Memory,
+) -> Result<Option<Session>, LinkError> {
+    let first = read_line(stream).await?;
+    if let Some(box_key) = noise_link::opener_key(&first) {
+        return noise_handshake(stream, target, identity, takeover, memory, box_key).await.map(Some);
+    }
+    let challenge = parse(&first)?;
     let text = |value: &Value, name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);
     if text(&challenge, "event").as_deref() != Some("link.challenge") {
         return Err(LinkError::Refused("no challenge".to_owned()));
+    }
+    // Whoever answers at the box's address can't talk a box that spoke Noise down to the clear.
+    if memory.knows(&target.box_key) {
+        return Err(LinkError::Refused("the box spoke Noise before, and now not".to_owned()));
     }
     // Another box answering at the remembered address is never driven.
     let box_key = text(&challenge, "box").and_then(|key| decode::<32>(&key));
@@ -334,20 +360,66 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     line.push(b'\n');
     stream.write_all(&line).await.map_err(|error| LinkError::Unreachable(error.to_string()))?;
 
-    let answer = read_message(stream).await?;
+    let answer = parse(&read_line(stream).await?)?;
     match text(&answer, "event").as_deref() {
         Some("link.welcome") => {
             let signature = text(&answer, "sig").and_then(|sig| decode::<64>(&sig));
             let proven = signature.is_some_and(|signature| verify(&target.box_key, &signed_message("box", &target.box_key, &ours), &signature));
-            if proven { Ok(()) } else { Err(LinkError::Refused("the box didn't prove its key".to_owned())) }
+            if proven { Ok(None) } else { Err(LinkError::Refused("the box didn't prove its key".to_owned())) }
         }
-        Some("link.busy") => Err(LinkError::Busy { reason: text(&answer, "reason").unwrap_or_default(), owner: text(&answer, "owner").unwrap_or_default() }),
-        _ => Err(LinkError::Refused(text(&answer, "code").unwrap_or_else(|| "unexpected reply".to_owned()))),
+        answer_event => Err(refusal(answer_event, &answer)),
     }
 }
 
+/// The Noise handshake (ADR-0015): the first message carries whether the user takes the box over, the box's reply
+/// proves its key, and its first sealed line says whether this computer has the box.
+async fn noise_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    target: &Target,
+    identity: &Identity,
+    takeover: bool,
+    memory: &Memory,
+    box_key: [u8; 32],
+) -> Result<Session, LinkError> {
+    // Another box answering at the remembered address is never driven.
+    if box_key != target.box_key {
+        return Err(LinkError::Refused("a different box".to_owned()));
+    }
+    let payload = serde_json::json!({"takeover": takeover}).to_string();
+    let (handshake, first) = noise_link::start(identity, &target.box_key, payload.as_bytes()).map_err(LinkError::Refused)?;
+    stream.write_all(format!("{first}\n").as_bytes()).await.map_err(|error| LinkError::Unreachable(error.to_string()))?;
+    let reply = read_line(stream).await?;
+    // Turned away before a session: `link.error` in the clear.
+    if reply.starts_with('{') {
+        let refused = parse(&reply)?;
+        return Err(refusal(refused.get("event").and_then(Value::as_str), &refused));
+    }
+    let mut session = handshake.finish(&reply).map_err(LinkError::Refused)?;
+    memory.learned(&target.box_key);
+    let sealed = read_line(stream).await?;
+    let answer = session.open(&sealed).map_err(LinkError::Refused)?;
+    let answer: Value = serde_json::from_slice(&answer).map_err(|_| LinkError::Refused("bad handshake line".to_owned()))?;
+    match answer.get("event").and_then(Value::as_str) {
+        Some("link.welcome") => Ok(session),
+        answer_event => Err(refusal(answer_event, &answer)),
+    }
+}
+
+/// `link.busy` or `link.error` as the error they mean.
+fn refusal(event: Option<&str>, answer: &Value) -> LinkError {
+    let text = |name: &str| answer.get(name).and_then(Value::as_str).map(str::to_owned);
+    match event {
+        Some("link.busy") => LinkError::Busy { reason: text("reason").unwrap_or_default(), owner: text("owner").unwrap_or_default() },
+        _ => LinkError::Refused(text("code").unwrap_or_else(|| "unexpected reply".to_owned())),
+    }
+}
+
+fn parse(line: &str) -> Result<Value, LinkError> {
+    serde_json::from_str(line).map_err(|_| LinkError::Refused("bad handshake line".to_owned()))
+}
+
 /// Reads one line, byte by byte so nothing after it is taken from the stream.
-async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Value, LinkError> {
+async fn read_line<S: AsyncRead + Unpin>(stream: &mut S) -> Result<String, LinkError> {
     let mut line = Vec::new();
     loop {
         let mut byte = [0u8; 1];
@@ -359,7 +431,12 @@ async fn read_message<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Value, Lin
             Err(error) => return Err(LinkError::Unreachable(error.to_string())),
         }
     }
-    serde_json::from_slice(&line).map_err(|_| LinkError::Refused("bad handshake line".to_owned()))
+    String::from_utf8(line).map_err(|_| LinkError::Refused("bad handshake line".to_owned()))
+}
+
+/// A key as the box reports it: 43 characters of unpadded base64url.
+pub fn decode_key(text: &str) -> Option<[u8; 32]> {
+    decode(text)
 }
 
 fn decode<const N: usize>(text: &str) -> Option<[u8; N]> {
@@ -423,12 +500,98 @@ mod tests {
         write.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
     }
 
+    fn memory() -> Memory {
+        Memory::new(&std::env::temp_dir().join(format!("vibebuddy-lan-memory-{}-{}", std::process::id(), rand_suffix())))
+    }
+
     async fn run(reply: &'static str, expected_box: Option<[u8; 32]>) -> Result<(), LinkError> {
         let box_key = SigningKey::from_bytes(&[8; 32]);
         let target = Target { address: String::new(), box_key: expected_box.unwrap_or(box_key.verifying_key().to_bytes()) };
         let (mut ours, theirs) = tokio::io::duplex(4096);
         tokio::spawn(fake_box(theirs, box_key, reply));
-        handshake(&mut ours, &target, &identity(), false).await
+        handshake(&mut ours, &target, &identity(), false, &memory()).await.map(|session| assert!(session.is_none(), "in the clear"))
+    }
+
+    /// Plays a box that speaks Noise, with the firmware's own code; `owner` set makes it busy.
+    async fn noise_box<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, link: vibebuddy_firmware_core::link::Link, owner: Option<&'static str>) {
+        use vibebuddy_firmware_core::noise;
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        write.write_all(format!("{}\n", noise::opener(&link.public_key())).as_bytes()).await.unwrap();
+        let Ok(Some(first)) = lines.next_line().await else { return };
+        let accepted = match noise::accept(&link, [4; 32], first.as_bytes()) {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                write.write_all(b"{\"version\":1,\"event\":\"link.error\",\"code\":\"auth\"}\n").await.unwrap();
+                return;
+            }
+        };
+        let (mut sealer, mut opener) = (accepted.sealer, accepted.opener);
+        let answer = match owner {
+            Some(owner) => serde_json::json!({"version":1,"event":"link.busy","reason":"linked","owner":owner}),
+            None => serde_json::json!({"version":1,"event":"link.welcome"}),
+        };
+        let reply = format!("{}\n{}\n", accepted.reply, sealer.seal(answer.to_string().as_bytes()).unwrap());
+        write.write_all(reply.as_bytes()).await.unwrap();
+        // Echoes each line back in upper case, sealed.
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Some(plain) = opener.open(line.as_bytes()) else { return };
+            let upper = String::from_utf8(plain).unwrap().to_uppercase();
+            write.write_all(format!("{}\n", sealer.seal(upper.as_bytes()).unwrap()).as_bytes()).await.unwrap();
+        }
+    }
+
+    fn paired_link(identity: &Identity) -> vibebuddy_firmware_core::link::Link {
+        let mut link = vibebuddy_firmware_core::link::Link::new([1; 32]);
+        link.pair(URL_SAFE_NO_PAD.decode(identity.public_key()).unwrap().try_into().unwrap(), "test").unwrap();
+        link
+    }
+
+    #[tokio::test]
+    async fn a_box_that_speaks_noise_links_in_a_sealed_session() {
+        let identity = identity();
+        let link = paired_link(&identity);
+        let target = Target { address: String::new(), box_key: link.public_key() };
+        let (mut ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(noise_box(theirs, link, None));
+        let memory = memory();
+        let session = handshake(&mut ours, &target, &identity, false, &memory).await.unwrap().expect("a session");
+        assert!(memory.knows(&target.box_key));
+        let mut stream = noise_link::bridge(ours, session);
+        stream.write_all(b"{\"version\":1,\"event\":\"device.hello\"}\n").await.unwrap();
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        assert_eq!(lines.next_line().await.unwrap().unwrap(), "{\"VERSION\":1,\"EVENT\":\"DEVICE.HELLO\"}");
+    }
+
+    #[tokio::test]
+    async fn a_busy_box_says_so_inside_the_session() {
+        let identity = identity();
+        let link = paired_link(&identity);
+        let target = Target { address: String::new(), box_key: link.public_key() };
+        let (mut ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(noise_box(theirs, link, Some("omarchy")));
+        let result = handshake(&mut ours, &target, &identity, false, &memory()).await;
+        assert!(matches!(result, Err(LinkError::Busy { ref reason, ref owner }) if reason == "linked" && owner == "omarchy"));
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_computer_is_turned_away_by_a_noise_box() {
+        let link = paired_link(&identity());
+        let target = Target { address: String::new(), box_key: link.public_key() };
+        let (mut ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(noise_box(theirs, link, None));
+        assert_eq!(handshake(&mut ours, &target, &identity(), false, &memory()).await.err(), Some(LinkError::Refused("auth".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn a_box_that_spoke_noise_before_is_never_linked_in_the_clear() {
+        let box_key = SigningKey::from_bytes(&[8; 32]);
+        let target = Target { address: String::new(), box_key: box_key.verifying_key().to_bytes() };
+        let (mut ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(fake_box(theirs, box_key, "welcome"));
+        let memory = memory();
+        memory.learned(&target.box_key);
+        assert!(matches!(handshake(&mut ours, &target, &identity(), false, &memory).await, Err(LinkError::Refused(_))));
     }
 
     #[tokio::test]
