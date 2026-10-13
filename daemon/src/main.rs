@@ -209,6 +209,7 @@ async fn main() {
             identity: identity.clone(),
             state_dir,
             fixed_address: std::env::var("VIBEBUDDY_LAN_ADDR").ok(),
+            discovery: lan::Discovery::default(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
         let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release());

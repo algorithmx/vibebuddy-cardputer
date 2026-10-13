@@ -403,6 +403,9 @@ async fn main(spawner: Spawner) -> ! {
     net::CREDENTIALS.signal(wifi_credentials(&firmware));
     report_memory(&mut board);
     if let Some(stack) = stack {
+        if let Some(link) = firmware.link() {
+            net::advertise(&spawner, stack, vibebuddy_firmware_core::link::encode(&link.public_key()).into());
+        }
         start_relay(&spawner, stack, trng, &firmware);
     }
     let mut relay_box = RelayBox::new();
