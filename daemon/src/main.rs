@@ -6,6 +6,7 @@ mod codex_hooks;
 mod config;
 mod identity;
 mod lan;
+mod noise_link;
 mod relay;
 mod link_alert;
 mod occasions;
@@ -92,6 +93,8 @@ struct AppState {
     updates: Arc<Mutex<Updates>>,
     /// "Check for updates" pressed: checks now instead of waiting for the daily one.
     check_updates: Arc<Notify>,
+    /// The box on the cable said `LINK NOISE` since its last `BOX KEY` (ADR-0015).
+    noise_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -125,6 +128,7 @@ impl AppState {
             state_dir: None,
             updates: Arc::new(Mutex::new(Updates::new(None, None))),
             check_updates: Arc::new(Notify::new()),
+            noise_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -309,6 +313,24 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     // (ADR-0012). Pairing again is harmless: the box only writes flash when something changed.
     // Over the network the box refuses pairing, and what it says there isn't news about the cable.
     let on_cable = !state.device.lock().await.network;
+    // The box says `LINK NOISE` just before `BOX KEY` when it links off the cable only through a Noise session
+    // (ADR-0015); from then on this computer never links to it in the clear. Only the cable is believed, both ways.
+    if let DeviceMessage::Line(line) = &message
+        && on_cable
+    {
+        use std::sync::atomic::Ordering;
+        if line.trim() == "LINK NOISE" {
+            state.noise_seen.store(true, Ordering::Relaxed);
+        } else if let Some(key) = line.strip_prefix(status::BOX_KEY_PREFIX)
+            && let Some(dir) = &state.state_dir
+        {
+            let memory = noise_link::Memory::new(dir);
+            match lan::decode_key(key.trim()) {
+                Some(key) if state.noise_seen.swap(false, Ordering::Relaxed) => memory.learned(&key),
+                _ => memory.forget(),
+            }
+        }
+    }
     if let DeviceMessage::Line(line) = &message
         && on_cable
         && let Some(key) = line.strip_prefix(status::BOX_KEY_PREFIX)

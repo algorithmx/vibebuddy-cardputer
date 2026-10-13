@@ -331,7 +331,8 @@ async fn serial_worker(
                     info!(here, "the box's presence on the Relay changed");
                     let _ = events.try_send(message);
                 });
-                let wait = relay::Wait { takeover: &config.takeover, busy: &mut on_busy, give_up: &give_up, presence };
+                let memory = config.lan.as_ref().map(|lan| lan.memory());
+                let wait = relay::Wait { takeover: &config.takeover, busy: &mut on_busy, give_up: &give_up, presence, memory };
                 let relay_link = relay::link(relay_config, &box_key, wait).await;
                 busy_logged = reported_busy.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
                 match relay_link {
