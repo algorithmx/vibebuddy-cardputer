@@ -17,6 +17,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
+use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Timer};
 use esp_hal::rng::Rng;
 use esp_radio::wifi::sta::StationConfig;
@@ -46,9 +47,12 @@ pub enum NetEvent {
 pub static EVENTS: Channel<CriticalSectionRawMutex, NetEvent, 16> = Channel::new();
 /// The computer on the cable asked for the networks the box can hear.
 pub static SCAN: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-/// The address the box has on Wi-Fi, or None once it loses it; for the mDNS task. embassy-net keeps one waker for
-/// its state, so two tasks waiting on it at once keep waking each other: only [`address_task`] waits there.
-static ADDRESS: Signal<CriticalSectionRawMutex, Option<core::net::Ipv4Addr>> = Signal::new();
+/// The address the box has on Wi-Fi, or None while it has none; for the mDNS and Relay tasks. embassy-net keeps one
+/// waker for its state, so two tasks waiting on it at once keep waking each other: only [`address_task`] waits there.
+/// A `Watch` gives each reader its own waker, and the current value to one that starts late.
+pub static ADDRESS: Watch<CriticalSectionRawMutex, Option<core::net::Ipv4Addr>, ADDRESS_READERS> = Watch::new();
+/// The mDNS task and the Relay task.
+const ADDRESS_READERS: usize = 2;
 /// The network to join, or None to leave Wi-Fi; signalled at boot and whenever the user changes it.
 pub static CREDENTIALS: Signal<CriticalSectionRawMutex, Option<(String, String)>> = Signal::new();
 
@@ -268,15 +272,9 @@ async fn mdns_task(stack: Stack<'static>, box_key: String) {
         service_subtypes: &[],
         txt_kvs: &txt,
     };
-    let mut address = None;
+    let mut address = ADDRESS.receiver().expect("mDNS address reader");
     loop {
-        let ipv4 = match address.take() {
-            Some(ipv4) => ipv4,
-            None => match ADDRESS.wait().await {
-                Some(ipv4) => ipv4,
-                None => continue,
-            },
-        };
+        let Some(ipv4) = address.get_and(Option::is_some).await else { continue };
         let host = Host { hostname: &hostname, ipv4, ipv6: Ipv6Addr::UNSPECIFIED, ttl: Ttl::from_secs(120) };
         let mut socket = match io::bind(&udp, io::IPV4_DEFAULT_SOCKET, Some(Ipv4Addr::UNSPECIFIED), None).await {
             Ok(socket) => socket,
@@ -291,29 +289,25 @@ async fn mdns_task(stack: Stack<'static>, box_key: String) {
         let mdns = io::Mdns::new(Some(Ipv4Addr::UNSPECIFIED), None, recv, send, &recv_buf, &send_buf, Rng::new(), &signal);
         let answers = ServiceAnswers::new(&host, &service);
         // Ends when the address changes or goes; the next address gets a fresh socket and announcement.
-        match select(mdns.run(HostAnswersMdnsHandler::new(&answers)), ADDRESS.wait()).await {
-            embassy_futures::select::Either::First(Err(error)) => {
-                line(alloc::format!("MDNS FAILED {error:?}"));
-                Timer::after(Duration::from_secs(10)).await;
-            }
-            embassy_futures::select::Either::First(Ok(())) => {}
-            embassy_futures::select::Either::Second(next) => address = next,
+        if let embassy_futures::select::Either::First(Err(error)) = select(mdns.run(HostAnswersMdnsHandler::new(&answers)), address.changed()).await {
+            line(alloc::format!("MDNS FAILED {error:?}"));
+            Timer::after(Duration::from_secs(10)).await;
         }
     }
 }
 
 /// Reports the address each time the network comes up, so the computer on the cable can find the box, and hands it
-/// to the mDNS task.
+/// to the mDNS and Relay tasks through [`ADDRESS`].
 #[embassy_executor::task]
 async fn address_task(stack: Stack<'static>) {
     loop {
         stack.wait_config_up().await;
         if let Some(config) = stack.config_v4() {
             line(alloc::format!("WIFI ADDRESS {}", config.address.address()));
-            ADDRESS.signal(Some(config.address.address()));
+            ADDRESS.sender().send(Some(config.address.address()));
         }
         stack.wait_config_down().await;
-        ADDRESS.signal(None);
+        ADDRESS.sender().send(None);
     }
 }
 
