@@ -95,8 +95,10 @@ pub fn bridge<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, mut session
             tokio::select! {
                 read = read_line(&mut sealed, &mut line) => {
                     let Ok(true) = read else { break };
-                    let Ok(text) = std::str::from_utf8(&line) else { break };
-                    match session.open(text) {
+                    let opened = std::str::from_utf8(&line).map_err(|_| "not a sealed line".to_owned()).and_then(|text| session.open(text));
+                    let length = line.len();
+                    line.clear();
+                    match opened {
                         Ok(mut opened) => {
                             opened.push(b'\n');
                             if plain_write.write_all(&opened).await.is_err() {
@@ -104,7 +106,7 @@ pub fn bridge<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, mut session
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, "ending the session with the box");
+                            tracing::warn!(%error, length, "ending the session with the box");
                             break;
                         }
                     }
@@ -124,10 +126,10 @@ pub fn bridge<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, mut session
     ours
 }
 
-/// Reads one line into `line`, without its newline; false at the end of the stream. A line longer than
-/// [`MAX_SEALED_LINE`] is an error.
+/// Reads the rest of one line onto `line`, without its newline; false at the end of the stream. A line longer than
+/// [`MAX_SEALED_LINE`] is an error. Cancel-safe: whatever was read before a cancel stays in `line`, so the caller
+/// clears it only after a whole line, never before reading.
 pub async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<bool> {
-    line.clear();
     loop {
         let buffer = reader.fill_buf().await?;
         if buffer.is_empty() {
@@ -234,6 +236,20 @@ mod tests {
         let link = Link::new([1; 32]);
         assert_eq!(opener_key(&box_noise::opener(&link.public_key())), Some(link.public_key()));
         assert_eq!(opener_key(r#"{"version":1,"event":"link.challenge"}"#), None);
+    }
+
+    #[tokio::test]
+    async fn a_line_read_in_pieces_survives_a_cancelled_read() {
+        // The bridge's select! drops the read whenever it sends; half a line must still be there next time.
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = Vec::new();
+        writer.write_all(b"half of ").await.unwrap();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_millis(20), read_line(&mut reader, &mut line)).await;
+        assert!(cancelled.is_err());
+        writer.write_all(b"a line\n").await.unwrap();
+        assert!(read_line(&mut reader, &mut line).await.unwrap());
+        assert_eq!(line, b"half of a line");
     }
 
     #[test]

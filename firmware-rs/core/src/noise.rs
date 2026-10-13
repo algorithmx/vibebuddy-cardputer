@@ -104,19 +104,20 @@ impl SealedLines {
         Self { partial: Vec::new(), sealer }
     }
 
-    /// Bytes of output; every line they complete, sealed, without its newline. A line `fits` refuses, given
-    /// its sealed length, is dropped before it is sealed: a sealed line that never arrives would leave the
-    /// other end unable to open any after it.
-    pub fn lines(&mut self, bytes: &[u8], mut fits: impl FnMut(usize) -> bool) -> Vec<String> {
+    /// Bytes of output: each line they complete is sealed and handed to `send`, without its newline, one at
+    /// a time. A line `fits` refuses, given its sealed length, is dropped before it is sealed: a sealed line
+    /// that never arrives would leave the other end unable to open any after it. `fits` is asked again for
+    /// every line, after the line before it was sent.
+    pub fn lines(&mut self, bytes: &[u8], mut fits: impl FnMut(usize) -> bool, mut send: impl FnMut(&str)) {
         self.partial.extend_from_slice(bytes);
-        let mut out = Vec::new();
         while let Some(end) = self.partial.iter().position(|&byte| byte == b'\n') {
             let line: Vec<u8> = self.partial.drain(..=end).collect();
-            if fits(sealed_len(end)) {
-                out.extend(self.sealer.seal(&line[..end]));
+            if fits(sealed_len(end))
+                && let Some(sealed) = self.sealer.seal(&line[..end])
+            {
+                send(&sealed);
             }
         }
-        out
     }
 
     /// One whole line, sealed, without going through the partial line.
@@ -253,8 +254,10 @@ mod tests {
         let accepted = accept(&link, [4; 32], first.as_bytes()).unwrap();
         let (_, mut from_box) = initiator.finish(accepted.reply.as_bytes()).unwrap();
         let mut lines = SealedLines::new(accepted.sealer);
-        assert!(lines.lines(b"MODE ", |_| true).is_empty());
-        let sealed = lines.lines(b"DUTY\nDROPPED\nVOLUME 65\n", |length| length != sealed_len(7));
+        let mut sealed = Vec::new();
+        lines.lines(b"MODE ", |_| true, |line| sealed.push(String::from(line)));
+        assert!(sealed.is_empty());
+        lines.lines(b"DUTY\nDROPPED\nVOLUME 65\n", |length| length != sealed_len(7), |line| sealed.push(String::from(line)));
         assert_eq!(sealed.len(), 2);
         assert_eq!(sealed[0].len(), sealed_len(9));
         assert_eq!(from_box.open(sealed[0].as_bytes()).unwrap(), b"MODE DUTY");

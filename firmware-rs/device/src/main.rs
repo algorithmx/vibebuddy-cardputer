@@ -182,15 +182,23 @@ impl Board for DeviceBoard {
         // A line with no room is dropped whole, before it is sealed (noise::SealedLines).
         if let Some((conn, lines)) = &mut self.lan_peer {
             let conn = *conn;
-            for line in lines.lines(bytes, |length| net::room(conn) > length) {
-                net::send(conn, line.as_bytes());
-                net::send(conn, b"\n");
-            }
+            lines.lines(
+                bytes,
+                |length| net::room(conn) > length,
+                |line| {
+                    net::send(conn, line.as_bytes());
+                    net::send(conn, b"\n");
+                },
+            );
         }
         if let Some(lines) = &mut self.relay_peer {
-            for line in lines.lines(bytes, |_| relay::OUT.free_capacity() > 0) {
-                let _ = relay::OUT.try_send((relay::current_socket(), relay_box::data(&line)));
-            }
+            lines.lines(
+                bytes,
+                |_| relay::OUT.free_capacity() > 0,
+                |line| {
+                    let _ = relay::OUT.try_send((relay::current_socket(), relay_box::data(line)));
+                },
+            );
         }
     }
 

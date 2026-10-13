@@ -93,15 +93,15 @@ impl Board for SimulatedBoard {
         if let Some((conn, lines)) = &mut self.peer
             && let Some(stream) = self.conns.get_mut(conn)
         {
-            for line in lines.lines(bytes, |_| true) {
+            lines.lines(bytes, |_| true, |line| {
                 let _ = stream.write_all(format!("{line}\n").as_bytes());
-            }
+            });
         }
         // Through the Relay, every line goes as one data message.
         if let (Some(lines), Some(relay)) = (&mut self.relay_peer, &self.relay) {
-            for line in lines.lines(bytes, |_| true) {
-                let _ = relay.send(relay_box::data(&line));
-            }
+            lines.lines(bytes, |_| true, |line| {
+                let _ = relay.send(relay_box::data(line));
+            });
         }
     }
 
