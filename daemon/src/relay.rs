@@ -414,9 +414,10 @@ where
                                             memory.learned(&noise.box_key);
                                         }
                                         // A new session is a new start, as on a new cable connection: hello first,
-                                        // then whatever waited for it.
+                                        // then whatever waited for it, less a hello of its own.
                                         let mut failed = false;
-                                        for line in std::iter::once(hello.clone()).chain(held.drain(..)) {
+                                        let waited: Vec<String> = held.drain(..).filter(|line| *line != hello).collect();
+                                        for line in std::iter::once(hello.clone()).chain(waited) {
                                             let sent = match session.seal(line.as_bytes()) {
                                                 Ok(sealed) => sink.send(data(&sealed)).await.is_ok(),
                                                 Err(_) => false,
