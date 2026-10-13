@@ -187,10 +187,19 @@ async fn connection(mut controller: WifiController<'static>) {
                 }
             }
             embassy_futures::select::Either::First(Err(error)) => {
-                line(alloc::format!("WIFI FAILED {error:?}"));
+                // The driver's reason alone (`AuthenticationExpired`, `NoAccessPointFound`): the daemon tells the
+                // user what it means.
+                match error {
+                    esp_radio::wifi::ConnectionError::Failed(info) => line(alloc::format!("WIFI FAILED {:?}", info.reason)),
+                    error => line(alloc::format!("WIFI FAILED {error:?}")),
+                }
                 report_scan(&mut controller).await;
             }
             embassy_futures::select::Either::Second(next) => {
+                // Dropping the wait doesn't stop the driver's attempt, and the driver refuses a new config while it
+                // is still connecting: a wrong password keeps it at that for over 10 s, so a quick second Join
+                // failed with `config`.
+                let _ = controller.disconnect_async().await;
                 wanted = next;
                 continue;
             }

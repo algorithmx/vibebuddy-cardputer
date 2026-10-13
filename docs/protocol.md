@@ -154,6 +154,8 @@ The apps set it through `POST /v1/device/wifi` with `{"ssid", "password"}` and `
 
 Replies: `WIFI NETWORK <ssid>`, `WIFI FORGOTTEN`, `WIFI INVALID` (an empty name, a name over 32 bytes, or a password over 63), or `WIFI UNAVAILABLE` (no `link` partition).
 
+Once joined it reports `WIFI ADDRESS <ip>`, and repeats it after `WIFI NETWORK` in answer to hello, so a computer that connects later learns it too; the daemon also takes the address it reached the box at over the local network. While it tries, the box reports `WIFI CONNECTING <ssid>`, then `WIFI CONNECTED` or `WIFI FAILED <why>`, and tries again every 10 s until the network changes. `<why>` is the Wi-Fi driver's disconnect reason (`AuthenticationExpired`, `NoAccessPointFound`, …), or `password` / `ssid` when the box can't use them as given. A wrong password usually takes 10 to 15 s to fail: the network repeats the handshake before turning the box away. The daemon turns `<why>` into `device.wifi_error` for the apps to explain: `wrong_password` (the network turned the box away; `AuthenticationExpired`, `AuthenticationFailed`, `FourWayHandshakeTimeout`, `HandshakeTimeout`, `MicFailure`), `not_found` (`NoAccessPointFound`, `BeaconTimeout`), `security` (no WPA2 or open network by that name), `password`, `ssid`, or the reason as it came. Joining again clears it.
+
 ## Relay
 
 Set only over USB, like Wi-Fi: the Relay the box connects to (docs/relay-protocol.md, "Which Relay"). The daemon sends it on every USB link, so a development build and its box use the staging Relay and a release and its box use production.

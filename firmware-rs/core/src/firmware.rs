@@ -135,6 +135,8 @@ pub struct Firmware {
     relay_changed: bool,
     /// The box is on its Wi-Fi network, as the device layer reports.
     wifi_joined: bool,
+    /// The address the box has on Wi-Fi while joined, repeated in answer to hello.
+    wifi_address: Option<alloc::string::String>,
     /// The Relay has welcomed the box on the socket that is open now.
     relay_up: bool,
     /// The computer on the cable asked which networks the box can hear.
@@ -259,6 +261,7 @@ impl Firmware {
             wifi_changed: false,
             relay_changed: false,
             wifi_joined: false,
+            wifi_address: None,
             relay_up: false,
             scan_requested: false,
             cable_key: None,
@@ -472,6 +475,15 @@ impl Firmware {
     /// The device layer joined the Wi-Fi network or lost it; shown in the menu's NETWORK view.
     pub fn set_wifi_joined(&mut self, joined: bool) {
         self.wifi_joined = joined;
+        if !joined {
+            self.wifi_address = None;
+        }
+    }
+
+    /// The device layer got an address on Wi-Fi (its `WIFI ADDRESS` line). The box reports that line once, as the
+    /// network comes up; a computer that connects later (or a daemon that restarted) learns it from hello.
+    pub fn set_wifi_address(&mut self, address: &str) {
+        self.wifi_address = Some(alloc::string::String::from(address));
     }
 
     /// The Relay welcomed the box, or its socket closed; shown in the menu's NETWORK view.
@@ -1340,6 +1352,9 @@ impl Firmware {
             // The network's name only; the password never leaves the box.
             if let Some(wifi) = &link.wifi {
                 Self::write_value_line(board, "WIFI NETWORK ", wifi.ssid.as_bytes());
+                if let Some(address) = &self.wifi_address {
+                    Self::write_value_line(board, "WIFI ADDRESS ", address.as_bytes());
+                }
             }
             Self::write_value_line(board, "RELAY URL ", self.relay_url().as_bytes());
         }
