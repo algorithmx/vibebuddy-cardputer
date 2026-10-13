@@ -46,6 +46,9 @@ pub enum NetEvent {
 pub static EVENTS: Channel<CriticalSectionRawMutex, NetEvent, 16> = Channel::new();
 /// The computer on the cable asked for the networks the box can hear.
 pub static SCAN: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// The address the box has on Wi-Fi, or None once it loses it; for the mDNS task. embassy-net keeps one waker for
+/// its state, so two tasks waiting on it at once keep waking each other: only [`address_task`] waits there.
+static ADDRESS: Signal<CriticalSectionRawMutex, Option<core::net::Ipv4Addr>> = Signal::new();
 /// The network to join, or None to leave Wi-Fi; signalled at boot and whenever the user changes it.
 pub static CREDENTIALS: Signal<CriticalSectionRawMutex, Option<(String, String)>> = Signal::new();
 
@@ -256,10 +259,16 @@ async fn mdns_task(stack: Stack<'static>, box_key: String) {
         service_subtypes: &[],
         txt_kvs: &txt,
     };
+    let mut address = None;
     loop {
-        stack.wait_config_up().await;
-        let Some(config) = stack.config_v4() else { continue };
-        let host = Host { hostname: &hostname, ipv4: config.address.address(), ipv6: Ipv6Addr::UNSPECIFIED, ttl: Ttl::from_secs(120) };
+        let ipv4 = match address.take() {
+            Some(ipv4) => ipv4,
+            None => match ADDRESS.wait().await {
+                Some(ipv4) => ipv4,
+                None => continue,
+            },
+        };
+        let host = Host { hostname: &hostname, ipv4, ipv6: Ipv6Addr::UNSPECIFIED, ttl: Ttl::from_secs(120) };
         let mut socket = match io::bind(&udp, io::IPV4_DEFAULT_SOCKET, Some(Ipv4Addr::UNSPECIFIED), None).await {
             Ok(socket) => socket,
             Err(error) => {
@@ -272,25 +281,30 @@ async fn mdns_task(stack: Stack<'static>, box_key: String) {
         let signal = embassy_sync::signal::Signal::<NoopRawMutex, ()>::new();
         let mdns = io::Mdns::new(Some(Ipv4Addr::UNSPECIFIED), None, recv, send, &recv_buf, &send_buf, Rng::new(), &signal);
         let answers = ServiceAnswers::new(&host, &service);
-        // Ends when the network goes down; the next address gets a fresh socket and announcement.
-        if let embassy_futures::select::Either::First(Err(error)) =
-            select(mdns.run(HostAnswersMdnsHandler::new(&answers)), stack.wait_config_down()).await
-        {
-            line(alloc::format!("MDNS FAILED {error:?}"));
-            Timer::after(Duration::from_secs(10)).await;
+        // Ends when the address changes or goes; the next address gets a fresh socket and announcement.
+        match select(mdns.run(HostAnswersMdnsHandler::new(&answers)), ADDRESS.wait()).await {
+            embassy_futures::select::Either::First(Err(error)) => {
+                line(alloc::format!("MDNS FAILED {error:?}"));
+                Timer::after(Duration::from_secs(10)).await;
+            }
+            embassy_futures::select::Either::First(Ok(())) => {}
+            embassy_futures::select::Either::Second(next) => address = next,
         }
     }
 }
 
-/// Reports the address each time the network comes up, so the computer on the cable can find the box.
+/// Reports the address each time the network comes up, so the computer on the cable can find the box, and hands it
+/// to the mDNS task.
 #[embassy_executor::task]
 async fn address_task(stack: Stack<'static>) {
     loop {
         stack.wait_config_up().await;
         if let Some(config) = stack.config_v4() {
             line(alloc::format!("WIFI ADDRESS {}", config.address.address()));
+            ADDRESS.signal(Some(config.address.address()));
         }
         stack.wait_config_down().await;
+        ADDRESS.signal(None);
     }
 }
 
