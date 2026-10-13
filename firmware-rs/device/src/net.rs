@@ -183,7 +183,12 @@ async fn connection(mut controller: WifiController<'static>) {
                 }
             }
             embassy_futures::select::Either::First(Err(error)) => {
-                line(alloc::format!("WIFI FAILED {error:?}"));
+                // The driver's reason alone (`AuthenticationExpired`, `NoAccessPointFound`): the daemon tells the
+                // user what it means.
+                match error {
+                    esp_radio::wifi::ConnectionError::Failed(info) => line(alloc::format!("WIFI FAILED {:?}", info.reason)),
+                    error => line(alloc::format!("WIFI FAILED {error:?}")),
+                }
                 report_scan(&mut controller).await;
             }
             embassy_futures::select::Either::Second(next) => {
