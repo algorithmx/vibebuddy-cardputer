@@ -102,7 +102,12 @@ impl RelayBox {
                     out.extend(self.opener_line(firmware));
                 }
             }
-            Some("unlinked") => self.gone(firmware, board),
+            // Only the computer's link ended, and its session with it; the socket stays up and the box keeps reporting.
+            Some("unlinked") => {
+                firmware.relay_linked(board.now_ms(), None);
+                self.end_session(board);
+                self.computer = None;
+            }
             Some("data") => {
                 let Some(line) = value["line"].as_str() else { return out };
                 if let Some(opener) = &mut self.opener {

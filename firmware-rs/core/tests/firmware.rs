@@ -1188,6 +1188,35 @@ mod relay {
     }
 
     #[test]
+    fn unlinked_ends_only_the_computers_link() {
+        // `unlinked` ends the link through the Relay, not the socket: the box keeps reporting and the Relay stays up.
+        use vibebuddy_firmware_core::display::Tone;
+        use vibebuddy_firmware_core::menu::View;
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{COMPUTER}","name":"a"}}"#));
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.set","ssid":"Home","password":"secret"}"#);
+        let mut relay = RelayBox::new();
+        relay.hello(&firmware, "n");
+        relay.message(&mut firmware, &mut board, &json!({"t": "welcome"}));
+        relay.report(&firmware, board.now_ms());
+        board.advance(USB_QUIET_MS);
+        relay.report(&firmware, board.now_ms());
+        relay.message(&mut firmware, &mut board, &json!({"t": "linked", "computer": COMPUTER}));
+
+        relay.message(&mut firmware, &mut board, &json!({"t": "unlinked", "reason": "takeover"}));
+        assert!(!relay.has_peer());
+        let relay_line = |firmware: &Firmware| firmware.menu_panel(View::Network, board.now_ms()).lines[2].clone();
+        assert_eq!(relay_line(&firmware), (b"RELAY".to_vec(), b"PROD".to_vec(), Tone::Plain), "the socket is still up");
+
+        let other = link::encode(&[3; 32]);
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{other}","name":"b"}}"#));
+        let reports: Vec<Value> = relay.report(&firmware, board.now_ms()).iter().map(|text| parse(text)).collect();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert_eq!(reports[0]["t"], "paired");
+        assert_eq!(reports[1], json!({"t": "linked", "via": "usb", "computer": other}));
+    }
+
+    #[test]
     fn pairing_over_the_relay_is_refused() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{}","name":"b"}}"#, computer_key()));
