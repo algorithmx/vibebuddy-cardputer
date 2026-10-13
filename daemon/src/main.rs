@@ -1017,6 +1017,8 @@ async fn post_firmware(
 /// deadline: a stale `replug` would keep the app's onboarding from ever showing the box as found, however late it boots.
 /// How long a box updated over the link may take to come back: restart, Wi-Fi, and the daemon finding it again.
 const OTA_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Long enough for an image that fails before confirming itself to restart and be rolled back (seen on a box: about 2 s).
+const OTA_SETTLE: Duration = Duration::from_secs(8);
 
 /// Sends the app image over the link (ADR-0016), then waits for the box to come back on it. Success is the box
 /// reporting its build again without `FIRMWARE ROLLED BACK`.
@@ -1054,7 +1056,14 @@ async fn update_over_the_link(state: AppState, segments: Vec<rom_flasher::Segmen
             task_state.set_operation(firmware(OperationState::Failed, 0.0, "the box didn't come back after the update")).await;
             return;
         }
-        // The box reports a rollback right after its build, in the same answer to hello.
+        // On the cable the new image reports its build before it confirms itself; one that fails in between restarts
+        // at once, and the bootloader goes back. Over the network the box is reached only after it confirmed. So the
+        // answer that counts is the one after a short wait, and the rollback comes right after its build.
+        tokio::time::sleep(OTA_SETTLE).await;
+        if !wait_for_firmware_build(&task_state, OTA_BOOT_TIMEOUT).await {
+            task_state.set_operation(firmware(OperationState::Failed, 0.0, "the box didn't come back after the update")).await;
+            return;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         if task_state.device.lock().await.rolled_back {
             warn!("the new firmware didn't confirm itself; the box went back");
