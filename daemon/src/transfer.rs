@@ -17,9 +17,14 @@ use crate::voice_writer::send;
 
 /// Image bytes per chunk: as base64 inside its line about 4.2 KB, under the box's 4608.
 pub const CHUNK_BYTES: usize = 3072;
-/// Chunks sent ahead of the acknowledgements: enough to keep the Relay busy at 130-250 ms a round trip, while
-/// staying under its 50 messages a second.
-const WINDOW: usize = 4;
+/// Chunks sent ahead of the acknowledgements: enough to keep the Relay busy at 130-250 ms a round trip and the box
+/// writing; [`PACE`] keeps the rate down.
+const WINDOW: usize = 16;
+/// At most one chunk this often, 40 a second: under the Relay's 50 messages a second for good, with room for the
+/// heartbeat (docs/relay-protocol.md). About 120 KB/s, more than the box takes over any link.
+const PACE: Duration = Duration::from_millis(25);
+/// The box erases what the image needs before it answers `xfer.begin`: up to 4 MB, a block per main-loop pass.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// No answer to a chunk for this long means it went missing: ask where the box got to.
 const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// The box reads 4 MB back to check it before it answers `xfer.end`.
@@ -110,15 +115,18 @@ async fn send_from_box(
 ) -> Result<(), Stop> {
     send(transport, begin_event(image.len(), sha256)).await.map_err(|_| Stop::Resume)?;
     let mut acked = loop {
-        if let (name, Some(offset)) = answer(bus, STEP_TIMEOUT).await?
+        if let (name, Some(offset)) = answer(bus, READY_TIMEOUT).await?
             && name == "xfer.ready"
         {
             break offset;
         }
     };
     let mut next = acked;
+    let mut pace = tokio::time::interval(PACE);
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while acked < image.len() {
         while next < image.len() && next < acked + WINDOW * CHUNK_BYTES {
+            pace.tick().await;
             let end = (next + CHUNK_BYTES).min(image.len());
             send(transport, chunk_event(next, &image[next..end])).await.map_err(|_| Stop::Resume)?;
             next = end;

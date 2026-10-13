@@ -592,6 +592,12 @@ impl Firmware {
     }
 
     pub fn poll<B: Board>(&mut self, board: &mut B) {
+        // A firmware transfer erases its slot one block per pass, so the network and the screen keep running.
+        match self.transfer.erase_step(board.flash()) {
+            Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+            Ok(None) => {}
+            Err(failure) => Self::transfer_error(board, failure),
+        }
         let now = board.now_ms();
         let outputs = self.lan.poll(now);
         self.apply_lan(board, outputs);
@@ -1550,7 +1556,9 @@ impl Firmware {
                     return Self::transfer_error(board, transfer::Error::BadMessage);
                 };
                 match self.transfer.begin(board.flash(), kind, size as u32, sha256) {
-                    Ok(offset) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+                    Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+                    // Erasing first; poll answers once it is done.
+                    Ok(None) => {}
                     Err(failure) => Self::transfer_error(board, failure),
                 }
             }

@@ -1266,6 +1266,19 @@ mod transfer {
         serde_json::from_str(lines.last().unwrap()).unwrap()
     }
 
+    /// Sends xfer.begin and runs the main loop until the box answers: it erases the slot first.
+    fn begin_transfer(firmware: &mut Firmware, board: &mut FakeBoard, line: &str) -> Value {
+        let mut lines = send(firmware, board, line);
+        let mut passes = 0;
+        while !lines.iter().any(|line| line.contains("xfer.")) {
+            firmware.poll(board);
+            lines = board.take_lines();
+            passes += 1;
+            assert!(passes < 100, "no answer to xfer.begin");
+        }
+        reply(&lines)
+    }
+
     #[test]
     fn a_firmware_image_comes_over_the_link_and_the_box_restarts_into_it() {
         let (mut firmware, mut board, _) = booted(blank_flash());
@@ -1274,7 +1287,7 @@ mod transfer {
         image[12..14].copy_from_slice(&[9, 0]);
         let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len());
-        assert_eq!(reply(&send(&mut firmware, &mut board, &begin)), serde_json::json!({"version": 1, "event": "xfer.ready", "offset": 0}));
+        assert_eq!(begin_transfer(&mut firmware, &mut board, &begin), serde_json::json!({"version": 1, "event": "xfer.ready", "offset": 0}));
         for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
             let line = format!(
                 r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#,
@@ -1300,7 +1313,7 @@ mod transfer {
         image[0] = 0xE9;
         image[12..14].copy_from_slice(&[9, 0]);
         let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
-        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len()));
+        begin_transfer(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len()));
         let piece = &image[..CHUNK_BYTES];
         let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, piece), base64(piece));
         assert_eq!(reply(&send(&mut firmware, &mut board, &line))["offset"], CHUNK_BYTES as u64);
@@ -1310,7 +1323,7 @@ mod transfer {
     fn a_bad_chunk_ends_the_transfer_with_its_reason() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
-        send(&mut firmware, &mut board, &begin);
+        begin_transfer(&mut firmware, &mut board, &begin);
         let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&[0xE9; 100]));
         assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "crc"}));
         assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sequence");

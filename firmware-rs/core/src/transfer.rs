@@ -1,8 +1,10 @@
 //! Receiving a firmware image over any link, in chunks, resumably (ADR-0016). The computer sends
-//! `xfer.begin` with the image's size and SHA-256, then `xfer.chunk`s of at most [`CHUNK_BYTES`] with up to
-//! four unacknowledged, then `xfer.end`. The box writes the OTA slot it isn't running from, erasing one sector
-//! ahead of the writes, and acknowledges each chunk with the next offset it expects; a chunk at any other offset
-//! is acknowledged with that offset again, since every way of carrying a link delivers in order and a chunk only
+//! `xfer.begin` with the image's size and SHA-256, then `xfer.chunk`s of at most [`CHUNK_BYTES`], several
+//! unacknowledged, then `xfer.end`. The box erases what the image needs in the OTA slot it isn't running from,
+//! one 64 KB block per main-loop pass, before it answers `xfer.ready`: while chunks arrive it only writes, since an
+//! erase stops interrupts long enough to lose bytes on the UART bridge, and block erases are far faster than
+//! sector ones. It acknowledges each chunk with the next offset it expects; a chunk at any other offset is
+//! acknowledged with that offset again, since every way of carrying a link delivers in order and a chunk only
 //! goes missing when the link drops.
 //!
 //! What has been written is kept in memory, so an `xfer.begin` for the same image, over any way of carrying the
@@ -13,6 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::ota;
 use crate::storage::{Flash, Region, SECTOR_BYTES, find_partition};
+
+/// What one erase step covers: a flash block, erased with one command.
+const ERASE_STEP: u32 = 64 * 1024;
 use crate::voice_pack::crc32;
 
 /// Most image bytes in one chunk: as base64 inside its line, about 4.2 KB.
@@ -59,7 +64,7 @@ struct Image {
     target: Region,
     /// Bytes of the image written so far.
     next: u32,
-    /// Flash erased up to here, absolute.
+    /// Flash erased up to here, absolute; chunks are taken once it reaches [`Image::erase_end`].
     erased_until: u32,
 }
 
@@ -72,6 +77,17 @@ pub struct Transfer {
 /// An ESP32-S3 app image starts with the magic 0xE9, and its extended header names the chip, 9 for the S3.
 fn is_esp32s3_image(first: &[u8]) -> bool {
     first.len() >= 14 && first[0] == 0xE9 && first[12..14] == [9, 0]
+}
+
+impl Image {
+    /// Where erasing stops: the image's end, rounded up to a whole block within the slot.
+    fn erase_end(&self) -> u32 {
+        (self.target.offset + self.size).next_multiple_of(ERASE_STEP).min(self.target.offset + self.target.size)
+    }
+
+    fn erased(&self) -> bool {
+        self.erased_until >= self.erase_end()
+    }
 }
 
 impl Transfer {
@@ -88,14 +104,15 @@ impl Transfer {
         self.image.as_ref().map(|image| (u64::from(image.next) * 100 / u64::from(image.size.max(1))) as u8)
     }
 
-    /// Starts a transfer, or resumes the same one; returns the offset to send from.
-    pub fn begin(&mut self, flash: &mut dyn Flash, kind: &str, size: u32, sha256: [u8; 32]) -> Result<u32, Error> {
+    /// Starts a transfer, or resumes the same one. Returns the offset to send from once the slot is erased for it;
+    /// None while erasing, and [`Self::erase_step`] gives the offset when done.
+    pub fn begin(&mut self, flash: &mut dyn Flash, kind: &str, size: u32, sha256: [u8; 32]) -> Result<Option<u32>, Error> {
         if let Some(image) = &self.image
             && image.size == size
             && image.sha256 == sha256
             && kind == "firmware"
         {
-            return Ok(image.next);
+            return Ok(image.erased().then_some(image.next));
         }
         self.image = None;
         if kind != "firmware" {
@@ -112,7 +129,23 @@ impl Transfer {
             return Err(Error::TooBig);
         }
         self.image = Some(Image { size, sha256, slot, target, next: 0, erased_until: target.offset });
-        Ok(0)
+        Ok(None)
+    }
+
+    /// Erases the next block while a transfer is starting; the offset to send from once the last one is done.
+    /// Called once per main-loop pass, so the network and the screen run between blocks.
+    pub fn erase_step(&mut self, flash: &mut dyn Flash) -> Result<Option<u32>, Error> {
+        let Some(image) = self.image.as_mut() else { return Ok(None) };
+        if image.erased() {
+            return Ok(None);
+        }
+        let end = (image.erased_until + ERASE_STEP).min(image.erase_end());
+        if flash.erase(image.erased_until, end).is_err() {
+            self.image = None;
+            return Err(Error::Flash);
+        }
+        image.erased_until = end;
+        Ok(image.erased().then_some(image.next))
     }
 
     /// One chunk at `offset`; returns the offset expected next. An error ends the transfer.
@@ -126,6 +159,9 @@ impl Transfer {
 
     fn write(&mut self, flash: &mut dyn Flash, offset: u32, data: &[u8], crc: u32) -> Result<u32, Error> {
         let image = self.image.as_mut().ok_or(Error::Sequence)?;
+        if !image.erased() {
+            return Err(Error::Sequence);
+        }
         if offset != image.next {
             return Ok(image.next);
         }
@@ -140,11 +176,6 @@ impl Transfer {
             return Err(Error::TooBig);
         }
         let at = image.target.offset + offset;
-        // One sector at a time, as the writes reach it: the main loop stalls for each erase.
-        while image.erased_until < at + data.len() as u32 {
-            flash.erase(image.erased_until, image.erased_until + SECTOR_BYTES).map_err(|_| Error::Flash)?;
-            image.erased_until += SECTOR_BYTES;
-        }
         // Flash writes go in whole words; the last chunk is padded with what erased flash holds anyway.
         let mut padded = [0xFFu8; CHUNK_BYTES];
         padded[..data.len()].copy_from_slice(data);
@@ -223,6 +254,18 @@ mod tests {
         Sha256::digest(data).into()
     }
 
+    /// Begins and erases, as the main loop would; returns the offset to send from.
+    fn start(transfer: &mut Transfer, flash: &mut MemoryFlash, image: &[u8], sha256: [u8; 32]) -> u32 {
+        if let Some(offset) = transfer.begin(flash, "firmware", image.len() as u32, sha256).unwrap() {
+            return offset;
+        }
+        loop {
+            if let Some(offset) = transfer.erase_step(flash).unwrap() {
+                return offset;
+            }
+        }
+    }
+
     fn send(transfer: &mut Transfer, flash: &mut MemoryFlash, image: &[u8], from: u32) -> u32 {
         let mut next = from;
         while (next as usize) < image.len() {
@@ -238,7 +281,13 @@ mod tests {
         let mut flash = flash();
         let image = test_image(10_000);
         let mut transfer = Transfer::new();
-        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(0));
+        flash.bytes[0x610000..0x620000].fill(0);
+        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(None), "erasing first");
+        let first = &image[..CHUNK_BYTES];
+        assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Err(Error::Sequence), "no chunks before ready");
+        transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)).unwrap();
+        assert_eq!(start(&mut transfer, &mut flash, &image, sha(&image)), 0);
+        assert!(flash.bytes[0x610000..0x620000].iter().all(|&byte| byte == 0xFF), "the block it needs is erased");
         assert_eq!(send(&mut transfer, &mut flash, &image, 0), 10_000);
         assert_eq!(transfer.percent(), Some(100));
         transfer.end(&mut flash).unwrap();
@@ -253,11 +302,11 @@ mod tests {
         let mut flash = flash();
         let image = test_image(10_000);
         let mut transfer = Transfer::new();
-        transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)).unwrap();
+        start(&mut transfer, &mut flash, &image, sha(&image));
         let first = &image[..CHUNK_BYTES];
         assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Ok(CHUNK_BYTES as u32));
-        // The link dropped and came back, perhaps another way: the same image carries on.
-        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(CHUNK_BYTES as u32));
+        // The link dropped and came back, perhaps another way: the same image carries on, with no erasing.
+        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(Some(CHUNK_BYTES as u32)));
         // A chunk sent twice, or one ahead of a lost one, gets the expected offset again.
         assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Ok(CHUNK_BYTES as u32));
         let later = &image[2 * CHUNK_BYTES..3 * CHUNK_BYTES];
@@ -267,7 +316,7 @@ mod tests {
 
         // Another image starts over.
         let other = test_image(5_000);
-        assert_eq!(transfer.begin(&mut flash, "firmware", other.len() as u32, sha(&other)), Ok(0));
+        assert_eq!(start(&mut transfer, &mut flash, &other, sha(&other)), 0);
     }
 
     #[test]
@@ -278,15 +327,15 @@ mod tests {
 
         let mut not_ours = test_image(4_000);
         not_ours[12] = 2;
-        transfer.begin(&mut flash, "firmware", 4_000, sha(&not_ours)).unwrap();
+        start(&mut transfer, &mut flash, &not_ours, sha(&not_ours));
         assert_eq!(transfer.chunk(&mut flash, 0, &not_ours[..CHUNK_BYTES], crc(&not_ours[..CHUNK_BYTES])), Err(Error::BadImage));
         assert!(!transfer.active());
 
         let image = test_image(4_000);
-        transfer.begin(&mut flash, "firmware", 4_000, sha(&image)).unwrap();
+        start(&mut transfer, &mut flash, &image, sha(&image));
         assert_eq!(transfer.chunk(&mut flash, 0, &image[..CHUNK_BYTES], 1), Err(Error::Crc));
 
-        transfer.begin(&mut flash, "firmware", 4_000, [0; 32]).unwrap();
+        start(&mut transfer, &mut flash, &image, [0; 32]);
         send(&mut transfer, &mut flash, &image, 0);
         assert_eq!(transfer.end(&mut flash), Err(Error::Sha256));
         assert_eq!(ota::running_slot(&mut flash, otadata), Ok(0));
