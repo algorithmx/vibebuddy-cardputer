@@ -135,6 +135,10 @@ impl DeviceState {
             DeviceMessage::ConnectedNetwork { address } => {
                 self.apply(&DeviceMessage::Connected { port: address.clone(), bridge: false, usb_serial: None });
                 self.network = true;
+                // Reached over Wi-Fi, so that is its address there, even from firmware that doesn't repeat it in answer to hello.
+                if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+                    self.wifi_address = Some(socket.ip().to_string());
+                }
             }
             DeviceMessage::ConnectedRelay { url } => {
                 self.apply(&DeviceMessage::Connected { port: url.clone(), bridge: false, usb_serial: None });
@@ -199,7 +203,7 @@ impl DeviceState {
                     // Another network: the address and any failure were the old one's. The same name comes again
                     // with every hello and changes nothing.
                     let network = network.trim();
-                    if self.wifi_network.as_deref() != Some(network) {
+                    if self.wifi_network.as_deref().is_some_and(|old| old != network) {
                         self.wifi_address = None;
                         self.wifi_error = None;
                     }
@@ -474,6 +478,14 @@ mod tests {
         state.apply(&line("WIFI ADDRESS 10.0.0.7"));
         state.apply(&line("WIFI DISCONNECTED"));
         assert_eq!(state.wifi_address, None);
+    }
+
+    #[test]
+    fn a_box_reached_over_the_local_network_is_joined_there() {
+        let mut state = DeviceState::default();
+        state.apply(&DeviceMessage::ConnectedNetwork { address: "192.168.1.160:7340".to_owned() });
+        state.apply(&line("WIFI NETWORK Home"));
+        assert_eq!(state.wifi_address.as_deref(), Some("192.168.1.160"));
     }
 
     #[test]
