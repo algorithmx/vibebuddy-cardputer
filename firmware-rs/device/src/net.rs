@@ -192,6 +192,10 @@ async fn connection(mut controller: WifiController<'static>) {
                 report_scan(&mut controller).await;
             }
             embassy_futures::select::Either::Second(next) => {
+                // Dropping the wait doesn't stop the driver's attempt, and the driver refuses a new config while it
+                // is still connecting: a wrong password keeps it at that for over 10 s, so a quick second Join
+                // failed with `config`.
+                let _ = controller.disconnect_async().await;
                 wanted = next;
                 continue;
             }
