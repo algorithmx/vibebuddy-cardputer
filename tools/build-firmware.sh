@@ -9,11 +9,18 @@
 # None of them touches the settings area at 0x9000 or the voices partition at 0x410000.
 #
 # FAST_CLOCK=1 builds the time-compressed acceptance firmware (five minutes of leisure become five seconds).
+# BOARD=cardputer-adv builds for the M5Stack Cardputer-Adv (8 MB flash, no PSRAM) into firmware-rs/device/build-cardputer-adv,
+# with firmware/partitions-cardputer-adv.csv. The default is the box.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 device="${repo_root}/firmware-rs/device"
-out="${device}/build"
+board="${BOARD:-box}"
+case "${board}" in
+    box) out="${device}/build"; partitions="firmware/partitions.csv"; flash_size="16mb"; board_features=(--no-default-features --features board-box) ;;
+    cardputer-adv) out="${device}/build-cardputer-adv"; partitions="firmware/partitions-cardputer-adv.csv"; flash_size="8mb"; board_features=(--no-default-features --features board-cardputer-adv) ;;
+    *) echo "BOARD must be box or cardputer-adv, not '${board}'" >&2; exit 2 ;;
+esac
 
 if ! command -v xtensa-esp32s3-elf-gcc >/dev/null 2>&1 && [[ -f "${HOME}/export-esp.sh" ]]; then
     # shellcheck disable=SC1091
@@ -23,16 +30,23 @@ features=()
 if [[ "${FAST_CLOCK:-0}" == "1" ]]; then
     features=(--features fast-clock)
 fi
-(cd "${device}" && cargo build --release ${features[@]+"${features[@]}"})
-elf="${device}/target/xtensa-esp32s3-none-elf/release/vibebuddy-firmware"
+(cd "${device}" && cargo build --release "${board_features[@]}" ${features[@]+"${features[@]}"})
+# The target directory comes from cargo, so a machine-wide target-dir setting (~/.cargo/config.toml) still finds the image.
+target_dir="$(cd "${device}" && cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+elf="${target_dir}/xtensa-esp32s3-none-elf/release/vibebuddy-firmware"
 
 mkdir -p "${out}"
 # The ESP-IDF bootloader with app rollback enabled (ADR-0013), prebuilt by tools/build-bootloader.sh.
-cp "${repo_root}/firmware-rs/bootloader/bootloader.bin" "${out}/bootloader.bin"
-# --flash-size writes 16 MB into the app's image header, matching the bootloader's.
-espflash save-image -S --chip esp32s3 --flash-size 16mb "${elf}" "${out}/vibebuddy-fw.bin"
+# The Cardputer-Adv has its own 8 MB bootloader (tools/build-bootloader.sh BOARD=cardputer-adv).
+bootloader="${repo_root}/firmware-rs/bootloader/bootloader.bin"
+if [[ "${board}" == "cardputer-adv" ]]; then
+    bootloader="${repo_root}/firmware-rs/bootloader/bootloader-cardputer-adv.bin"
+fi
+cp "${bootloader}" "${out}/bootloader.bin"
+# --flash-size writes the board's flash size into the app's image header, matching the bootloader's.
+espflash save-image -S --chip esp32s3 --flash-size "${flash_size}" "${elf}" "${out}/vibebuddy-fw.bin"
 # espflash can't parse a partition table with a custom subtype (voices is 0x40), so we build it ourselves.
-python3 "${repo_root}/tools/make-partition-table.py" "${repo_root}/firmware/partitions.csv" "${out}/partition-table.bin" >/dev/null
+python3 "${repo_root}/tools/make-partition-table.py" "${repo_root}/${partitions}" "${out}/partition-table.bin" >/dev/null
 
 python3 - "${out}" <<'PY'
 import sys
