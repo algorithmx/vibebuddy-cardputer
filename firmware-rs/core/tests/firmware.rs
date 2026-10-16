@@ -5,6 +5,7 @@
 use std::cell::Cell;
 
 use vibebuddy_firmware_core::audio::{Codec, Prompt, Sound};
+use vibebuddy_firmware_core::board::{PANEL_HEIGHT, PANEL_WIDTH};
 use vibebuddy_firmware_core::buttons::Levels;
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
@@ -506,14 +507,14 @@ fn silence_means_the_link_is_lost() {
 fn a_screenshot_is_run_length_encoded() {
     let (mut firmware, mut board, _) = booted(blank_flash());
     let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.screenshot"}"#);
-    assert_eq!(lines.first().map(String::as_str), Some("SHOT BEGIN 320x240 BACKLIGHT ON"));
+    assert_eq!(lines.first().map(String::as_str), Some(shot_begin_on().as_str()));
     assert_eq!(lines.last().map(String::as_str), Some("SHOT END"));
     let pixels: usize = lines[1..lines.len() - 1]
         .iter()
         .flat_map(|line| line.split(' ').skip(1))
         .map(|run| run.split(':').nth(1).unwrap().parse::<usize>().unwrap())
         .sum();
-    assert_eq!(pixels, 320 * 240);
+    assert_eq!(pixels, PANEL_WIDTH as usize * PANEL_HEIGHT as usize);
 }
 
 /// Polls every 10 ms until `SHOT END`, returning each `SHOT` line with the time it went out.
@@ -550,8 +551,8 @@ fn a_screenshot_over_the_relay_is_sent_a_line_at_a_time() {
     firmware.relay_line(&mut board, br#"{"version":1,"event":"device.screenshot"}"#);
     assert!(!board.take_lines().iter().any(|line| line.starts_with("SHOT")), "nothing at once");
     let shot = poll_screenshot(&mut firmware, &mut board);
-    assert_eq!(shot[0].1, "SHOT BEGIN 320x240 BACKLIGHT ON");
-    assert_eq!(shot_pixels(&shot).len(), 320 * 240);
+    assert_eq!(shot[0].1, shot_begin_on());
+    assert_eq!(shot_pixels(&shot).len(), PANEL_WIDTH as usize * PANEL_HEIGHT as usize);
 }
 
 #[test]
@@ -566,8 +567,8 @@ fn a_screenshot_waits_while_the_network_cannot_take_a_whole_line() {
     assert!(!board.take_lines().iter().any(|line| line.starts_with("SHOT")), "nothing dropped half-way");
     board.peer_full = false;
     let shot = poll_screenshot(&mut firmware, &mut board);
-    assert_eq!(shot[0].1, "SHOT BEGIN 320x240 BACKLIGHT ON");
-    assert_eq!(shot_pixels(&shot).len(), 320 * 240);
+    assert_eq!(shot[0].1, shot_begin_on());
+    assert_eq!(shot_pixels(&shot).len(), PANEL_WIDTH as usize * PANEL_HEIGHT as usize);
 }
 
 #[test]
@@ -956,7 +957,7 @@ mod lan {
         let (mut firmware, mut board) = paired_box();
         let mut sealer = link_up(&mut firmware, &mut board, 1);
         // No two neighbouring pixels alike: the most runs a frame can have.
-        let pattern: Vec<u16> = (0..320 * 240).map(|index| (index % 7) as u16 * 0x1111).collect();
+        let pattern: Vec<u16> = (0..PANEL_WIDTH as usize * PANEL_HEIGHT as usize).map(|index| (index % 7) as u16 * 0x1111).collect();
         for (index, color) in pattern.iter().enumerate() {
             board.frame[index * 2..index * 2 + 2].copy_from_slice(&color.to_be_bytes());
         }
@@ -1240,4 +1241,9 @@ mod relay {
         assert!(relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": first})).is_empty());
         assert!(!relay.has_peer());
     }
+}
+
+/// The first line of a screenshot with the backlight on, for the board this build is for.
+fn shot_begin_on() -> String {
+    format!("SHOT BEGIN {PANEL_WIDTH}x{PANEL_HEIGHT} BACKLIGHT ON")
 }

@@ -1,11 +1,12 @@
-//! A 320×240 RGB565 frame buffer and the most basic drawing: filled rectangles, thick lines, 5×7 bitmap text.
+//! An RGB565 frame buffer the size of the board's panel (`board.rs`) and the most basic drawing: filled
+//! rectangles, thick lines, 5×7 bitmap text.
 //!
 //! The buffer is in the byte order the panel wants: high byte first for each pixel. The C firmware stores
 //! little-endian u16 in memory and has the LCD driver swap bytes on send; here it is stored as it goes on
 //! the wire, so DMA can send it as is.
 
-pub const WIDTH: i32 = 320;
-pub const HEIGHT: i32 = 240;
+pub use crate::board::{PANEL_HEIGHT as HEIGHT, PANEL_WIDTH as WIDTH};
+
 pub const FRAME_BYTES: usize = (WIDTH * HEIGHT * 2) as usize;
 
 const LETTER_GLYPHS: [[u8; 7]; 26] = [
@@ -79,14 +80,44 @@ pub fn half_bright(color: u16) -> u16 {
     (color >> 1) & 0x7bef
 }
 
+/// Maps the design coordinates a screen is drawn in onto the panel: `x0 + x * num / den`, and likewise for y.
+/// Rectangles and lines shrink with it; text keeps its glyph size and only its position is mapped.
+/// [`View::IDENTITY`] leaves everything where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct View {
+    pub x: i32,
+    pub y: i32,
+    pub num: i32,
+    pub den: i32,
+}
+
+impl View {
+    pub const IDENTITY: View = View { x: 0, y: 0, num: 1, den: 1 };
+
+    fn point(&self, x: i32, y: i32) -> (i32, i32) {
+        (self.x + x * self.num / self.den, self.y + y * self.num / self.den)
+    }
+
+    /// A length in design pixels, at least one pixel if it was not empty.
+    fn length(&self, length: i32) -> i32 {
+        if length <= 0 { length } else { (length * self.num / self.den).max(1) }
+    }
+}
+
 pub struct Canvas<'a> {
     bytes: &'a mut [u8],
+    view: View,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(bytes: &'a mut [u8]) -> Self {
         assert!(bytes.len() >= FRAME_BYTES);
-        Self { bytes }
+        Self { bytes, view: View::IDENTITY }
+    }
+
+    /// From now on, drawing calls take design coordinates and draw them through `view`.
+    pub fn set_view(&mut self, view: View) {
+        self.view = view;
     }
 
     pub fn pixel(&self, index: usize) -> u16 {
@@ -94,6 +125,13 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn fill_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: u16) {
+        let (x, y) = self.view.point(x, y);
+        let (width, height) = (self.view.length(width), self.view.length(height));
+        self.fill_device(x, y, width, height, color);
+    }
+
+    /// Fills a rectangle given in panel pixels, clipped to the panel.
+    fn fill_device(&mut self, x: i32, y: i32, width: i32, height: i32, color: u16) {
         let x_start = x.max(0);
         let y_start = y.max(0);
         let x_end = (x + width).min(WIDTH);
@@ -136,8 +174,32 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draws byte by byte from (x, y), at most `max_characters`; stops at NUL.
+    /// Draws byte by byte from (x, y), at most `max_characters`; stops at NUL. The position goes through the view.
     pub fn draw_text(&mut self, x: i32, y: i32, text: &[u8], scale: i32, color: u16, max_characters: usize) {
+        let (x, y) = self.view.point(x, y);
+        self.draw_glyphs(x, y, text, scale, color, max_characters);
+    }
+
+    /// Centered across the panel. Only y goes through the view; the centering is on the panel itself.
+    pub fn draw_text_centered(&mut self, y: i32, text: &[u8], scale: i32, color: u16) {
+        let max_characters = (WIDTH / (6 * scale)) as usize;
+        let length = text.iter().take(max_characters).take_while(|&&byte| byte != 0).count() as i32;
+        let width = if length == 0 { 0 } else { (length * 6 - 1) * scale };
+        let (_, y) = self.view.point(0, y);
+        self.draw_glyphs((WIDTH - width) / 2, y, text, scale, color, max_characters);
+    }
+
+    /// Centered on `center_x` (panel pixels), at most `max_width` pixels wide; `y` goes through the view.
+    pub fn draw_text_centered_at(&mut self, center_x: i32, y: i32, text: &[u8], scale: i32, color: u16) {
+        let max_characters = (WIDTH / (6 * scale)) as usize;
+        let length = text.iter().take(max_characters).take_while(|&&byte| byte != 0).count() as i32;
+        let width = if length == 0 { 0 } else { (length * 6 - 1) * scale };
+        let (_, y) = self.view.point(0, y);
+        self.draw_glyphs(center_x - width / 2, y, text, scale, color, max_characters);
+    }
+
+    /// Glyphs in panel pixels: `scale` is the size of one glyph pixel on the panel.
+    fn draw_glyphs(&mut self, x: i32, y: i32, text: &[u8], scale: i32, color: u16, max_characters: usize) {
         for (index, &character) in text.iter().take(max_characters).enumerate() {
             if character == 0 {
                 break;
@@ -146,7 +208,7 @@ impl<'a> Canvas<'a> {
                 let bits = glyph_row(character, row);
                 for column in 0..5 {
                     if bits & (1 << (4 - column)) != 0 {
-                        self.fill_rect(
+                        self.fill_device(
                             x + index as i32 * 6 * scale + column * scale,
                             y + row as i32 * scale,
                             scale,
@@ -157,13 +219,6 @@ impl<'a> Canvas<'a> {
                 }
             }
         }
-    }
-
-    pub fn draw_text_centered(&mut self, y: i32, text: &[u8], scale: i32, color: u16) {
-        let max_characters = (WIDTH / (6 * scale)) as usize;
-        let length = text.iter().take(max_characters).take_while(|&&byte| byte != 0).count() as i32;
-        let width = if length == 0 { 0 } else { (length * 6 - 1) * scale };
-        self.draw_text((WIDTH - width) / 2, y, text, scale, color, max_characters);
     }
 
     /// Dims the whole frame for the sleepy phase: halves each component of every pixel.

@@ -8,6 +8,10 @@ license.workspace = true
 # storage formats, chip register sequences. no_std, compiled once for the device and once for the Mac;
 # `cargo test` on the Mac runs the whole chain.
 [features]
+# The board this build is for (src/board.rs). Exactly one is enabled; the box is the default.
+default = ["board-box"]
+board-box = []
+board-cardputer-adv = []
 # For on-device acceptance testing: squeezes leisure's five minutes into five seconds and the pomodoro's
 # 25 minutes into 25 seconds.
 fast-clock = []

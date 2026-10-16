@@ -4,6 +4,8 @@
 //! invert colors → set MADCTL/COLMOD again → swap_xy → mirror → display on. This lists the commands
 //! that sequence actually sends, in order, and the device layer sends them from the table.
 
+use crate::board::{PANEL_HEIGHT, PANEL_OFFSET_X, PANEL_OFFSET_Y, PANEL_WIDTH};
+
 /// One command: command byte, parameters, and milliseconds to wait after sending it.
 pub struct Command {
     pub command: u8,
@@ -36,10 +38,18 @@ pub const INIT_SEQUENCE: &[Command] = &[
     command(0x29, &[], 0),
 ];
 
-/// The window set before a full-frame flush: columns 0–319, rows 0–239. Then RAMWR (0x2C) plus the pixels.
-pub const WINDOW: [Command; 2] = [
-    command(0x2A, &[0x00, 0x00, 0x01, 0x3F], 0),
-    command(0x2B, &[0x00, 0x00, 0x00, 0xEF], 0),
-];
+/// Column and row range for a full-frame flush: the panel's visible area, shifted by the board's offsets.
+const COLUMNS: [u8; 4] = span(PANEL_OFFSET_X, PANEL_WIDTH);
+const ROWS: [u8; 4] = span(PANEL_OFFSET_Y, PANEL_HEIGHT);
+
+/// Big-endian start and end of `length` pixels that begin at `offset`.
+const fn span(offset: u16, length: i32) -> [u8; 4] {
+    let start = offset;
+    let end = offset + length as u16 - 1;
+    [(start >> 8) as u8, start as u8, (end >> 8) as u8, end as u8]
+}
+
+/// The window set before a full-frame flush. Then RAMWR (0x2C) plus the pixels.
+pub const WINDOW: [Command; 2] = [command(0x2A, &COLUMNS, 0), command(0x2B, &ROWS, 0)];
 
 pub const RAMWR: u8 = 0x2C;

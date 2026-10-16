@@ -14,11 +14,13 @@ pub mod text;
 
 pub mod adpcm;
 pub mod audio;
+pub mod board;
 pub mod buttons;
 pub mod canvas;
 pub mod character_pack;
 pub mod display;
 pub mod firmware;
+pub mod keymap;
 pub mod lan;
 pub mod lcd;
 pub mod leisure;

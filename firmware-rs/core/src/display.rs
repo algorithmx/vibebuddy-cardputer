@@ -8,7 +8,8 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::canvas::{Canvas, FRAME_BYTES, HEIGHT, WIDTH, half_bright};
+use crate::board;
+use crate::canvas::{Canvas, FRAME_BYTES, HEIGHT, View, WIDTH, half_bright};
 use crate::leisure::{self, Skit};
 use crate::look::{self, Look};
 use crate::pomodoro::{self, Phase, Run};
@@ -878,7 +879,7 @@ impl Display {
 
     /// While idle, rotate between the title and stats. The idle screen shows up most often, so a single fixed
     /// sentence is a waste. The pomodoro's daily record is kept by the device itself and goes into the rotation too.
-    fn draw_idle_line(&self, canvas: &mut Canvas, scene: &Scene) {
+    fn draw_idle_line(&self, canvas: &mut Canvas, scene: &Scene, y: i32) {
         let pomodoro = scene.pomodoro.view(scene.now_ms);
         let tally_line = format_tally(pomodoro.completed, pomodoro.focus_s);
         let mut lines: [&[u8]; 2 + MAX_STATS] = [&[]; 2 + MAX_STATS];
@@ -897,12 +898,12 @@ impl Display {
             count += 1;
         }
         if count == 0 {
-            canvas.draw_text_centered(195, b"YOUR VIBEBUDDY", 2, COLOR_MUTED);
+            canvas.draw_text_centered(y, b"YOUR VIBEBUDDY", 2, COLOR_MUTED);
             return;
         }
         let slot = (self.animation_frame / IDLE_ROTATE_FRAMES) as usize % count;
         let color = if has_title && slot == 0 { COLOR_TEXT } else { COLOR_MUTED };
-        canvas.draw_text_centered(195, lines[slot], 2, color);
+        canvas.draw_text_centered(y, lines[slot], 2, color);
     }
 
     /// Whether the alarm is still ringing. After the end, any change of view means the user acted: starting the
@@ -955,7 +956,68 @@ impl Display {
         }
     }
 
+    /// The compact pomodoro scene: the ring and countdown on the left, the phase, the controls, today's record
+    /// and the agent's status on the right. The ring is drawn through its view; the text is in panel pixels.
+    fn draw_pomodoro_compact(&mut self, canvas: &mut Canvas, scene: &Scene, label: &[u8], status_color: u16) {
+        let view = scene.pomodoro.view(scene.now_ms);
+        let color = phase_color(&view);
+        let paused = view.run == Run::Paused;
+        let alarm = self.ring_alarm_active(&view);
+        canvas.set_view(board::RING_VIEW);
+        self.draw_pomodoro_ring(canvas, &view, alarm);
+        canvas.set_view(View::IDENTITY);
+
+        if !paused || self.animation_frame.is_multiple_of(2) {
+            let countdown = format_countdown(view.remaining_ms);
+            canvas.draw_text(18 + self.ring_alarm_shift(), 68, countdown.as_bytes(), 3, COLOR_TEXT, 5);
+        }
+
+        const COLUMN: i32 = 128;
+        let phase_label: &[u8] = if view.is_idle() {
+            b"READY"
+        } else if view.phase == Phase::Break {
+            b"BREAK"
+        } else {
+            b"FOCUS"
+        };
+        // The column starts below the title bar, which runs down to y = 26.
+        canvas.draw_text(COLUMN, 30, phase_label, 2, color, 9);
+        if view.run == Run::Pending {
+            canvas.draw_text(COLUMN, 50, b"K0 START", 1, COLOR_MUTED, 18);
+            if !view.is_idle() {
+                canvas.draw_text(COLUMN, 60, b"HOLD K0 SKIP", 1, COLOR_MUTED, 18);
+            }
+        } else {
+            canvas.draw_text(COLUMN, 50, if paused { b"K0 RESUME" } else { b"K0 PAUSE" }, 1, COLOR_MUTED, 18);
+            canvas.draw_text(COLUMN, 60, b"HOLD K0 STOP", 1, COLOR_MUTED, 18);
+        }
+        if paused {
+            canvas.draw_text(COLUMN, 70, b"PAUSED", 2, color, 9);
+        }
+
+        canvas.draw_text(COLUMN, 88, b"TODAY", 1, COLOR_MUTED, 18);
+        let shown = view.completed.min(8);
+        for index in 0..shown as i32 {
+            canvas.fill_rect(COLUMN + index * 12, 98, 6, 6, COLOR_FOCUS);
+        }
+        if view.completed > 8 {
+            let more = text!(7, "+{}", (view.completed - 8) % 1000);
+            canvas.draw_text(COLUMN + 100, 98, more.as_bytes(), 1, COLOR_FOCUS, 8);
+        }
+        let tally_line = format_tally(view.completed, view.focus_s);
+        canvas.draw_text(COLUMN, 108, tally_line.as_bytes(), 1, if view.completed > 0 { COLOR_FOCUS } else { COLOR_MUTED }, 18);
+
+        canvas.draw_text(COLUMN, 118, label, 1, status_color, 18);
+        if let Some(task) = self.tasks.first() {
+            canvas.draw_text(COLUMN, 127, &task.title, 1, if self.link_lost { COLOR_MUTED } else { COLOR_TEXT }, 18);
+        }
+    }
+
     fn draw_pomodoro_scene(&mut self, canvas: &mut Canvas, scene: &Scene, label: &[u8], status_color: u16) {
+        if board::COMPACT {
+            self.draw_pomodoro_compact(canvas, scene, label, status_color);
+            return;
+        }
         let view = scene.pomodoro.view(scene.now_ms);
         let color = phase_color(&view);
         let paused = view.run == Run::Paused;
@@ -1082,34 +1144,52 @@ impl Display {
 
     fn draw_leisure_scene(&self, canvas: &mut Canvas, scene: &Scene, view: &leisure::View) {
         let frame = view.skit_frame;
+        // The skits are drawn in the pet's design space, so the compact panel draws them through the pet's view.
+        if board::COMPACT {
+            canvas.set_view(board::PET_VIEW);
+        }
         if let Some(look) = &self.look {
             self.draw_look_skit(canvas, look, view.skit, frame);
-            self.draw_pomodoro_badge(canvas, scene);
-            return;
+        } else {
+            match view.skit {
+                Skit::Patrol => skit_patrol(canvas, frame),
+                Skit::Ball => skit_ball(canvas, frame),
+                Skit::Read => skit_read(canvas, frame),
+                Skit::Stars => skit_stars(canvas, frame),
+                Skit::Hide => skit_hide(canvas, frame),
+                Skit::Startle => skit_startle(canvas, frame),
+                Skit::Dream => self.skit_dream(canvas, frame),
+                Skit::Sleep => skit_sleep(canvas, frame),
+                Skit::None => skit_rest(canvas, frame),
+            }
         }
-        match view.skit {
-            Skit::Patrol => skit_patrol(canvas, frame),
-            Skit::Ball => skit_ball(canvas, frame),
-            Skit::Read => skit_read(canvas, frame),
-            Skit::Stars => skit_stars(canvas, frame),
-            Skit::Hide => skit_hide(canvas, frame),
-            Skit::Startle => skit_startle(canvas, frame),
-            Skit::Dream => self.skit_dream(canvas, frame),
-            Skit::Sleep => skit_sleep(canvas, frame),
-            Skit::None => skit_rest(canvas, frame),
-        }
+        canvas.set_view(View::IDENTITY);
         self.draw_pomodoro_badge(canvas, scene);
     }
 
     fn draw_pet_scene(&self, canvas: &mut Canvas, scene: &Scene, label: &[u8], status_color: u16) {
         if !self.tasks.is_empty() {
-            self.draw_task_cards(canvas, scene.now_ms);
+            if board::COMPACT {
+                self.draw_task_cards_compact(canvas, scene.now_ms);
+            } else {
+                self.draw_task_cards(canvas, scene.now_ms);
+            }
         }
         let state = if self.link_lost { State::Offline } else { self.state };
-        let x_offset = if self.tasks.is_empty() { 0 } else { 96 };
+        // The compact panel moves the pet with its view instead.
+        let x_offset = if self.tasks.is_empty() || board::COMPACT { 0 } else { 96 };
+        if board::COMPACT {
+            canvas.set_view(if self.tasks.is_empty() { board::PET_VIEW } else { board::PET_VIEW_WITH_TASKS });
+        }
         match &self.look {
             Some(look) => draw_look_on_duty(canvas, look, state, self.animation_frame, LOOK_CENTER_X + x_offset, status_color),
             None => draw_buddy(canvas, state, self.animation_frame, x_offset, status_color),
+        }
+        canvas.set_view(View::IDENTITY);
+        if board::COMPACT {
+            self.draw_pet_text_compact(canvas, scene, label, status_color);
+            self.draw_pomodoro_badge(canvas, scene);
+            return;
         }
         // The third task card ends at y = 158: the label and the line under it move down, into the free space at the bottom, to keep clear of it.
         let crowded = self.tasks.len() >= 3;
@@ -1119,11 +1199,51 @@ impl Display {
             canvas.draw_text_centered(if crowded { 212 } else { 195 }, b"LATEST ON TOP", 1, COLOR_MUTED);
         } else if self.state == State::Idle && !self.link_lost {
             // No rotation while the link is lost: a moving screen looks alive, the exact opposite of NO LINK.
-            self.draw_idle_line(canvas, scene);
+            self.draw_idle_line(canvas, scene, 195);
         } else if !self.title.is_empty() {
             canvas.draw_text_centered(195, &self.title, 2, COLOR_TEXT);
         }
         self.draw_pomodoro_badge(canvas, scene);
+    }
+
+    /// The task cards on the compact panel: up to three in the left half, one title line and one state line each.
+    /// The project name is not shown here: the elapsed time takes the room on the second line.
+    fn draw_task_cards_compact(&self, canvas: &mut Canvas, now_ms: u32) {
+        for (index, task) in self.tasks.iter().enumerate() {
+            let index = index as i32;
+            let x = 4 + index * 3;
+            let y = 30 + index * 28;
+            let width = 124 - index * 3;
+            let card_color = if index == 0 { 0x18c6 } else { 0x1083 };
+            let color = self.state_color(task.state);
+            canvas.fill_rect(x, y, width, 25, COLOR_MUTED);
+            canvas.fill_rect(x + 1, y + 1, width - 2, 23, card_color);
+            canvas.fill_rect(x + 1, y + 1, 3, 23, color);
+            canvas.draw_text(x + 8, y + 4, &task.title, 1, COLOR_TEXT, 18);
+            canvas.draw_text(x + 8, y + 14, short_state_label(task.state), 1, color, 4);
+            let elapsed = format_elapsed(self.task_elapsed_seconds(task, now_ms));
+            let elapsed_width = elapsed.len() as i32 * 6 - 1;
+            let elapsed_color = if task.state == State::InputRequired { color } else { COLOR_MUTED };
+            canvas.draw_text(x + width - 6 - elapsed_width, y + 14, elapsed.as_bytes(), 1, elapsed_color, 8);
+        }
+    }
+
+    /// The text under the pet on the compact panel. With task cards on the left, the text is centred under the pet
+    /// on the right half, and the label shrinks when it is too wide for that half.
+    fn draw_pet_text_compact(&self, canvas: &mut Canvas, scene: &Scene, label: &[u8], status_color: u16) {
+        if self.tasks.is_empty() {
+            canvas.draw_text_centered(98, label, 2, status_color);
+            if self.state == State::Idle && !self.link_lost {
+                self.draw_idle_line(canvas, scene, 118);
+            } else if !self.title.is_empty() {
+                canvas.draw_text_centered(118, &self.title, 2, COLOR_TEXT);
+            }
+            return;
+        }
+        const RIGHT_HALF_CENTER: i32 = 180;
+        let scale = if label.len() <= 9 { 2 } else { 1 };
+        canvas.draw_text_centered_at(RIGHT_HALF_CENTER, 98, label, scale, status_color);
+        canvas.draw_text_centered_at(RIGHT_HALF_CENTER, 118, b"LATEST ON TOP", 1, COLOR_MUTED);
     }
 
     fn ensure_backlight(&mut self, screen: &mut dyn Screen, wanted: bool) {
@@ -1248,7 +1368,7 @@ impl Display {
     }
 
     /// Screenshot: run-length encodes the current framebuffer and hands it to `write_line`
-    /// line by line (without newlines). The first line is `SHOT BEGIN 320x240 BACKLIGHT ON|OFF`,
+    /// line by line (without newlines). The first line is `SHOT BEGIN <width>x<height> BACKLIGHT ON|OFF`,
     /// each middle line holds several `rgb565:length` runs, and the last is `SHOT END`.
     /// Writes out while encoding instead of buffering the whole frame: one frame's run-length encoding is
     /// tens of KB, larger than the heap.
@@ -1456,6 +1576,10 @@ fn tone_color(tone: Tone) -> u16 {
 fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
     canvas.dim();
     canvas.dim();
+    if board::COMPACT {
+        draw_panel_compact(canvas, panel);
+        return;
+    }
     canvas.fill_rect(30, 14, 260, 212, PANEL_BORDER);
     canvas.fill_rect(32, 16, 256, 208, COLOR_SCREEN);
     canvas.draw_text(PANEL_LEFT, 26, &panel.title, 2, COLOR_PET_HIGHLIGHT, 19);
@@ -1492,6 +1616,51 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
         x += text_width(key, 1) + 10;
         canvas.draw_text(x, 206, action, 1, COLOR_TEXT, 12);
         x += text_width(action, 1) + 14;
+    }
+}
+
+/// The menu panel on the compact panel: the frame fills the screen, the rows are one 5x7 line each, and the value
+/// column is on the right. The rows keep the box's wording.
+fn draw_panel_compact(canvas: &mut Canvas, panel: &Panel) {
+    const LEFT: i32 = 14;
+    const RIGHT: i32 = 226;
+    const VALUE_X: i32 = 110;
+    canvas.fill_rect(0, 0, WIDTH, HEIGHT, PANEL_BORDER);
+    canvas.fill_rect(2, 2, WIDTH - 4, HEIGHT - 4, COLOR_SCREEN);
+    canvas.draw_text(LEFT, 9, &panel.title, 2, COLOR_PET_HIGHLIGHT, 19);
+    canvas.fill_rect(LEFT, 27, RIGHT - LEFT, 1, COLOR_MUTED);
+    for (index, (label, value, tone)) in panel.lines.iter().enumerate() {
+        let index = index as i32;
+        match panel.kind {
+            PanelKind::List => {
+                let y = 32 + index * 13;
+                if panel.selected == Some(index as usize) {
+                    canvas.fill_rect(8, y - 2, 220, 11, PANEL_SELECTED);
+                    canvas.draw_text(10, y, b">", 1, COLOR_PET_HIGHLIGHT, 1);
+                }
+                canvas.draw_text(20, y, label, 1, COLOR_TEXT, 14);
+                let value = &value[..value.len().min(8)];
+                canvas.draw_text(RIGHT - text_width(value, 1), y, value, 1, tone_color(*tone), 8);
+            }
+            PanelKind::Facts => {
+                let y = 32 + index * 16;
+                let mut label = label.splitn(2, |&byte| byte == b'\n');
+                canvas.draw_text(LEFT, y, label.next().unwrap_or_default(), 1, COLOR_MUTED, 16);
+                if let Some(note) = label.next() {
+                    canvas.draw_text(LEFT, y + 8, note, 1, COLOR_MUTED, 16);
+                }
+                canvas.draw_text(VALUE_X, y, value, 1, tone_color(*tone), 19);
+            }
+        }
+    }
+    canvas.fill_rect(LEFT, 109, RIGHT - LEFT, 1, COLOR_MUTED);
+    let mut x = LEFT;
+    for (key, action) in &panel.hints {
+        canvas.fill_rect(x, 115, text_width(key, 1) + 6, 9, COLOR_MUTED);
+        canvas.draw_text(x + 3, 116, key, 1, COLOR_SCREEN, 4);
+        x += text_width(key, 1) + 10;
+        canvas.draw_text(x, 116, action, 1, COLOR_TEXT, 12);
+        x += text_width(action, 1) + 12;
     }
 }
 
