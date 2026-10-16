@@ -1,0 +1,38 @@
+[package]
+name = "adv-display-check"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Visual check of the compact layout on a Cardputer-Adv (ESP32-S3FN8, ST7789V2 240x135 over SPI).
+# It draws the firmware-core screens, with the core built for the board-cardputer-adv feature, and cycles
+# through them on each press of the BOOT key (G0). It has no keyboard, audio, network or storage: it is a
+# display test, not the device firmware. A separate workspace, like ../device.
+[workspace]
+
+[[bin]]
+name = "adv-display-check"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vibebuddy-firmware-core = { path = "../core", default-features = false, features = ["board-cardputer-adv"] }
+
+esp-hal = { version = "~1.2.2", features = ["esp32s3", "unstable"] }
+esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3"] }
+esp-backtrace = { version = "0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32s3", "jtag-serial"] }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false

@@ -1,0 +1,12 @@
+# Same target and build-std as ../device. No runner: flash only the app image with tools/adv-display-check-flash.sh,
+# which leaves the bootloader and the partition table on the board alone.
+
+[build]
+rustflags = ["-C", "link-arg=-nostartfiles"]
+target = "xtensa-esp32s3-none-elf"
+
+[env]
+ESP_LOG = "off"
+
+[unstable]
+build-std = ["alloc", "core"]
