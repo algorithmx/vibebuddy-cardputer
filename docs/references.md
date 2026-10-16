@@ -48,3 +48,13 @@ Version checked: [`v1.9.4 / 3ced7709c65a39494f5684e99111854a5bcbd8c7`](https://g
 On 2026-09-14 the hardware boot log reported the application `xiaozhi` 1.9.4, ESP-IDF v5.5 and the board `atk-dnesp32s3-box`, matching this pinned source version. This repository is therefore the primary implementation source for "the firmware currently running on the device", and can be used to understand the board configuration that currently works and to choose a compatible ESP-IDF version.
 
 Limits: it is not ALIENTEK's vendor schematic/BSP, and it doesn't state the hardware revision of the PCB in the user's hands. The GPIO, LCD and audio parameters in its [`config.h`](https://github.com/78/xiaozhi-esp32/blob/3ced7709c65a39494f5684e99111854a5bcbd8c7/main/boards/atk-dnesp32s3-box/config.h) can only be candidates to verify, and can't on their own become VibeBuddy's final hardware basis.
+
+## M5Stack Cardputer-Adv (vendor documentation)
+
+Local copies, extracts and the list of sources for the Cardputer-Adv are in [`docs/references/cardputer-adv/`](references/cardputer-adv/README.md). The research summary (spec comparison with the original Cardputer, pinmap and open questions) is in `.agent_context/research/cardputer-adv-research.md`.
+
+Limits:
+
+- The Cardputer-Adv product page, the M5Cardputer Arduino library and the `M5Cardputer-UserDemo` (CardputerADV branch) factory firmware are vendor sources. The factory firmware is ESP-IDF code and its license is not recorded in this repository, so only pin and address facts are taken from it, not code.
+- The vendor schematic PDF (`Sch_M5CardputerAdv_v1.0`) is the most authoritative pin source we found. Its licensing is not stated, so it is referenced by URL rather than copied into the repository; the net names we transcribed are in the reference folder.
+- Retail listings disagree with the vendor page on battery capacity (1500 mAh vs 1750 mAh). The vendor page is used as the primary source.
