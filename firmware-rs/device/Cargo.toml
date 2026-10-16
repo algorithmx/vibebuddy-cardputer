@@ -20,12 +20,16 @@ test = false
 bench = false
 
 [features]
+# The board this firmware is built for (src/board.rs). Exactly one is enabled; the box is the default.
+default = ["board-box"]
+board-box = ["vibebuddy-firmware-core/board-box"]
+board-cardputer-adv = ["vibebuddy-firmware-core/board-cardputer-adv"]
 # For on-device acceptance: compresses leisure's five minutes to five seconds and the pomodoro's
 # 25 minutes to 25 seconds.
 fast-clock = ["vibebuddy-firmware-core/fast-clock"]
 
 [dependencies]
-vibebuddy-firmware-core = { path = "../core" }
+vibebuddy-firmware-core = { path = "../core", default-features = false }
 
 esp-hal = { version = "~1.2.2", features = ["esp32s3", "unstable"] }
 esp-rtos = { version = "0.4.0", features = ["embassy", "esp-alloc", "esp-radio", "esp32s3"] }

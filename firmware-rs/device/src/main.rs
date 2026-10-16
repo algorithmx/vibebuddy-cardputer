@@ -3,7 +3,7 @@
 //! Board wiring (same as the C firmware):
 //! - LCD: ST7789, 8-bit parallel. CS GPIO1, DC GPIO2, RD GPIO41, WR GPIO42,
 //!   D0-D7 = GPIO40, 39, 38, 12, 11, 10, 9, 46.
-//! - I2C0: SDA GPIO48, SCL GPIO45. Carries the XL9555 expander (0x20) and the ES8311
+//! - I2C0: SDA GPIO48, SCL GPIO45 (Cardputer-Adv: G8, G9, carrying the TCA8418 keyboard and the ES8311). Carries the XL9555 expander (0x20) and the ES8311
 //!   codec (0x18, absent on the NS4168 variant).
 //! - XL9555 P0: bit7 LCD backlight, bit5 amplifier enable, bit4 K1, bit3 K2 (keys active low).
 //! - K0: BOOT key, GPIO0, active low.
@@ -16,7 +16,12 @@
 extern crate alloc;
 
 mod audio;
+#[cfg(feature = "board-box")]
 mod lcd;
+#[cfg(feature = "board-cardputer-adv")]
+mod lcd_spi;
+#[cfg(feature = "board-cardputer-adv")]
+mod keyboard;
 mod net;
 mod relay;
 mod serial;
@@ -28,22 +33,36 @@ use embassy_executor::Spawner;
 use embassy_time::{Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::dma::{DmaTxBuf, DmaTxStreamBuf};
+use esp_hal::dma::DmaTxStreamBuf;
+#[cfg(feature = "board-box")]
+use esp_hal::dma::DmaTxBuf;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::i2c::master::{AcknowledgeCheckFailedReason, Config as I2cConfig, Error as I2cError, I2c};
 use esp_hal::i2s::master::{Channels, DataFormat, I2s, TdmConfig};
+#[cfg(feature = "board-box")]
 use esp_hal::lcd_cam::LcdCam;
+#[cfg(feature = "board-box")]
 use esp_hal::lcd_cam::lcd::{ClockMode, Phase, Polarity};
+#[cfg(feature = "board-box")]
 use esp_hal::lcd_cam::lcd::i8080::{Config as I8080Config, I8080};
+#[cfg(feature = "board-cardputer-adv")]
+use esp_hal::spi::Mode as SpiMode;
+#[cfg(feature = "board-cardputer-adv")]
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::rng::{Rng, Trng, TrngSource};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+#[cfg(feature = "board-box")]
 use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_hal::usb::usb_serial_jtag::UsbSerialJtag;
-use esp_hal::{Blocking, dma_tx_buffer, dma_tx_stream_buffer};
+use esp_hal::Blocking;
+#[cfg(feature = "board-box")]
+use esp_hal::dma_tx_buffer;
+use esp_hal::dma_tx_stream_buffer;
 use esp_storage::FlashStorage;
 use vibebuddy_firmware_core::audio::{self as codec, ES8311_ADDRESS, Registers, SAMPLE_RATE, Sound};
 use vibebuddy_firmware_core::buttons::Levels;
+#[cfg(feature = "board-box")]
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
 use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
@@ -52,7 +71,14 @@ use vibebuddy_firmware_core::relay_box::{self, RelayBox};
 use vibebuddy_firmware_core::storage::Flash;
 
 use crate::audio::{PLAYING, PlayCommand, QUEUE, STOP, STREAM_BYTES, STREAM_CHUNK};
+#[cfg(feature = "board-box")]
 use crate::lcd::Lcd;
+#[cfg(feature = "board-cardputer-adv")]
+use crate::keyboard::Keyboard;
+#[cfg(feature = "board-cardputer-adv")]
+use crate::lcd_spi::Lcd;
+#[cfg(feature = "board-cardputer-adv")]
+use vibebuddy_firmware_core::board::KEY_MAP;
 use crate::serial::Transport;
 use crate::storage::SharedFlash;
 
@@ -66,13 +92,21 @@ fn custom_halt() -> ! {
     esp_hal::system::software_reset()
 }
 
+#[cfg(feature = "board-box")]
 const XL9555_ADDRESS: u8 = 0x20;
+#[cfg(feature = "board-box")]
 const XL9555_INPUT_PORT0: u8 = 0x00;
+#[cfg(feature = "board-box")]
 const XL9555_OUTPUT_PORT0: u8 = 0x02;
+#[cfg(feature = "board-box")]
 const XL9555_CONFIG_PORT0: u8 = 0x06;
+#[cfg(feature = "board-box")]
 const XL9555_LCD_BACKLIGHT: u8 = 0x80;
+#[cfg(feature = "board-box")]
 const XL9555_SPEAKER: u8 = 0x20;
+#[cfg(feature = "board-box")]
 const XL9555_K1: u8 = 0x10;
+#[cfg(feature = "board-box")]
 const XL9555_K2: u8 = 0x08;
 
 /// Build stamp: git description plus build time, written in by build.rs.
@@ -84,10 +118,12 @@ const BUILD: &str = env!("VIBEBUDDY_FW_BUILD");
 #[used]
 static BUILD_MARKER: &[u8] = concat!("VIBEBUDDY-BUILD:", env!("VIBEBUDDY_FW_BUILD"), "\0").as_bytes();
 
+#[cfg(feature = "board-box")]
 struct Expander<'a> {
     i2c: &'a mut I2c<'static, Blocking>,
 }
 
+#[cfg(feature = "board-box")]
 impl Expander<'_> {
     fn read(&mut self, register: u8) -> Result<u8, I2cError> {
         let mut value = [0u8];
@@ -137,7 +173,14 @@ struct DeviceBoard {
     flash: SharedFlash,
     k0: Input<'static>,
     /// The RD pin stays high: write-only. Kept here so it stays alive.
+    #[cfg(feature = "board-box")]
     _lcd_read: Output<'static>,
+    /// The backlight on G38 (the Cardputer-Adv has no expander).
+    #[cfg(feature = "board-cardputer-adv")]
+    backlight: Output<'static>,
+    /// The TCA8418 key matrix, for K1 and K2 (the box reads them from the expander).
+    #[cfg(feature = "board-cardputer-adv")]
+    keyboard: Keyboard,
     /// Only the ES8311 variant has a codec; the NS4168 variant has no adjustable volume.
     has_codec: bool,
     /// The computer linked over the network, which gets the box's output too, sealed for its session.
@@ -149,6 +192,7 @@ struct DeviceBoard {
 }
 
 impl DeviceBoard {
+    #[cfg(feature = "board-box")]
     fn expander(&mut self) -> Expander<'_> {
         Expander { i2c: &mut self.i2c }
     }
@@ -167,8 +211,15 @@ impl Screen for DeviceBoard {
         self.lcd.present()
     }
 
+    #[cfg(feature = "board-box")]
     fn set_backlight(&mut self, on: bool) -> Result<(), ()> {
         self.expander().set_output(XL9555_LCD_BACKLIGHT, on).map_err(|_| ())
+    }
+
+    #[cfg(feature = "board-cardputer-adv")]
+    fn set_backlight(&mut self, on: bool) -> Result<(), ()> {
+        self.backlight.set_level(if on { Level::High } else { Level::Low });
+        Ok(())
     }
 }
 
@@ -254,6 +305,13 @@ impl Board for DeviceBoard {
         action(frame, &mut |bytes| transport.write(bytes));
     }
 
+    #[cfg(feature = "board-cardputer-adv")]
+    fn init_display(&mut self) -> bool {
+        self.backlight.set_low();
+        self.lcd.init().is_ok()
+    }
+
+    #[cfg(feature = "board-box")]
     fn init_display(&mut self) -> bool {
         let backlight_off = self
             .expander()
@@ -273,22 +331,43 @@ impl Board for DeviceBoard {
             Err(I2cError::AcknowledgeCheckFailed(AcknowledgeCheckFailedReason::Address | AcknowledgeCheckFailedReason::Unknown)) => {}
             Err(_) => return Err("ES8311 PROBE"),
         }
-        let speaker = self
-            .expander()
-            .set_direction(XL9555_SPEAKER, false)
-            .and_then(|()| self.expander().set_output(XL9555_SPEAKER, true));
-        if speaker.is_err() {
-            return Err("SPEAKER ENABLE");
+        #[cfg(feature = "board-box")]
+        {
+            let speaker = self
+                .expander()
+                .set_direction(XL9555_SPEAKER, false)
+                .and_then(|()| self.expander().set_output(XL9555_SPEAKER, true));
+            if speaker.is_err() {
+                return Err("SPEAKER ENABLE");
+            }
         }
         Ok(if self.has_codec { "ES8311" } else { "NS4168" })
     }
 
+    #[cfg(feature = "board-cardputer-adv")]
+    fn init_buttons(&mut self) -> Option<Levels> {
+        self.keyboard.init(&mut self.i2c).ok()?;
+        Some(Levels { k0: self.k0.is_low(), k1: false, k2: false })
+    }
+
+    #[cfg(feature = "board-cardputer-adv")]
+    fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>) {
+        let k0 = self.k0.is_low();
+        // A failed read keeps the last known state: a keyboard glitch should not release a held key.
+        let _ = self.keyboard.poll(&mut self.i2c);
+        let k1 = self.keyboard.is_pressed(KEY_MAP.k1);
+        let k2 = self.keyboard.is_pressed(KEY_MAP.k2);
+        (k0, Some((k1, k2)))
+    }
+
+    #[cfg(feature = "board-box")]
     fn init_buttons(&mut self) -> Option<Levels> {
         self.expander().set_direction(XL9555_K1 | XL9555_K2, true).ok()?;
         let port = self.expander().read(XL9555_INPUT_PORT0).ok()?;
         Some(Levels { k0: self.k0.is_low(), k1: port & XL9555_K1 == 0, k2: port & XL9555_K2 == 0 })
     }
 
+    #[cfg(feature = "board-box")]
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>) {
         let k0 = self.k0.is_low();
         let expander = self.expander().read(XL9555_INPUT_PORT0).ok().map(|port| (port & XL9555_K1 == 0, port & XL9555_K2 == 0));
@@ -323,6 +402,7 @@ async fn main(spawner: Spawner) -> ! {
     // The module's 8 MB octal PSRAM comes first, so the firmware's own allocations (JSON, looks, network
     // buffers) land there and internal RAM stays for the Wi-Fi driver, which asks for internal memory
     // explicitly. The flash runs at 40 MHz (the bootloader's header), and the PSRAM timing must agree.
+    #[cfg(feature = "board-box")]
     esp_alloc::psram_allocator!(
         peripherals.PSRAM,
         esp_hal::psram,
@@ -333,16 +413,24 @@ async fn main(spawner: Spawner) -> ! {
     // A Character's look lives on the heap too (about 6 KB, plus as much again while it is read from
     // flash); this region keeps it from eating into what JSON parsing needs.
     esp_alloc::heap_allocator!(size: 16 * 1024);
+    // Without PSRAM the LCD frame (about 65 KB) also lives in internal RAM. Provisional: check the free memory on the device.
+    #[cfg(feature = "board-cardputer-adv")]
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     // Serial comes up first: the result of every later step is reported to the Mac.
-    let uart = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
-        .expect("UART0 config")
-        .with_tx(peripherals.GPIO43)
-        .with_rx(peripherals.GPIO44);
-    serial::start_uart(uart);
+    // The box's UART0 goes to its CH343 bridge on GPIO43 and GPIO44. On the Cardputer-Adv those pins carry the
+    // speaker and the expansion header, and the computer link is the USB port alone, so there the UART stays off.
+    #[cfg(feature = "board-box")]
+    {
+        let uart = Uart::new(peripherals.UART0, UartConfig::default().with_baudrate(115_200))
+            .expect("UART0 config")
+            .with_tx(peripherals.GPIO43)
+            .with_rx(peripherals.GPIO44);
+        serial::start_uart(uart);
+    }
     let (usb_rx, usb_tx) = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async().split();
     spawner.spawn(serial::usb_rx_task(usb_rx).expect("USB read task"));
 
@@ -350,16 +438,25 @@ async fn main(spawner: Spawner) -> ! {
     // Wi-Fi starts idle; it joins a network once the firmware below names one.
     let stack = net::start(&spawner, peripherals.WIFI);
 
+    // The I2C bus carries the codec and, on the box, the expander; on the Cardputer-Adv, the keyboard too (G8, G9).
+    #[cfg(feature = "board-box")]
+    let (i2c_sda, i2c_scl) = (peripherals.GPIO48, peripherals.GPIO45);
+    #[cfg(feature = "board-cardputer-adv")]
+    let (i2c_sda, i2c_scl) = (peripherals.GPIO8, peripherals.GPIO9);
     let i2c = I2c::new(peripherals.I2C0, I2cConfig::default().with_frequency(Rate::from_khz(400)))
         .expect("I2C0 config")
-        .with_sda(peripherals.GPIO48)
-        .with_scl(peripherals.GPIO45);
+        .with_sda(i2c_sda)
+        .with_scl(i2c_scl);
 
+    #[cfg(feature = "board-box")]
     let lcd_read = Output::new(peripherals.GPIO41, Level::High, OutputConfig::default());
+    #[cfg(feature = "board-box")]
     let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
     // WR idles high and data goes out on the falling edge, matching the ESP-IDF i80 defaults
     // (pclk_idle_low = 0, pclk_active_neg = 0); esp-hal defaults to idle low.
+    #[cfg(feature = "board-box")]
     let clock = ClockMode { polarity: Polarity::IdleHigh, phase: Phase::ShiftLow };
+    #[cfg(feature = "board-box")]
     let bus = I8080::new(lcd_cam.lcd, peripherals.DMA_CH0, I8080Config::default().with_frequency(Rate::from_mhz(10)).with_clock_mode(clock))
         .expect("LCD i8080 config")
         .with_cs(peripherals.GPIO1)
@@ -373,9 +470,29 @@ async fn main(spawner: Spawner) -> ! {
         .with_data5(peripherals.GPIO10)
         .with_data6(peripherals.GPIO9)
         .with_data7(peripherals.GPIO46);
+    #[cfg(feature = "board-box")]
     let parameters = dma_tx_buffer!(16).expect("LCD parameter buffer");
+    #[cfg(feature = "board-box")]
     let frame: DmaTxBuf = dma_tx_buffer!(FRAME_BYTES).expect("LCD frame buffer");
+    #[cfg(feature = "board-box")]
     let lcd = Lcd::new(bus, parameters, frame);
+
+    #[cfg(feature = "board-cardputer-adv")]
+    let spi = Spi::new(peripherals.SPI2, SpiConfig::default().with_frequency(Rate::from_mhz(40)).with_mode(SpiMode::_0))
+        .expect("SPI2 config")
+        .with_sck(peripherals.GPIO36)
+        .with_mosi(peripherals.GPIO35);
+    #[cfg(feature = "board-cardputer-adv")]
+    let lcd = Lcd::new(
+        spi,
+        Output::new(peripherals.GPIO34, Level::Low, OutputConfig::default()),
+        Output::new(peripherals.GPIO37, Level::High, OutputConfig::default()),
+        Output::new(peripherals.GPIO33, Level::High, OutputConfig::default()),
+    );
+    #[cfg(feature = "board-cardputer-adv")]
+    let backlight = Output::new(peripherals.GPIO38, Level::Low, OutputConfig::default());
+    #[cfg(feature = "board-cardputer-adv")]
+    let keyboard = Keyboard::new();
 
     // Start the I2S stream first (all zeros): as in the C firmware, the clock runs before the codec is
     // configured.
@@ -389,7 +506,11 @@ async fn main(spawner: Spawner) -> ! {
     )
     .expect("I2S0 config")
     .into_async();
+    // The speaker's I2S: BCLK, WS and data out. The box and the Cardputer-Adv wire them to different pins.
+    #[cfg(feature = "board-box")]
     let i2s_tx = i2s.i2s_tx.with_bclk(peripherals.GPIO21).with_ws(peripherals.GPIO13).with_dout(peripherals.GPIO14).build();
+    #[cfg(feature = "board-cardputer-adv")]
+    let i2s_tx = i2s.i2s_tx.with_bclk(peripherals.GPIO41).with_ws(peripherals.GPIO43).with_dout(peripherals.GPIO42).build();
     let stream: DmaTxStreamBuf = dma_tx_stream_buffer!(STREAM_BYTES, STREAM_CHUNK);
     spawner.spawn(audio::audio_task(i2s_tx, stream).expect("audio task"));
 
@@ -401,7 +522,12 @@ async fn main(spawner: Spawner) -> ! {
         transport: Transport::new(usb_tx),
         flash: SharedFlash,
         k0,
+        #[cfg(feature = "board-box")]
         _lcd_read: lcd_read,
+        #[cfg(feature = "board-cardputer-adv")]
+        backlight,
+        #[cfg(feature = "board-cardputer-adv")]
+        keyboard,
         has_codec: false,
         lan_peer: None,
         relay_peer: None,

@@ -1,0 +1,11 @@
+# 8 MB flash (Cardputer-Adv, ESP32-S3FN8), no PSRAM. The same partitions as partitions.csv, resized to fit:
+# two 3 MB app slots for over-the-air updates (ADR-0013), and a 1.75 MB voices partition (the voice pack is about
+# 1.2 MB). The offsets of nvs, phy_init and the app slots are the same as the box's; voices, otadata and link move.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+phy_init,  data, phy,     0xf000,   0x1000
+ota_0,     app,  ota_0,   0x10000,  3M
+ota_1,     app,  ota_1,   0x310000, 3M
+voices,    data, 0x40,    0x610000, 0x1C0000
+otadata,   data, ota,     0x7d0000, 0x2000
+link,      data, 0x41,    0x7d2000, 0x2000
