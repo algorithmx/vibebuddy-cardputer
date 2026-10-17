@@ -9,7 +9,7 @@ if [[ "$(uname -s)" != Linux ]]; then
 fi
 
 cargo build --locked -p vibebuddyd --target-dir target
-cargo build --locked -p vibebuddy-desktop --example host_status_probe --target-dir target
+cargo build --locked -p vibebuddy-desktop --example host_status_probe --example daemon_outage_probe --target-dir target
 cargo build --locked -p vibebuddy-firmware-core --example simulator --target-dir target
 
 export VIBEBUDDY_HOST_TESTS=1

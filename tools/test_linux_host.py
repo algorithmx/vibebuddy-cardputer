@@ -353,6 +353,169 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(struct.unpack(">II", png[16:24]), (320, 240))
 
 
+NOTIFY_ARGS = ["--app-name=VibeBuddy", "VibeBuddy",
+               "The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab."]
+# The status stream retries every 2 s, so a brief restart must fit inside one retry plus the grace period.
+PROBE_GRACE_MS = 4000
+PROBE_WAIT = PROBE_GRACE_MS / 1000 + 8
+
+
+@unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
+class DaemonOutageTests(HostTestCase):
+    """The Linux app's daemon-failure notification: the real status stream drives the outage policy via the probe."""
+    firmware = False
+
+    def setUp(self):
+        super().setUp()
+        self.decision_log = self.host.root / "outage-decisions.log"
+        # The harness keeps notifications off for the other tests; the app's toggle is on for these.
+        config = self.host.status()["config"]
+        config["notify_link"] = True
+        code, response = self.host.request("/v1/config", config, method="PUT")
+        self.assertEqual(code, 200, response)
+
+    def start_probe(self, grace_ms=PROBE_GRACE_MS):
+        probe = os.environ.get("VIBEBUDDY_TEST_OUTAGE_PROBE", str(REPO / "target/debug/examples/daemon_outage_probe"))
+        with self.decision_log.open("w") as log:
+            process = subprocess.Popen([probe, self.host.base, str(grace_ms)], cwd=self.host.root,
+                                       env=self.host.env, stdout=log, stderr=subprocess.STDOUT)
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+
+        self.addCleanup(stop)
+
+    def decisions(self):
+        return self.decision_log.read_text().splitlines() if self.decision_log.exists() else []
+
+    def count(self, text):
+        return sum(text in line for line in self.decisions())
+
+    def wait_count(self, text, n, timeout=12):
+        return wait_for(lambda: self.count(text) >= n, f"{n} decision(s) containing {text!r}", timeout)
+
+    def assert_no_check_or_notify(self):
+        self.assertFalse(any("CheckService" in line or "Notify" in line for line in self.decisions()), self.decisions())
+
+    def vibebuddy_notifications(self):
+        # The daemon's own box alert also goes through notify-send, under another title.
+        return [command["args"] for command in self.host.commands("notify-send") if command["args"][1:2] == ["VibeBuddy"]]
+
+    def await_notifications(self, n):
+        return wait_for(lambda: (sent if len(sent := self.vibebuddy_notifications()) >= n else None),
+                        f"{n} VibeBuddy notification(s)", 8)
+
+    def test_a_brief_restart_within_the_grace_period_stays_silent(self):
+        self.start_probe()
+        self.wait_count("Status { notify_link: true } -> None", 1)
+        self.host.stop_daemon()
+        self.wait_count("Down -> Some(Wait", 1)
+        self.host.start_daemon()
+        self.wait_count("Status { notify_link: true } -> None", 2)
+        self.wait_count("GraceElapsed -> None", 1, timeout=PROBE_WAIT)
+        self.assert_no_check_or_notify()
+        self.assertEqual(self.vibebuddy_notifications(), [])
+
+    def test_a_sustained_outage_notifies_once(self):
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        # Retries keep failing after the notification; none of them may notify again.
+        self.wait_count("Down -> None", 3, timeout=PROBE_WAIT)
+        self.assertEqual(self.count("-> Some(Notify)"), 1)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+        self.assertEqual([command["args"] for command in self.host.commands("systemctl")],
+                         [["--user", "is-active", "vibebuddyd"]])
+
+    def test_recovery_rearms_the_notification_for_the_next_outage(self):
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.host.start_daemon()
+        self.wait_count("Status {", 2)
+        self.host.stop_daemon()
+        self.wait_count("-> Some(Notify)", 2, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(2), [NOTIFY_ARGS, NOTIFY_ARGS])
+
+    def test_the_notify_toggle_silences_an_outage_after_the_daemon_is_gone(self):
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        config = self.host.status()["config"]
+        config["notify_link"] = False
+        code, response = self.host.request("/v1/config", config, method="PUT")
+        self.assertEqual(code, 200, response)
+        self.wait_count("Status { notify_link: false } -> None", 1)
+        self.host.stop_daemon()
+        self.wait_count("GraceElapsed -> None", 1, timeout=PROBE_WAIT)
+        self.assert_no_check_or_notify()
+        self.assertEqual(self.vibebuddy_notifications(), [])
+
+    def test_without_any_status_the_notification_is_on(self):
+        self.host.stop_daemon()
+        self.start_probe()
+        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+    def test_a_unit_stopped_on_purpose_stays_silent(self):
+        self.host.command_reply("systemctl", stdout="inactive\n", exit=3)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Inactive) -> Some(Wait", 2, timeout=PROBE_WAIT + PROBE_GRACE_MS / 1000)
+        self.assertEqual(self.vibebuddy_notifications(), [])
+
+    def test_a_failed_restart_after_a_stop_notifies_without_recovering(self):
+        self.host.command_reply("systemctl", stdout="inactive\n", exit=3)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Inactive) -> Some(Wait", 1, timeout=PROBE_WAIT)
+        self.host.command_reply("systemctl", stdout="failed\n", exit=3)
+        self.wait_count("Service(Failed) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+    def test_restart_uses_systemd_when_the_daemon_is_down_and_reports_failure(self):
+        self.host.stop_daemon()
+        probe = os.environ.get("VIBEBUDDY_TEST_OUTAGE_PROBE", str(REPO / "target/debug/examples/daemon_outage_probe"))
+        self.host.command_reply("systemctl", stdout="", exit=0)
+        result = subprocess.run([probe, "--restart"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.host.commands("systemctl")[-1]["args"], ["--user", "restart", "vibebuddyd"])
+        self.host.command_reply("systemctl", stderr="restart refused", exit=1)
+        result = subprocess.run([probe, "--restart"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restart refused", result.stderr)
+
+    def test_a_crash_looping_unit_notifies(self):
+        self.host.command_reply("systemctl", stdout="failed\n", exit=3)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Failed) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+    def test_an_unreadable_unit_state_still_notifies(self):
+        # No user bus or missing systemd: systemctl prints nothing and exits non-zero.
+        self.host.command_reply("systemctl", stdout="", exit=1)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Unknown) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+    def test_a_slow_systemctl_times_out_and_still_notifies(self):
+        self.host.command_reply("systemctl", stdout="active\n", sleep=3)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Unknown) -> Some(Notify)", 1, timeout=PROBE_WAIT + 2)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+
 @unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
 class ForeignFirmwareTests(HostTestCase):
     firmware = False
