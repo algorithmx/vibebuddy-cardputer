@@ -677,8 +677,7 @@ impl App {
                 }
             }
             Message::ShowDaemonLog => {
-                let args = ["journalctl", "--user", "-u", "vibebuddyd", "-f"].map(std::ffi::OsStr::new);
-                if let Err(error) = launch("xdg-terminal-exec", &args) {
+                if let Err(error) = show_daemon_log() {
                     self.notice = Some(Err(error));
                 }
             }
@@ -1637,6 +1636,32 @@ fn launch(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
         .spawn()
         .map(drop)
         .map_err(|error| format!("cannot run {program}: {error}"))
+}
+
+/// What Show daemon log runs: the daemon logs to the journal here.
+const DAEMON_LOG: [&str; 5] = ["journalctl", "--user", "-u", "vibebuddyd", "-f"];
+
+/// Terminals that run a command given after their flag, in the order tried: the XDG default first (Omarchy has it),
+/// then the usual desktops' own. Ubuntu 22.04, for one, has no xdg-terminal-exec.
+const TERMINALS: [(&str, &[&str]); 5] = [
+    ("xdg-terminal-exec", &[]),
+    ("gnome-terminal", &["--"]),
+    ("konsole", &["-e"]),
+    ("xfce4-terminal", &["-x"]),
+    ("xterm", &["-e"]),
+];
+
+/// Follows the daemon's journal in the first terminal this desktop has. Only a terminal that isn't installed moves on
+/// to the next; one that fails to start is reported.
+fn show_daemon_log() -> Result<(), String> {
+    for (terminal, flag) in TERMINALS {
+        match std::process::Command::new(terminal).args(flag).args(DAEMON_LOG).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot run {terminal}: {error}")),
+        }
+    }
+    Err(tr("No terminal found. Run %@ to see the daemon log.", &[&DAEMON_LOG.join(" ")]))
 }
 
 /// Logs, config and both sides' build IDs in one folder under Downloads, with no hook payloads; the folder opens when
