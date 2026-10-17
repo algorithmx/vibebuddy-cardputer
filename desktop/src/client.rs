@@ -20,10 +20,15 @@ pub enum Update {
 
 /// Snapshots for as long as the app runs, reconnecting whenever the daemon goes away.
 pub fn status_updates() -> impl Stream<Item = Update> {
-    iced::stream::channel(16, async |mut output| {
+    status_updates_at(BASE.to_owned())
+}
+
+/// The same stream from another base URL, for the headless probe that runs against a test daemon.
+pub fn status_updates_at(base: String) -> impl Stream<Item = Update> {
+    iced::stream::channel(16, async move |mut output| {
         let client = reqwest::Client::new();
         loop {
-            if let Ok(response) = client.get(format!("{BASE}/v1/status/stream")).send().await
+            if let Ok(response) = client.get(format!("{base}/v1/status/stream")).send().await
                 && response.status().is_success()
             {
                 let mut body = response.bytes_stream();

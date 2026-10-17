@@ -72,9 +72,10 @@ environment omits `HOME`, agent hooks and desktop bus variables; explicit XDG di
 Update checks and Relay use are disabled, with loopback-only fallback URLs, and CI repository polling is empty.
 
 `hyprctl`, `swaymsg`, `wmctrl`, `xdg-open`, `notify-send`, `systemctl` and `gh` resolve to per-test stubs. Their argument
-lists are recorded; responses and exit codes can be configured with `command_reply`. The current tests exercise
-Hyprland, its older dispatch syntax and command failure/recovery. The Sway, X11, service-state and notification stubs
-are extension points for G4; their presence does not mean those features have been implemented or validated.
+lists are recorded; responses, exit codes and a `sleep` before answering can be configured with `command_reply`. One
+reply per program applies to every argument list. The Hyprland tests exercise its older dispatch syntax and command
+failure/recovery. The `systemctl` and `notify-send` stubs carry the G4 P0 outage scenarios. The `swaymsg` and `wmctrl`
+stubs are still only extension points for P1; their presence does not mean those features have been implemented.
 
 The PTY has no USB VID/PID metadata. The existing explicit-port path therefore assumes bridge pacing and reports
 `device.bridge=true`, even though the physical Adv uses native USB. USB discovery, native-USB write timing, DTR reset,
@@ -106,6 +107,7 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Split/coalesced CRLF lines, malformed JSON/version, oversized diagnostic | Recovery to valid status without launching a source. |
 | Real Adv screenshot; synthetic valid BOX frame and malformed run | Adv limitation recorded; existing PNG path works on its supported dimensions; malformed pixels become HTTP errors. |
 | Factory log line followed by several heartbeat intervals, then ROM reset/build | No hello or heartbeat is written to foreign firmware; normal traffic resumes after our build appears. |
+| Daemon stopped (status stream retries every 2 s), with the unit `inactive`, `failed`, unreadable, slow or never read, and the app's notify toggle on, off or never read | `daemon_outage_probe` runs the app's real status stream through the outage policy and its `systemctl`/`notify-send` adapters. One `notify-send` per outage after a 4 s grace (shortened for the probe; the 30 s boundary is unit-tested with explicit instants); none for a brief restart, a stopped unit or a disabled toggle; rearmed after recovery. |
 
 `tools/fixtures/cardputer-adv/boot.txt` replays the boot captured in `device-specs.md`, with the redacted box key replaced
 by a synthetic key. `wifi.json` contains synthetic device-layer reports, using test-only network names and a
@@ -158,7 +160,8 @@ remain available for separate network development.
 
 The suite does not launch the iced window, exercise the real tray host/desktop notification server or focus an
 actual window. It does not establish Claude/Codex Linux app availability or session URL handling (G4 P2), implement
-Sway/X11 focus (P1), or test the future daemon-failure notification (P0). Hardware key scanning, sound, native USB
+Sway/X11 focus (P1). The daemon-failure notification (P0) is tested headless through the app's stream and the stubs, but
+not on a real notification server or a real systemd unit: that desktop acceptance is pending. Hardware key scanning, sound, native USB
 discovery/timing, RAM pressure, LAN/Relay handover and ROM flashing are separate acceptance tasks. Existing firmware
 and daemon unit tests continue covering network/Noise/OTA logic; this first wave adds the missing USB host boundary.
 
@@ -169,3 +172,14 @@ documented runner passed its 29-case run; the subsequently added delayed/duplica
 The workspace tests, all 148 Adv firmware-core tests, existing Python tool tests and localization check passed.
 Workspace Clippy and the Adv simulator's Clippy check completed with existing warnings. The default BOX simulator
 also booted and produced a complete 320×240 screenshot. No physical device or graphical desktop was used.
+
+## Validation recorded for G4 P0 on 2026-10-17
+
+On top of `0c1360a`, with the P0 changes uncommitted: the full host runner passed 39 scenarios (30 existing and 9 new
+`DaemonOutageTests`), with the same one expected screenshot failure, in 155 s. The new outage scenarios alone passed in
+62 s. The workspace tests passed 502 cases (one ignored, the native-USB ROM test), up from 489 with the 13 new
+desktop unit tests for the outage policy. The Adv firmware-core tests passed 101 and 47 cases. Workspace clippy
+exits 0 with the four warnings that were already there, none in the desktop crate. The localization check passed with
+285 keys. As a mutation check, a copy of the policy that stopped suppressing `inactive` and one that ignored the
+toggle each failed exactly their matching scenario, and the policy was restored. Not run: a real desktop notification,
+a real systemd unit, or the Mac app.

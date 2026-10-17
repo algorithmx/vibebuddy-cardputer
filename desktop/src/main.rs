@@ -15,13 +15,14 @@ mod firmware_file;
 mod i18n;
 #[cfg(target_os = "linux")]
 mod instance;
+mod outage;
 mod preview;
 mod status;
 mod theme;
 #[cfg(target_os = "linux")]
 mod tray;
 
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{button, checkbox, column, container, image, pick_list, row, scrollable, slider, space, text, text_input, toggler};
 use iced::{Element, Font, Length, Subscription, Task, Theme, window};
@@ -80,6 +81,9 @@ enum Message {
     TrayHost(bool),
     TrayHostCheck,
     ThemeTick,
+    /// The grace period of a daemon outage has passed, or the unit's state was read after it.
+    OutageGrace,
+    OutageService(outage::Service),
     OpenSettings,
     /// A page of the first-run guide, or (None) leave it for the tabs.
     Guide(Option<usize>),
@@ -221,6 +225,8 @@ struct App {
     /// When the box's port was last seen open, to tell a box that never reports a build.
     /// Whether the shell has a tray host for the icon right now.
     tray_host: bool,
+    /// Tells the user if the daemon fails and stays down, once per outage.
+    outage: outage::Outage,
     #[cfg(target_os = "linux")]
     tray: Option<TrayHandle>,
     /// VibeBuddy's Omarchy plugin is in the bar, showing the face; the tray icon would be a second one.
@@ -267,6 +273,7 @@ impl App {
             restart_offer: None,
             pending_voice: launch_voice(),
             tray_host: true,
+            outage: outage::Outage::new(outage::GRACE),
             #[cfg(target_os = "linux")]
             tray: None,
             #[cfg(target_os = "linux")]
@@ -336,12 +343,22 @@ impl App {
                     .then(|| self.pending_voice.take())
                     .flatten();
                 notify_new_firmware(&status);
+                self.outage.handle(outage::Event::Status { notify_link: status.config.notify_link }, Instant::now());
                 self.status = Some(*status);
                 return Task::batch([self.refresh_tray(), voice.map_or_else(Task::none, |id| Task::done(Message::UseVoice(id)))]);
             }
             Message::Daemon(client::Update::Down) => {
                 self.status = None;
-                return self.refresh_tray();
+                let effect = self.outage.handle(outage::Event::Down, Instant::now());
+                return Task::batch([self.refresh_tray(), self.outage_task(effect)]);
+            }
+            Message::OutageGrace => {
+                let effect = self.outage.handle(outage::Event::GraceElapsed, Instant::now());
+                return self.outage_task(effect);
+            }
+            Message::OutageService(service) => {
+                let effect = self.outage.handle(outage::Event::Service(service), Instant::now());
+                return self.outage_task(effect);
             }
             #[cfg(target_os = "linux")]
             Message::TrayReady(handle) => {
@@ -687,6 +704,21 @@ impl App {
             Message::Quit => return iced::exit(),
         }
         Task::none()
+    }
+
+    /// Carries out what the outage policy asked for: the timer, the unit's state, or the notification.
+    fn outage_task(&self, effect: Option<outage::Effect>) -> Task<Message> {
+        match effect {
+            Some(outage::Effect::Wait(after)) => Task::perform(tokio::time::sleep(after), |()| Message::OutageGrace),
+            Some(outage::Effect::CheckService) => Task::perform(outage::service(), Message::OutageService),
+            Some(outage::Effect::Notify) => {
+                if let Err(error) = outage::notify() {
+                    eprintln!("vibebuddy-desktop: {error}");
+                }
+                Task::none()
+            }
+            None => Task::none(),
+        }
     }
 
     /// Pushes the menu and the face's color to the tray; a no-op until the tray is up.

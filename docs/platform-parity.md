@@ -52,7 +52,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 |---|---|---|---|
 | Box gone for 30 s | the app (`AppModel.swift`, `checkLink`) | the daemon, through `notify-send` (`link_alert.rs`) | same rule, different sender |
 | New box firmware available | the app (`AppModel.swift`) | the app, through `notify-send` (`main.rs`, `notify_new_firmware`) | same |
-| Daemon failed | the app, when its supervisor gives up after three failed starts; follows the notify toggle, on when no config can be read (`AppModel.swift`, `onGiveUp`) | **none**, although the Linux toggle reads "Notify me when the box disconnects or the daemon fails" | **Linux gap** |
+| Daemon failed | the app, when its supervisor gives up after three failed starts (`AppModel.swift`, `onGiveUp`). That code reads the toggle from the status, which is already cleared at that point, so it notifies whether or not the toggle is on (read from the code, not run on a Mac) | the app, through `notify-send` (`outage.rs`), once after 30 s without the daemon and again only after it returns. The last toggle the daemon reported applies, on when none was read. A unit stopped with `systemctl --user stop` stays silent; a failed, activating or unreadable unit notifies | differs: the Linux app honours the toggle and stays silent for a unit the user stopped; the Mac's give-up path does not honour its toggle (see gap 2) |
 | "Codex hook config updated" | the app, after migrating legacy hook commands (`HookInstaller.migrateLegacyCommands`) | no such migration on Linux | Mac only, by design |
 
 ### Menu bar and tray
@@ -102,9 +102,10 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
 
 1. **K2 focus works only under Hyprland.** On GNOME, KDE, Sway and X11, K2 does nothing visible except a tmux pane
    switch. This is the largest functional difference for Linux users outside Omarchy.
-2. **No daemon-failure notification on Linux, while the Linux toggle promises one.** The Mac app sends it when its
-   supervisor gives up. The Linux app already sees the daemon go away (its tray shows the daemon-down face) and already
-   sends notifications through `notify-send`.
+2. **Daemon-failure notification: closed on Linux, with a Mac question left open.** The Linux app now sends it
+   (`outage.rs`; headless tests in `DaemonOutageTests`; desktop acceptance pending). The Mac's give-up path looks like
+   it ignores the toggle, because its check reads a status that is already cleared (`AppModel.swift:45–50`). Whether to
+   fix that on the Mac is a decision for the maintainers: AGENTS.md asks that a change in one app come with the other.
 3. **K2 reaches the Claude or Codex app window, not the session, and only under Hyprland.** Whether the Linux builds of
    those apps set `CLAUDE_CODE_HOST_SESSION_ID` and register the `claude:` and `codex:` URL schemes is unknown.
 4. **No explanation when there is no tray.** The window opens after 10 s, but on Fedora or upstream GNOME the user is

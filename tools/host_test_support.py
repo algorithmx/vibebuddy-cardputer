@@ -66,7 +66,7 @@ class HostHarness:
         self.bin = self.root / "bin"
         self.bin.mkdir()
         stub = self.bin / "desktop-command"
-        stub.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+        stub.write_text(f"#!{sys.executable}\n" + '''import json, os, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
 root = Path(os.environ["VIBEBUDDY_TEST_ROOT"])
@@ -74,6 +74,7 @@ with (root / "commands.jsonl").open("a") as log:
     log.write(json.dumps({"program": name, "args": sys.argv[1:]}) + "\\n")
 reply = root / (name + ".json")
 data = json.loads(reply.read_text()) if reply.exists() else {}
+time.sleep(data.get("sleep", 0))
 if name == "hyprctl" and sys.argv[1:2] == ["clients"]:
     print(data.get("stdout", json.dumps(data.get("clients", []))))
 elif name == "hyprctl" and sys.argv[1:2] == ["dispatch"] and sys.argv[2].startswith("hl."):

@@ -9,7 +9,7 @@ if [[ "$(uname -s)" != Linux ]]; then
 fi
 
 cargo build --locked -p vibebuddyd --target-dir target
-cargo build --locked -p vibebuddy-desktop --example host_status_probe --target-dir target
+cargo build --locked -p vibebuddy-desktop --example host_status_probe --example daemon_outage_probe --target-dir target
 # Keep Adv and BOX features in separate builds: workspace tests select BOX through daemon dev-dependencies.
 cargo build --locked -p vibebuddy-firmware-core --example simulator \
     --no-default-features --features board-cardputer-adv --target-dir target/cardputer-adv

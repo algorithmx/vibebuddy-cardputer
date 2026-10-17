@@ -230,12 +230,80 @@ real behavior contradicts a simulated pass or a test proves unreliable. These pr
 
 | Checkpoint | Status | Evidence / reflection entry |
 |---|---|---|
-| T0 current-revision baseline | Not started | Pending |
-| P0 app notification path | Not started | Pending |
+| T0 current-revision baseline | Done 2026-10-17 | Entry below |
+| P0 app notification path | Implemented; headless checks pass; desktop acceptance pending | Entry below |
 | P1 Sway | Not started | Pending |
 | P1 X11 and Hyprland regression | Not started | Pending |
 | P2 capability gate / conditional implementation | Not started | Pending |
 | P3/P4 coverage and documentation closeout | Not started | Pending |
+
+**T0 entry, 2026-10-17, revision `0c1360a` (branch `claude/cardputer-adv-port`, clean tree).**
+
+- **Observation:** `bash tools/test-linux-host.sh`: 30 tests, OK, one expected failure
+  (`test_cardputer_screenshot_should_be_a_240_by_135_png`), 94 s. `cargo test --workspace --locked`: all pass; one test
+  ignored, the native-USB ROM test that needs a device. Adv firmware-core (`--target-dir target/cardputer-adv`): 101 and
+  47 pass. `cargo clippy --workspace --all-targets --locked`: exit 0 with four warnings (`firmware-rs/core/src/display.rs:322`,
+  `daemon/src/activity.rs:313` and `:844`, `daemon/src/session_titles.rs:50`). `check-localization.py`: ok, 284 keys.
+  Logs are in the session scratchpad, not the repo.
+- **Expected failure, checked:** run unmarked, it fails at its first assertion with HTTP 502
+  `incomplete frame: 32400 pixels`. `daemon/src/screenshot.rs:12–13` and `:125` hard-code 320×240, so the daemon
+  rejects a 240×135 frame. This is a product gap, not a harness defect. The plan's wording ("dimension check") is
+  imprecise and should say so when the gap is next touched.
+- **Isolation and cleanup:** the run was in a Wayland desktop session (`DISPLAY`, `WAYLAND_DISPLAY` set, no `SWAYSOCK`).
+  The daemon gets only `PATH` and explicit XDG paths, and no `vibebuddyd` or simulator process was left behind.
+  Control sockets are removed on close. Scenario artifacts in `target/host-tests` are kept after passing runs, with no
+  pruning: 140 directories, 9.8 MB after this baseline. Not a failure, but it grows without bound locally.
+- **Coverage assessment:** the Adv firmware is simulated, over the PTY with bridge pacing, so native USB is untested
+  (already recorded in `docs/linux-host-testing.md`). The desktop harness covers only the headless status and menu
+  path. The notification decision and command calls (`desktop/src/main.rs:343`, `:1762`) are reached only from iced's
+  `update()`, which the probe cannot run.
+- **Seams for P0 and P1, found during T0 (not built yet):**
+  - P0: the smallest seam is a pure outage-policy struct shaped like `LinkAlert`, compiled into
+    `desktop/examples/host_status_probe.rs` through `#[path]`, as `status.rs` already is. It takes explicit `Instant`s
+    and Down/Up events, and calls `notify-send` through the same adapter production uses. The `systemctl` stub gives one
+    reply per program, so the `is-active` replies work only if no other `systemctl` call in the same test needs a different reply.
+  - P1: stub replies are keyed by program name only (`tools/host_test_support.py`, `command_reply`). `swaymsg -t get_tree`
+    and `swaymsg [con_id=N] focus` cannot return different output, and stubs have no stderr, no delay and no per-argument
+    replies. The daemon's environment has no `DISPLAY`, `WAYLAND_DISPLAY`, `SWAYSOCK` or `XDG_SESSION_TYPE`, so session
+    selection cannot be exercised until per-test session variables are allowed.
+- **Decision:** T0 is the baseline; no product or harness code changed. Next is P0, after the toggle decision in the
+  plan's open question (the Mac's give-up path does not follow the toggle, and the Linux app clears its status on
+  daemon loss).
+
+**P0 entry, 2026-10-17, on `0c1360a` with the P0 changes uncommitted.** The user said "go ahead" without answering the toggle
+question, so I took the recommended reading: Linux keeps the last-known toggle, on when none was read. The Mac is unchanged, and
+the difference is recorded for a maintainer decision (`docs/platform-parity.md`, gap 2).
+
+- **Observation:** full host runner 39 scenarios OK (30 existing, 9 new `DaemonOutageTests`), one expected failure, 155 s.
+  Workspace 502 passed; Adv core 101 and 47; clippy exit 0 with the 4 pre-existing warnings; localization 285 keys.
+  `desktop` unit tests: 13 new outage policy tests. Mutation check: an `inactive` suppression removed and the toggle
+  ignored in one run; each failed exactly its own scenario (`a_unit_stopped_on_purpose_stays_silent`,
+  `the_notify_toggle_silences_an_outage_after_the_daemon_is_gone`). Logs: scratchpad `p0/`.
+- **Coverage assessment:** production path covered: the app's real status stream (`client::status_updates_at`), the
+  outage state machine (`desktop/src/outage.rs`), and its `systemctl` and `notify-send` adapters, all driven by
+  `daemon_outage_probe` against the real daemon. Not covered: the iced wiring in `desktop/src/main.rs` (`update`,
+  the `Task` mapping, the notification from the real app); it compiles and is checked only by reading. Stubs are
+  fire-and-forget on the notify side, so a missing `notify-send` binary is not exercised. The probe shortens the grace
+  to 4 s, because the stream retries every 2 s; the 30 s boundary is checked with explicit instants.
+- **Decisions taken while building the seam:**
+  - One policy, shared by app and probe: `Outage::handle` returns effects (`Wait`, `CheckService`, `Notify`) and each
+    caller runs them. No second policy in the test.
+  - Unit states: `active`, `activating`, `failed`, `Unknown` (no bus, missing binary, timeout after 2 s) all notify.
+    `inactive` and `deactivating` stay silent: the user's stop. `is-active` prints `inactive` for a missing unit too, so
+    a missing unit is silent, not distinguished (this was an open question in the plan; it is now a recorded limit).
+  - The last-known toggle survives the daemon going away, because `Update::Down` clears `status` (`desktop/src/main.rs`).
+  - Only the first `Down` of an outage starts the timer; the stream repeats `Down` every 2 s while the daemon is gone.
+  - `client.rs` gained `status_updates_at(base)`, the test seam for the probe's port. Production calls it with the
+    fixed `127.0.0.1:7331`.
+  - The harness config turns notifications off for the other tests; the outage tests turn the toggle on in `setUp`, and
+    count only `VibeBuddy` titles, since the daemon's own box alert also uses `notify-send`.
+  - `notify-send` is spawned and not awaited, like the firmware notification, so the adapter has no timeout.
+- **Follow-through:** docs updated: `README.md` and `README.zh-CN.md` (Linux section, one sentence each),
+  `docs/platform-parity.md` (notification row and gap 2), `docs/linux-host-testing.md` (scenario row, stubs, acceptance,
+  validation). zh-Hans string added. Remaining acceptance: on a real desktop, a persistent daemon failure and an explicit
+  `systemctl --user stop` should give the notifications and silences the tests predict, and the tray restart should
+  clear it. Not run: a real notification server, a real systemd unit, the Mac app. P1 is next, one backend at a time, and
+  the outage seam is reused as it stands.
 
 For an entry, record:
 
