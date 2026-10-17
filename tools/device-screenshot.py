@@ -13,9 +13,17 @@ import sys
 import time
 import zlib
 
-import serial
+MAX_PIXELS = 320 * 240
 
-WIDTH, HEIGHT = 320, 240
+
+def parse_header(line: str) -> tuple[int, int, bool]:
+    try:
+        width, height = map(int, line.removeprefix("SHOT BEGIN").split()[0].split("x"))
+        if width <= 0 or height <= 0 or width * height > MAX_PIXELS:
+            raise ValueError
+    except (ValueError, IndexError) as error:
+        raise ValueError(f"invalid screenshot dimensions: {line}") from error
+    return width, height, "BACKLIGHT OFF" not in line
 
 
 def rgb565_to_rgb(color: int) -> bytes:
@@ -25,17 +33,17 @@ def rgb565_to_rgb(color: int) -> bytes:
     return bytes((red * 255 // 31, green * 255 // 63, blue * 255 // 31))
 
 
-def write_png(path: str, pixels: list[bytes], scale: int) -> None:
+def write_png(path: str, pixels: list[bytes], scale: int, width: int, height: int) -> None:
     def chunk(kind: bytes, payload: bytes) -> bytes:
         body = kind + payload
         return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
     raw = bytearray()
-    for y in range(HEIGHT):
-        row = b"".join(pixels[y * WIDTH + x] * scale for x in range(WIDTH))
+    for y in range(height):
+        row = b"".join(pixels[y * width + x] * scale for x in range(width))
         for _ in range(scale):
             raw += b"\x00" + row
-    header = struct.pack(">IIBBBBB", WIDTH * scale, HEIGHT * scale, 8, 2, 0, 0, 0)
+    header = struct.pack(">IIBBBBB", width * scale, height * scale, 8, 2, 0, 0, 0)
     with open(path, "wb") as output:
         output.write(b"\x89PNG\r\n\x1a\n")
         output.write(chunk(b"IHDR", header))
@@ -44,6 +52,8 @@ def write_png(path: str, pixels: list[bytes], scale: int) -> None:
 
 
 def main(argv: list[str]) -> int:
+    import serial
+
     if len(argv) not in (3, 4):
         print(__doc__, file=sys.stderr)
         return 2
@@ -54,6 +64,7 @@ def main(argv: list[str]) -> int:
     port.write(b'{"version":1,"event":"device.screenshot"}\n')
 
     pixels: list[bytes] = []
+    width, height = 0, 0
     backlight_on = True
     deadline = time.time() + 60
     started = False
@@ -62,8 +73,9 @@ def main(argv: list[str]) -> int:
         if not line:
             continue
         if line.startswith("SHOT BEGIN"):
+            width, height, backlight_on = parse_header(line)
             started = True
-            backlight_on = "BACKLIGHT OFF" not in line
+            pixels.clear()
             continue
         if line == "SHOT END":
             break
@@ -71,16 +83,19 @@ def main(argv: list[str]) -> int:
             continue
         for run in line[5:].split():
             color, count = run.split(":")
-            pixels.extend([rgb565_to_rgb(int(color, 16))] * int(count))
+            length = int(count)
+            if length < 0 or length > width * height - len(pixels):
+                raise ValueError("more pixels than one screen")
+            pixels.extend([rgb565_to_rgb(int(color, 16))] * length)
     port.close()
 
-    if len(pixels) != WIDTH * HEIGHT:
-        print(f"incomplete frame: got {len(pixels)} pixels, expected {WIDTH * HEIGHT}", file=sys.stderr)
+    if not started or len(pixels) != width * height:
+        print(f"incomplete frame: got {len(pixels)} pixels, expected {width * height}", file=sys.stderr)
         return 1
     if not backlight_on:
         # With the backlight off, what a person sees is a black screen; dim the image until it is barely visible.
         pixels = [bytes(channel // 8 for channel in pixel) for pixel in pixels]
-    write_png(output_path, pixels, scale)
+    write_png(output_path, pixels, scale, width, height)
     print(f"{output_path} backlight {'on' if backlight_on else 'off'}")
     return 0
 

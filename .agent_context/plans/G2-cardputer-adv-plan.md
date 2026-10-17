@@ -198,3 +198,14 @@ Open, to settle in the final phase:
 - Speaker: not yet confirmed by ear.
 - Wi-Fi/Relay: not viable on the Adv as built (38.8 KB of heap free before any network start). Profile A in G3.
 - Speaker, confirmed on the unit (fast-clock build): the focus-end voice line plays through the ES8311 and the speaker. The speaker-enable question is closed.
+
+### Linux desktop screenshot acceptance, 2026-10-17
+
+- The user confirmed the screenshot function working in the Linux desktop app with the physical Cardputer-ADV over
+  USB after a fresh daemon/app restart. The shared host decoder now reads `SHOT BEGIN` dimensions rather than assuming
+  320×240; the standalone serial screenshot tool follows the same rule. No firmware change was needed for this fix.
+- Five focused Rust tests, four simulated-device screenshot scenarios (no expected failures), and two standalone-tool
+  tests passed. Automated PNG checks cover 240×135 Adv and 320×240 BOX output. The manual run's saved image was not
+  independently inspected. See `docs/linux-host-testing.md` for the full record and remaining acceptance boundaries.
+- This closes the Linux screenshot acceptance item only; board identity, safe update targeting and other device/app
+  gates remain separate work.

@@ -53,9 +53,11 @@ overrides and service changes confined to the harness's child processes and temp
 
 ### Known device gaps carried forward
 
-- **240×135 screenshots:** retain the existing characterization test and expected failure while this behavior is
-  untouched. If a later change fixes it, update the old-error characterization and remove the expected-failure
-  marker together; require a real 240×135 PNG. Do not change the simulator to emit a BOX-size frame to get a pass.
+- **240×135 screenshots:** fixed during desktop/device acceptance. The daemon and standalone tool now use the frame's
+  announced dimensions. The expected-failure marker is removed and the old-error characterization now checks a
+  genuinely incomplete frame; the unmodified Adv simulator must produce a real 240×135 PNG. Historical test records
+  below still describe the failure before this fix. On 2026-10-17, after a fresh restart, the user confirmed the Linux
+  desktop screenshot working with the physical Cardputer-ADV over USB. Details and limits: `docs/linux-host-testing.md`.
 - **Missing Adv board report:** synthetic `BOARD cardputer-adv` proves only the host parser path. It does not prove
   the device reports its identity or that an update offer targets the correct hardware. Track device reporting
   with the Cardputer work separately; do not invent a boot signal or expand G4 into firmware changes implicitly.

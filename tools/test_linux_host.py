@@ -324,12 +324,15 @@ class LinuxHostTests(HostTestCase):
         self.host.emit(b'x' * 9000 + b'\nVOLUME 60\n')
         self.host.wait_device(lambda device: device["volume"] == 60, "oversized diagnostic recovery")
 
-    def test_cardputer_screenshot_rejection_is_explicit(self):
-        code, response = self.host.request("/v1/device/screenshot", method="POST")
-        # Characterize the existing host limitation without fixing production in the infrastructure pass.
+    def test_incomplete_cardputer_screenshot_is_rejected(self):
+        self.host.filter(drop=("SHOT",))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            capture = executor.submit(self.host.request, "/v1/device/screenshot", method="POST")
+            self.host.wait_line("SHOT END")
+            self.host.emit("SHOT BEGIN 240x135 BACKLIGHT ON\nSHOT 0000:10\nSHOT END\n")
+            code, response = capture.result(timeout=8)
         self.assertEqual(code, 502, response)
-        self.assertIn(b"incomplete frame: 32400 pixels", response)
-        self.host.wait_line("SHOT BEGIN 240x135")
+        self.assertIn(b"incomplete frame: 10 pixels", response)
 
     def test_synthetic_box_screenshot_still_encodes_as_png(self):
         # Synthetic BOX-size compatibility data, explicitly separate from the real Adv frame.
@@ -353,10 +356,8 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(code, 502, response)
         self.assertIn(b"bad color", response)
 
-    @unittest.expectedFailure
     def test_cardputer_screenshot_should_be_a_240_by_135_png(self):
         code, png = self.host.request("/v1/device/screenshot", method="POST")
-        # Keep unexpected transport/setup errors outside the expected-failure assertion.
         self.host.wait_line("SHOT END")
         self.assertEqual(code, 200, png)
         self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")

@@ -82,3 +82,7 @@ services after another grace period, and adds header/inactivity deadlines to the
 uses the same 45 s inactivity limit and its failure notification retains the last reported toggle. The goal and parity
 summaries are updated. The findings above describe the reviewed `868b07c` state; current validation is recorded in
 `linux-host-testing.md`. Real desktop acceptance, the systemd session-environment check and P2 navigation remain open.
+The later screenshot fix also closes the Adv PNG carryover: four screenshot integration scenarios now pass without
+an expected-failure marker. On 2026-10-17 the user also confirmed the Linux desktop screenshot working with the physical
+Cardputer-ADV over USB after a fresh restart. The detailed acceptance record and its limits are in
+`linux-host-testing.md`. Board identity remains a separate unresolved item.

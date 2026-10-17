@@ -131,6 +131,11 @@ Checked headless, with no desktop: the daemon-failure notification policy and it
 X11 focus backends and their selection (`SwayFocusTests`, `X11FocusTests`, `daemon/src/window_focus.rs`), the Hyprland K2
 regressions, and the tray host's behaviour in isolation (an Xvfb display with a private bus, and with the user's bus).
 
+User-confirmed on the physical device, 2026-10-17: the Linux desktop screenshot works with a USB-connected
+Cardputer-ADV after restarting with the screenshot fix (Ubuntu GNOME/Wayland). The shared daemon now uses the frame's
+announced dimensions; automated checks cover 240×135 Adv and 320×240 BOX PNGs. This manual acceptance covers the Linux
+screenshot path only; it does not establish Mac, network or image-saving acceptance. See `docs/linux-host-testing.md`.
+
 Not run on a machine: K2 on a real Sway or X11 session; the daemon-failure notification on a real desktop and systemd
 unit; the tray without the AppIndicator extension on Fedora, upstream GNOME or KDE; the notifications under each desktop
 environment; the Linux voice preview; the Linux Claude and Codex apps' environment and URL schemes (G4 P2 needs the apps

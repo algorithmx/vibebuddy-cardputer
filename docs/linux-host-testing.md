@@ -109,7 +109,7 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Dropped/delayed/duplicate receipt, wrong sequence, injected `voice.error`, lost link | No next chunk before its receipt; delayed receipt resumes the write; one operation at a time; failure propagated; missing receipt times out and permits retry. |
 | HTTP/SSE device updates; snapshots consumed by Linux app probe | Live status changes; real app decoder and online/offline/daemon-down tray model. |
 | Split/coalesced CRLF lines, malformed JSON/version, oversized diagnostic | Recovery to valid status without launching a source. |
-| Real Adv screenshot; synthetic valid BOX frame and malformed run | Adv limitation recorded; existing PNG path works on its supported dimensions; malformed pixels become HTTP errors. |
+| Real Adv screenshot; synthetic valid BOX frame, incomplete frame and malformed run | PNG dimensions match each board's header (240×135 or 320×240); incomplete and malformed pixels become HTTP errors. |
 | Factory log line followed by several heartbeat intervals, then ROM reset/build | No hello or heartbeat is written to foreign firmware; normal traffic resumes after our build appears. |
 | Daemon stopped (status stream retries every 2 s), with the unit `inactive`, `failed`, unreadable, slow or never read, and the app's notify toggle on, off or never read | `daemon_outage_probe` runs the app's real status stream through the outage policy and its `systemctl`/`notify-send` adapters. One `notify-send` per outage after a 4 s grace (shortened for the probe; the 30 s boundary is unit-tested with explicit instants); none for a brief restart, a stopped unit or a disabled toggle; rearmed after recovery. |
 | Inactive service followed by failed startup with no status recovery; restart requested while HTTP is down | The outage policy rechecks the stopped service and notifies when it later fails. The same restart adapter used by Advanced and the tray calls systemd without HTTP and reports a refused restart. |
@@ -120,11 +120,10 @@ documentation-range IP address. Other scenarios generate actions directly or run
 
 ## Known gaps exposed before G4
 
-1. **Adv screenshots fail on the computer.** `daemon/src/screenshot.rs` assumes 320×240, while the simulator produces
-   a complete 240×135 frame. One passing characterization test asserts the existing 502 response and 32,400-pixel
-   error. A separate expected-failure test specifies the desired 240×135 PNG; remove the marker with the later fix.
-   Setup errors remain ordinary test failures. The characterization test prevents unrelated screenshot errors from
-   being silently accepted by the expected-failure marker.
+1. **Adv screenshots originally failed on the computer; now fixed.** The daemon and standalone screenshot tool use the
+   dimensions in `SHOT BEGIN` instead of assuming 320×240. The Adv test now requires a 240×135 PNG without an
+   expected-failure marker; the old rejection characterization is replaced with an incomplete-frame regression.
+   The synthetic BOX compatibility test remains. Historical validation counts below retain their original expected failure.
 2. **Adv board identity is not reported.** The current Rust device/core boot does not print `BOARD cardputer-adv`.
    The host therefore cannot identify it using its existing board guard. An explicit synthetic report verifies the
    host path, without changing the real boot behavior or claiming firmware update offers are safe for the Adv.
@@ -222,3 +221,29 @@ The sandbox initially denied local socket binding; the socket tests passed when 
 not rerun the full host suite or workspace tests. Swift is unavailable on this Linux host, so the Mac preference and
 stream-timeout changes have only been inspected. Real UI, notification-server and systemd acceptance, the Sway/X11
 session environment, and P2 session navigation remain pending.
+
+## Cardputer-ADV screenshot fix on 2026-10-17
+
+The shared daemon now reads frame dimensions from `SHOT BEGIN`, bounds them to 76,800 pixels, and rejects oversized
+runs before allocation. PNG output preserves the announced dimensions. The standalone serial tool follows the same
+dimensions and bounds. This fixes the Mac and Linux apps through their existing shared screenshot API; no firmware
+change is required.
+
+Validation with offline dependencies: five focused Rust screenshot tests passed, the four screenshot host scenarios
+passed in 6.9 s with no expected failures, and two standalone-tool tests passed (including decoded PNG pixel data).
+The real Adv firmware core produced the 240×135 frame; BOX compatibility used the explicit 320×240 synthetic fixture.
+Daemon Clippy passed with the existing warnings, `git diff --check` passed, and the debug daemon was rebuilt.
+The automated checkpoint did not rerun the full host/workspace suites.
+
+**Physical-device acceptance, user-confirmed on 2026-10-17:** after a fresh restart of the rebuilt daemon and the Linux
+desktop app, the user confirmed that the screenshot function worked with the Cardputer-ADV connected over USB. The
+desktop session was Ubuntu GNOME on Wayland. This accepts the Linux desktop → daemon → physical device → screenshot
+path. The 240×135 PNG dimensions and decoded pixel content were checked by the automated tests above; no saved image
+from this manual run was independently inspected. Mac screenshot acceptance, network screenshots, image saving and
+the remaining device/desktop acceptance items are not established by this confirmation.
+
+Manual launch reminders from this session: use `./target/debug/vibebuddy-desktop --settings` to open the window after
+the first launch; the plain command starts in the tray. Serial access initially failed with `Permission denied` on
+`/dev/ttyACM0` (`root:dialout`, user outside `dialout`); the repository's `packaging/linux/70-vibebuddy.rules` provides
+active-desktop-user access when installed and applied. Neither starting the GUI nor compiling the daemon installs
+that system rule.
