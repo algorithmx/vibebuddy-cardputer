@@ -9,6 +9,10 @@ This folder holds text extracts of the official M5Stack documentation for the Ca
 - `README.md` (this file): source list, access dates and what each source covers.
 - `extracts.md`: pin and feature tables taken from the product pages, our transcription of the Cardputer-Adv schematic net names, and the pin and I2C constants from the vendor factory firmware `hal/` headers.
 
+For the Linux simulated-device test harness derived from these references, see
+[`../../linux-host-testing.md`](../../linux-host-testing.md). Its 2026-10-17 source recheck found the product page at
+https://docs.m5stack.com/en/core/Cardputer-Adv; the previously recorded SKU URL was inaccessible in that check.
+
 ## Sources
 
 ### Official M5Stack sources
