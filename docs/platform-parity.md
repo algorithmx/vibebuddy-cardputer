@@ -15,7 +15,7 @@ Reviewed 2026-10-17, second pass (the first pass had errors; see "Corrections" a
 | Daemon supervision | the app starts and restarts `vibebuddyd` (`DaemonSupervisor.swift`, backoff `[1,2,5]` s, gives up after three failed starts) | systemd user service (`packaging/linux/vibebuddyd.service`: `Restart=always`, `RestartSec=2`, default start limit) |
 | Quitting the app | stops the daemon: the box goes offline ("Quit VibeBuddy (the box goes offline)") | leaves the daemon running: the box stays online (`tray.rs`, "Quit") |
 | Install | Homebrew cask, DMG | `install.sh` from the release tarball, pacman package, or build from source |
-| Tests in CI | `SelfTest` only (model and status decoding), macOS runner | `cargo test --workspace` on Ubuntu (daemon, hook, Linux app), clippy, the localization check |
+| Tests in CI | `SelfTest` only (model and status decoding), macOS runner | `cargo test --workspace` on Ubuntu (daemon, hook, Linux app), clippy, the localization check, the Python tool tests, and the Linux host suite with a simulated Cardputer-ADV (`tools/test-linux-host.sh`, see `docs/linux-host-testing.md`) |
 
 The daemon (`daemon/`) and the hook (`hook/`) are shared. Their platform code sits in a few places: the config and
 state directories (`daemon/src/config.rs`), K2 (`daemon/src/source_opener.rs`), the box-lost alert
@@ -62,11 +62,13 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 | Icon | `NSStatusItem` with the buddy's face | ksni StatusNotifierItem tray icon with the face | differs (platform) |
 | Menu: device, mode and today lines; restart from the device line when the daemon is down; Settings…, Check for Updates…, Report a Problem…, Quit | yes | yes (`tray.rs`, `menu`) | same |
 | App menus (Edit, Window, Hide) | standard macOS menus | none (no app menu bar) | by design |
-| No tray host | not applicable | the app notices (`watcher_offline`, or ksni fails to start) and opens the settings window after 10 s; it does not say why (`main.rs`, `TrayHostCheck`) | Linux gap (small): no explanation |
+| No tray host | not applicable | the app notices (`watcher_offline`, or ksni fails to start) and opens the settings window after 10 s (`main.rs`, `TrayHostCheck`); the README's Linux section says why and names the extension | differs; explained in the README, not in the window (G4 P3) |
 | Omarchy bar plugin, Omarchy colours and font | not applicable | yes (`tray.rs`, `theme.rs`) | Linux only |
 
 Where a tray host exists: KDE supports StatusNotifierItem natively; Ubuntu preinstalls the AppIndicator GNOME extension;
-Fedora and upstream GNOME do not, so there the icon needs the extension. Sources in the research notes.
+Fedora and upstream GNOME do not, so there the icon needs the extension. Sources in the research notes. Without a
+tray host the app opens its settings window about 10 s after start (`TrayHostCheck`); the README's Linux section says
+why and names the extension (G4 P3).
 
 ### K2: what the box's source key opens
 
@@ -79,12 +81,12 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
 
 | Where the agent runs | Mac | Linux | Status |
 |---|---|---|---|
-| Claude Code session in the Claude desktop app | opens that session: `claude://code/continue?session=…` | focuses the window that owns the agent's process, under Hyprland only; that is the app window, not the session | Linux gap: window, not session; unverified on the Claude Linux beta |
-| Codex in the Codex app | opens that thread: `codex://threads/<id>` | same as above: the app window under Hyprland | Linux gap; unverified on the ChatGPT/Codex Linux preview |
-| Terminal session | brings the terminal forward; with the Automation permission, the exact tab (Ghostty, iTerm2, Terminal) | focuses the terminal window, Hyprland only (`hyprctl`) | differs; tabs Mac only |
+| Claude Code session in the Claude desktop app | opens that session: `claude://code/continue?session=…` | focuses the window that owns the agent's process, on Hyprland, Sway or X11; that is the app window, not the session | Linux gap: window, not session; unverified on the Claude Linux beta |
+| Codex in the Codex app | opens that thread: `codex://threads/<id>` | same as above: the app window on Hyprland, Sway or X11 | Linux gap; unverified on the ChatGPT/Codex Linux preview |
+| Terminal session | brings the terminal forward; with the Automation permission, the exact tab (Ghostty, iTerm2, Terminal) | focuses the terminal window: `hyprctl` on Hyprland, `swaymsg` on Sway, `wmctrl` on X11 (`window_focus.rs`) | differs; tabs Mac only |
 | Warp | its focus deep link back to the pane | not handled (the hook ignores `WARP_FOCUS_URL` outside macOS) | Mac only |
-| Inside tmux | switches the tmux client to the pane, then the terminal tab | switches the tmux client to the pane (any desktop), then focuses its window (Hyprland only) | differs |
-| Any compositor other than Hyprland (GNOME, KDE, Sway, X11) | not applicable | no window focus; K2 logs the failure; a tmux pane switch still happens | **Linux gap** |
+| Inside tmux | switches the tmux client to the pane, then the terminal tab | switches the tmux client to the pane (any desktop), then focuses its window (Hyprland, Sway or X11) | differs |
+| GNOME or KDE under Wayland (no supported window backend) | not applicable | no window focus; K2 logs the failure; a tmux pane switch still happens | **Linux gap** |
 | GitHub Actions card | `open` the run page | `xdg-open` the run page | same |
 | No host (SSH, background process) | nothing to open, logged | same | same |
 
@@ -100,16 +102,22 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
 
 ## Gaps, ranked
 
-1. **K2 focus works only under Hyprland.** On GNOME, KDE, Sway and X11, K2 does nothing visible except a tmux pane
-   switch. This is the largest functional difference for Linux users outside Omarchy.
+1. **K2 focus: Hyprland, Sway and X11 now; GNOME and KDE under Wayland still not.** On GNOME and KDE Wayland, K2 does
+   nothing visible except a tmux pane switch. The Sway and X11 backends (`daemon/src/window_focus.rs`) are checked
+   headless against synthetic window listings; desktop acceptance on each is pending. Before this change, the gap
+   covered every desktop but Hyprland.
 2. **Daemon-failure notification: closed on Linux, with a Mac question left open.** The Linux app now sends it
    (`outage.rs`; headless tests in `DaemonOutageTests`; desktop acceptance pending). The Mac's give-up path looks like
    it ignores the toggle, because its check reads a status that is already cleared (`AppModel.swift:45–50`). Whether to
    fix that on the Mac is a decision for the maintainers: AGENTS.md asks that a change in one app come with the other.
-3. **K2 reaches the Claude or Codex app window, not the session, and only under Hyprland.** Whether the Linux builds of
-   those apps set `CLAUDE_CODE_HOST_SESSION_ID` and register the `claude:` and `codex:` URL schemes is unknown.
-4. **No explanation when there is no tray.** The window opens after 10 s, but on Fedora or upstream GNOME the user is
-   not told that the icon needs the AppIndicator extension.
+3. **K2 reaches the Claude or Codex app window, not the session.** Focus works on Hyprland, Sway and X11 (G4 P1). Whether
+   the Linux builds of those apps set `CLAUDE_CODE_HOST_SESSION_ID` and register the `claude:` and `codex:` URL schemes is
+   unknown: the apps are not installed on the machine where this was checked, so the G4 P2 gate has not run. The Claude
+   Code CLI's desktop entry registers `claude-cli://`, not `claude://`.
+4. **No explanation when there is no tray: documented, not in the window.** The window opens after 10 s, and the README's
+   Linux section now says why and how to get the icon (G4 P3). A line in the window is deferred until users report
+   missing it. Checked on Ubuntu 22.04 GNOME (extension on, host present: no window, tray item registered) and in an
+   isolated Xvfb run without a watcher (window appears 9–11 s after start). Fedora and upstream GNOME are not run.
 
 By design, and documented rather than closed: manual app updates on Linux, the opposite meaning of Quit, the terminal
 tabs and Warp (Mac only), the app menus, the first-run guide's shorter Linux path.
@@ -118,8 +126,14 @@ tabs and Warp (Mac only), the app menus, the first-run guide's shorter Linux pat
 
 Verified by reading the code: every row above.
 
-Not run on a machine: any K2 action on Linux, the notifications under each desktop environment, the tray on GNOME, the
-Linux voice preview, and the Linux Claude and Codex apps' environment and URL schemes.
+Checked headless, with no desktop: the daemon-failure notification policy and its probe (`DaemonOutageTests`), the Sway and
+X11 focus backends and their selection (`SwayFocusTests`, `X11FocusTests`, `daemon/src/window_focus.rs`), the Hyprland K2
+regressions, and the tray host's behaviour in isolation (an Xvfb display with a private bus, and with the user's bus).
+
+Not run on a machine: K2 on a real Sway or X11 session; the daemon-failure notification on a real desktop and systemd
+unit; the tray without the AppIndicator extension on Fedora, upstream GNOME or KDE; the notifications under each desktop
+environment; the Linux voice preview; the Linux Claude and Codex apps' environment and URL schemes (G4 P2 needs the apps
+installed); the Mac app's give-up path (read from the code only).
 
 ## Research notes (web, 2026-10-17; secondary sources, check the vendors before relying on them)
 

@@ -232,10 +232,10 @@ real behavior contradicts a simulated pass or a test proves unreliable. These pr
 |---|---|---|
 | T0 current-revision baseline | Done 2026-10-17 | Entry below |
 | P0 app notification path | Implemented; headless checks pass; desktop acceptance pending | Entry below |
-| P1 Sway | Not started | Pending |
-| P1 X11 and Hyprland regression | Not started | Pending |
-| P2 capability gate / conditional implementation | Not started | Pending |
-| P3/P4 coverage and documentation closeout | Not started | Pending |
+| P1 Sway | Implemented; headless checks pass; desktop acceptance pending | Entry below |
+| P1 X11 and Hyprland regression | Implemented; headless checks pass; Hyprland regression in the full run; desktop acceptance pending | Entry below |
+| P2 capability gate / conditional implementation | Blocked: the apps are not installed on the machine checked; gate not run | Entry below |
+| P3/P4 coverage and documentation closeout | P3 and P4 done (docs reconciled); desktop acceptance pending | P3 and P4 entries below |
 
 **T0 entry, 2026-10-17, revision `0c1360a` (branch `claude/cardputer-adv-port`, clean tree).**
 
@@ -304,6 +304,91 @@ the difference is recorded for a maintainer decision (`docs/platform-parity.md`,
   `systemctl --user stop` should give the notifications and silences the tests predict, and the tray restart should
   clear it. Not run: a real notification server, a real systemd unit, the Mac app. P1 is next, one backend at a time, and
   the outage seam is reused as it stands.
+
+**P1 entry, 2026-10-17, uncommitted on top of `0c1360a`.** Sway, then X11, each with its scenarios written red first. The
+Hyprland path stays the default.
+
+- **Observation:** full host runner 55 scenarios OK (30 existing, 9 P0, 9 Sway, 7 X11), one expected failure, 204 s.
+  Workspace 522 passed; Adv core passed; clippy exit 0 with the 4 pre-existing warnings; localization 285 keys. Sway
+  scenarios first failed red (6 of 9), then passed; X11 scenarios first failed red (6 of 7), then passed. The one X11
+  "red" that passed at first (the Xwayland guard) was correct: it is the Hyprland default. Mutation checks, each caught by
+  its own scenarios: Sway socket existence check removed and focus success loosened (2 tests); `x11` routed to Hyprland
+  (6 tests).
+- **Coverage assessment:** the production path is covered end to end: real daemon, real K2 release through the PTY,
+  `window_focus::compositor` choosing the backend from the daemon's environment, and the `swaymsg`/`wmctrl` stubs
+  receiving the exact argv (`-t get_tree`, `[con_id=N] focus`, `-l -p`, `-i -a <id>`). Not covered: real `swaymsg` and
+  `wmctrl` output and exit codes; the fixtures are synthetic (`tools/fixtures/linux-windows/README.md`). Stubs take any
+  argument list, so a mistake in the criteria syntax would pass the harness; the syntax is from the sway and wmctrl
+  documentation, not run. A missing executable is checked in a unit test (`run`), not through the daemon.
+- **Decisions taken:**
+  - Selection order: Hyprland signature, then a Sway socket that exists, then `XDG_SESSION_TYPE` (`x11` is X11, any
+    other value stays on Hyprland), then a bare `DISPLAY` without `WAYLAND_DISPLAY` as X11, else Hyprland. A session
+    type always beats the display guess, so Xwayland stays on Hyprland.
+  - Within a window list, the first window of the nearest ancestor that owns one wins (the same rule as Hyprland). Sway
+    tree order is tiled before floating; wmctrl's listing order.
+  - Invalid container ids (`<= 0`) and X window ids that aren't `0x` hex never reach a command. Malformed or unparseable
+    output is "no host window", not an error with stack detail.
+  - A Sway focus counts only when swaymsg's reply says every command succeeded; a refused focus is logged with its reply.
+  - `run` became `pub(crate)` so the new module shares the bounded runner; `focus_window` now dispatches and keeps the
+    Hyprland body as `focus_hyprland`.
+  - The stubs gained leading-argument replies and stderr, `command_reply(name, args=[...])`. A default reply without
+    `args` still replaces the old one, so earlier tests are unchanged.
+  - `wmctrl` is an optional dependency in the AUR package (PKGBUILD and `.SRCINFO`); Sway needs nothing extra, since
+    `swaymsg` ships with sway.
+- **Known limit, documented, not fixed:** a terminal that puts all its windows under one process (one pid) can make K2
+  raise the wrong one, as on Hyprland.
+- **Follow-through:** docs updated: `README.md` and `README.zh-CN.md` (K2 paragraph: Hyprland, Sway and X11; GNOME and KDE
+  Wayland not), `docs/platform-parity.md` (K2 rows, gap 1), `docs/linux-host-testing.md` (scenario rows, stubs, acceptance,
+  validation). Remaining acceptance: on a real Sway session and a real X11 session, press K2 with an agent running in a
+  terminal and check the window gains focus, including after completion and after a daemon restart. Check the environment
+  of the systemd-launched daemon: `SWAYSOCK`, `DISPLAY` and `XDG_SESSION_TYPE` must reach it, or K2 falls back to Hyprland
+  and logs an error. Recheck Hyprland when shared selection changes (done here, through the full run).
+
+**P3 entry, 2026-10-17, docs only; no code changed since the P1 checkpoint.** The plan's order is docs first, and the
+window line waits for user evidence.
+
+- **Observation:** on the real desktop (Ubuntu 22.04.5, GNOME on Wayland, `ubuntu-appindicators@ubuntu.com` enabled,
+  the StatusNotifier watcher on the session bus) the tray host is present. For the host-absent case there was no
+  watcher, so I used a private `dbus-run-session` bus on an isolated Xvfb display. Results: with the host present, the
+  app registered its tray item, and no window opened at 8, 12 or 16 s. With the host absent, no window at 6 or 9 s, and
+  one at 11 s (`TrayHostCheck` fires 10 s after `HostGone`). Note: the tray item name registers even without a watcher,
+  so only the window separates the two cases.
+- **Coverage assessment:** this exercises the real ksni registration, `HostGone`/`HostBack`, the 10 s check and
+  `OpenSettings`, in a real app process. It does not cover Fedora or upstream GNOME without the extension, KDE, or
+  Omarchy's bar. The window was checked with `xwininfo` on the isolated display, because GNOME refuses window listing
+  over D-Bus; the real session's window was not inspected, to avoid taking a screenshot of the desktop. The tray icon
+  was visible in the real top bar for the host-present run's ~15 s.
+- **Decision:** documentation only. The README's Linux section explains the icon, names the GNOME extension and its
+  Fedora package, and says the window opens after 10 s. No line is added to the window: that waits for reports that
+  users miss the explanation, and the plan says so. No tray-server emulator was built.
+- **Follow-through:** `README.md` and `README.zh-CN.md` (Linux section), `docs/platform-parity.md` (tray paragraph and
+  gap 4). Remaining acceptance: Fedora or upstream GNOME without the extension, and KDE, on a real machine, recording the
+  distribution, extension and session as the plan asks. Known: GNOME updates have broken this extension before, so the
+  README names the package rather than a version.
+
+**P2 entry, 2026-10-17: gate not run.** Step 1 needs the official Linux Claude and Codex apps, their versions, and the
+hook environment and URL handling. None is installed here. The Claude Code CLI (2.1.302) and Codex CLI (0.163.0) are,
+and the one desktop entry on the machine (`claude-code-url-handler.desktop`) registers `claude-cli://`, not `claude://`,
+so it is no evidence for the app's scheme. `xdg-mime` has no handler for `x-scheme-handler/claude` or `codex`. Record the
+apps as unverified, as step 1 says; the window-focus fallback is what K2 does on Linux until the gate passes. Installing
+a beta app is a step for the maintainer to approve, so it was not done. No step 2 code was written.
+
+**P4 entry, 2026-10-17: docs reconciled, no code change.** `docs/platform-parity.md` now separates what is implemented,
+what is checked headless, and what is not run: the CI row lists the Linux host suite, the tray row and gap 4 point to the
+README, gap 3 covers Sway and X11 and records the P2 gap, and the verified section is rewritten. `docs/architecture.md`
+point 15 names the window systems and the Linux daemon-failure notification. `docs/app.md` has a short Linux section that
+points to the review. `docs/linux-host-testing.md` has the scenario rows, fixture provenance (`tools/fixtures/linux-windows/README.md`),
+runtime and validation for each checkpoint, and a corrected intro. Both READMEs describe K2 per desktop, the
+daemon-failure notification, the tray, and `wmctrl` as optional; the Linux sections match. Three lessons went to
+`LESSONS.md`, each from an incident in this work: a negative test that passed through the old path, a log read before the
+record was written, and an expected failure that failed for another reason. No code changed in P4, so the P1 checkpoint
+(55 host scenarios, 522 workspace tests) still stands.
+
+**Closeout, what is still open.** Desktop acceptance: the daemon-failure notification and intentional stop on a real
+desktop and systemd unit (P0); K2 on a real Sway session and a real X11 session, including after completion and after a
+daemon restart, with the systemd daemon's environment checked (P1); the tray on Fedora or upstream GNOME without the
+extension, and on KDE (P3). P2: the apps need installing and the gate running. Decision for a maintainer: the Mac's
+give-up path and its toggle (`docs/platform-parity.md`, gap 2), and whether the window should explain the missing tray.
 
 For an entry, record:
 

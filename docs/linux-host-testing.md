@@ -1,8 +1,8 @@
 # Linux host tests with a simulated Cardputer-ADV
 
-This is the first implementation wave before G4's Linux parity changes. It exercises the existing computer-side
-code without a physical device: the real daemon, the firmware core compiled for Cardputer-ADV, and the Linux app's
-status decoder and tray model. G4 P0–P4 remain separate work.
+This began as the first implementation wave, before G4's Linux parity changes. Those changes (P0, P1 and P3) now run
+here too, each with its own scenarios; the validation sections record each checkpoint. It exercises the computer-side code without a physical device: the real daemon, the firmware core compiled for Cardputer-ADV, and the Linux app's
+status decoder and tray model. P2 has not started.
 
 ## Device and protocol evidence
 
@@ -75,7 +75,9 @@ Update checks and Relay use are disabled, with loopback-only fallback URLs, and 
 lists are recorded; responses, exit codes and a `sleep` before answering can be configured with `command_reply`. One
 reply per program applies to every argument list. The Hyprland tests exercise its older dispatch syntax and command
 failure/recovery. The `systemctl` and `notify-send` stubs carry the G4 P0 outage scenarios. The `swaymsg` and `wmctrl`
-stubs are still only extension points for P1; their presence does not mean those features have been implemented.
+stubs carry the P1 scenarios. Their replies can be keyed by leading arguments (`command_reply(name, args=[...], ...)`),
+so the window listing and the focus call can differ, and stderr can be set. The window listings are synthetic
+(`tools/fixtures/linux-windows/README.md`).
 
 The PTY has no USB VID/PID metadata. The existing explicit-port path therefore assumes bridge pacing and reports
 `device.bridge=true`, even though the physical Adv uses native USB. USB discovery, native-USB write timing, DTR reset,
@@ -95,6 +97,8 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Working, needs input, failed, done events | HTTP events reach the firmware's display and announcement paths. |
 | K2 short press on release | Source focus command; needs-input priority; completed source retained; destination survives daemon restart. |
 | Nearest ancestor window; Lua dispatch rejected; desktop command fails | Correct PID choice, legacy Hyprland fallback and recovery on the next press. |
+| K2 on Sway: nearest ancestor's container focused with `swaymsg`; needs-input priority; completed source survives a restart; refused focus, failing or slow `swaymsg`, missing window, malformed tree; a stale `SWAYSOCK` falls back to Hyprland | `SwayFocusTests`. `swaymsg -t get_tree` and `[con_id=N] focus` are answered by a synthetic tree and reply. A refused focus is logged with its reply and the next press recovers; failures and timeouts are logged, and nothing else is focused. |
+| K2 on X11: nearest ancestor raised with `wmctrl -i -a`; missing, malformed or invalid listing rows; refused raise; failing or slow `wmctrl`; an Xwayland session stays on Hyprland | `X11FocusTests`. `wmctrl -l -p` is answered by a synthetic listing. Invalid rows are skipped, and errors are logged with their stderr. Missing executables and the selection rules are covered by unit tests in `daemon/src/window_focus.rs`. |
 | K0/K1 taps, K2 hold, K1 hold and menu K2 | Pomodoro/mode diagnostics reach status; mute/menu actions stay local and do not open a source. |
 | Firmware clock advanced across a focus period | Focus completion diagnostic without waiting 25 minutes. |
 | Disconnect, new PTY, device reset | Offline/reconnect status; settings and pairing key restored from the same simulated flash. |
@@ -159,8 +163,9 @@ remain available for separate network development.
 ## Acceptance still required
 
 The suite does not launch the iced window, exercise the real tray host/desktop notification server or focus an
-actual window. It does not establish Claude/Codex Linux app availability or session URL handling (G4 P2), implement
-Sway/X11 focus (P1). The daemon-failure notification (P0) is tested headless through the app's stream and the stubs, but
+actual window. It does not establish Claude/Codex Linux app availability or session URL handling (G4 P2). The Sway and
+X11 focus backends (P1) are checked against synthetic window listings, not a real compositor or X server: that desktop
+acceptance is pending. The daemon-failure notification (P0) is tested headless through the app's stream and the stubs, but
 not on a real notification server or a real systemd unit: that desktop acceptance is pending. Hardware key scanning, sound, native USB
 discovery/timing, RAM pressure, LAN/Relay handover and ROM flashing are separate acceptance tasks. Existing firmware
 and daemon unit tests continue covering network/Noise/OTA logic; this first wave adds the missing USB host boundary.
@@ -183,3 +188,15 @@ exits 0 with the four warnings that were already there, none in the desktop crat
 285 keys. As a mutation check, a copy of the policy that stopped suppressing `inactive` and one that ignored the
 toggle each failed exactly their matching scenario, and the policy was restored. Not run: a real desktop notification,
 a real systemd unit, or the Mac app.
+
+## Validation recorded for G4 P1 on 2026-10-17
+
+On top of the P0 changes, still uncommitted: the full host runner passed 55 scenarios, with the same one expected
+screenshot failure, in 204 s. That is the 30 existing scenarios, the 9 P0 outage scenarios, 9 Sway scenarios and 7 X11
+scenarios. The Hyprland K2 scenarios, including the nearest-ancestor, legacy-dispatch and recovery cases, are among the
+existing ones and passed unchanged. The workspace tests passed 522 cases, one ignored, up from 502 with 20 window-focus
+unit tests. Clippy exits 0 with the same four warnings as before, none in the new code. The localization check passed.
+Mutation checks: a Sway socket treated as live without checking it, and a refused focus counted as success, each failed
+the scenarios that should catch them; an `x11` session routed to Hyprland failed all X11 scenarios except the Xwayland
+guard, which is meant to pass. Not run: a real Sway or X11 session, a real `swaymsg` or `wmctrl`, and the systemd
+environment of a real daemon. The window listings are synthetic.
