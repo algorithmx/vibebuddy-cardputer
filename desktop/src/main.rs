@@ -134,10 +134,9 @@ enum Message {
     TakeScreenshot,
     Screenshot(Result<Vec<u8>, String>),
     SaveScreenshot,
+    /// Through systemd on Linux, including when the daemon's HTTP endpoint is unavailable.
     RestartDaemon,
     LaunchAtLogin(bool),
-    /// Through systemd, which works when the daemon isn't answering, unlike its own restart endpoint.
-    StartDaemon,
     /// The tray's Check for Updates…: check, and show General, where the answer appears (the Mac shows Sparkle's).
     CheckFromMenu,
     /// Play a Character's preview lines here, or stop the one playing.
@@ -624,12 +623,6 @@ impl App {
             Message::CheckFromMenu => {
                 self.tab = Tab::General;
                 return Task::batch([Task::done(Message::OpenSettings), Task::done(Message::CheckForUpdatesNow)]);
-            }
-            Message::StartDaemon => {
-                let args = ["--user", "restart", "vibebuddyd"].map(std::ffi::OsStr::new);
-                if let Err(error) = launch("systemctl", &args) {
-                    self.notice = Some(Err(error));
-                }
             }
             Message::LaunchAtLogin(enabled) => {
                 match set_launch_at_login(enabled) {
@@ -1588,7 +1581,7 @@ impl App {
             .unwrap_or_default();
         column![
             row![text("daemon").width(140), text(daemon)].spacing(12),
-            button(text(tr("Restart daemon", &[]))).on_press_maybe(self.status.is_some().then_some(Message::RestartDaemon)),
+            button(text(tr("Restart daemon", &[]))).on_press(Message::RestartDaemon),
             // The daemon logs to the journal here, not a file; the folder holds the hook's log.
             row![
                 button(text(tr("Show daemon log", &[]))).on_press(Message::ShowDaemonLog),
@@ -1947,7 +1940,7 @@ fn run_tray() -> impl futures::Stream<Item = Message> {
         while let Some(event) = clicks.next().await {
             let message = match event {
                 tray::TrayEvent::OpenSettings => Message::OpenSettings,
-                tray::TrayEvent::RestartDaemon => Message::StartDaemon,
+                tray::TrayEvent::RestartDaemon => Message::RestartDaemon,
                 tray::TrayEvent::CheckForUpdates => Message::CheckFromMenu,
                 tray::TrayEvent::ReportProblem => Message::ReportProblem,
                 tray::TrayEvent::Quit => Message::Quit,

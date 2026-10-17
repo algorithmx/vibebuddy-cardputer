@@ -30,6 +30,14 @@ fn config_dir() -> Option<std::path::PathBuf> {
 async fn main() {
     let mut args = std::env::args().skip(1);
     let base = args.next().expect("the daemon's base URL");
+    // Exercise the recovery adapter the real app uses, including when its HTTP server is gone.
+    if base == "--restart" {
+        if let Err(error) = client::restart_daemon().await {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let grace = Duration::from_millis(args.next().expect("the grace period in ms").parse().expect("a number of ms"));
     let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<Event>();
 
@@ -38,7 +46,9 @@ async fn main() {
         let mut updates = std::pin::pin!(client::status_updates_at(base));
         while let Some(update) = updates.next().await {
             let event = match update {
-                client::Update::Status(status) => Event::Status { notify_link: status.config.notify_link },
+                client::Update::Status(status) => Event::Status {
+                    notify_link: status.config.notify_link,
+                },
                 client::Update::Down => Event::Down,
             };
             if updates_tx.send(event).is_err() {

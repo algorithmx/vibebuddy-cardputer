@@ -73,7 +73,12 @@ pub struct Outage {
 
 impl Outage {
     pub fn new(grace: Duration) -> Self {
-        Self { grace, down_since: None, notified: false, notify_link: true }
+        Self {
+            grace,
+            down_since: None,
+            notified: false,
+            notify_link: true,
+        }
     }
 
     pub fn handle(&mut self, event: Event, now: Instant) -> Option<Effect> {
@@ -93,8 +98,13 @@ impl Outage {
             }
             Event::GraceElapsed => self.due(now).then_some(Effect::CheckService),
             Event::Service(service) => {
-                if !self.due(now) || service.suppresses() {
+                if !self.due(now) {
                     return None;
+                }
+                // A stopped unit can later fail to start without ever serving a status snapshot. Keep observing it
+                // so intentional-stop suppression does not hide that later failure forever.
+                if service.suppresses() {
+                    return Some(Effect::Wait(self.grace));
                 }
                 self.notified = true;
                 Some(Effect::Notify)
@@ -124,7 +134,10 @@ pub async fn service() -> Service {
 /// The notification, sent with `notify-send` as the firmware one is. It is spawned and not awaited, so a slow
 /// notification server never holds up the app.
 pub fn notify() -> Result<(), String> {
-    let body = tr("The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.", &[]);
+    let body = tr(
+        "The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.",
+        &[],
+    );
     std::process::Command::new("notify-send")
         .args(["--app-name=VibeBuddy", "VibeBuddy", body.as_str()])
         .spawn()
@@ -178,7 +191,10 @@ mod tests {
         let mut policy = outage();
         policy.handle(Event::Down, start);
         policy.handle(Event::GraceElapsed, at(start, 30.0));
-        assert_eq!(policy.handle(Event::Service(Service::Failed), at(start, 30.0)), Some(Effect::Notify));
+        assert_eq!(
+            policy.handle(Event::Service(Service::Failed), at(start, 30.0)),
+            Some(Effect::Notify)
+        );
         assert_eq!(policy.handle(Event::Down, at(start, 32.0)), None);
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), None);
     }
@@ -193,7 +209,10 @@ mod tests {
         policy.handle(Event::Status { notify_link: true }, at(start, 40.0));
         assert_eq!(policy.handle(Event::Down, at(start, 50.0)), Some(Effect::Wait(GRACE)));
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 80.0)), Some(Effect::CheckService));
-        assert_eq!(policy.handle(Event::Service(Service::Failed), at(start, 80.0)), Some(Effect::Notify));
+        assert_eq!(
+            policy.handle(Event::Service(Service::Failed), at(start, 80.0)),
+            Some(Effect::Notify)
+        );
     }
 
     #[test]
@@ -249,7 +268,36 @@ mod tests {
         let mut policy = outage();
         policy.handle(Event::Down, start);
         policy.handle(Event::GraceElapsed, at(start, 30.0));
-        assert_eq!(policy.handle(Event::Service(Service::Inactive), at(start, 30.0)), None);
+        assert_eq!(
+            policy.handle(Event::Service(Service::Inactive), at(start, 30.0)),
+            Some(Effect::Wait(GRACE))
+        );
+    }
+
+    #[test]
+    fn a_failed_restart_after_an_intentional_stop_notifies_without_a_status() {
+        let start = Instant::now();
+        let mut policy = outage();
+        policy.handle(Event::Down, start);
+        policy.handle(Event::GraceElapsed, at(start, 30.0));
+        policy.handle(Event::Service(Service::Inactive), at(start, 30.0));
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), Some(Effect::CheckService));
+        assert_eq!(
+            policy.handle(Event::Service(Service::Failed), at(start, 60.0)),
+            Some(Effect::Notify)
+        );
+        assert_eq!(policy.handle(Event::Down, at(start, 62.0)), None);
+    }
+
+    #[test]
+    fn recovery_cancels_checks_scheduled_while_a_unit_was_stopped() {
+        let start = Instant::now();
+        let mut policy = outage();
+        policy.handle(Event::Down, start);
+        policy.handle(Event::GraceElapsed, at(start, 30.0));
+        policy.handle(Event::Service(Service::Inactive), at(start, 30.0));
+        policy.handle(Event::Status { notify_link: true }, at(start, 40.0));
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), None);
     }
 
     #[test]
@@ -259,7 +307,11 @@ mod tests {
             let mut policy = outage();
             policy.handle(Event::Down, start);
             policy.handle(Event::GraceElapsed, at(start, 30.0));
-            assert_eq!(policy.handle(Event::Service(service), at(start, 30.0)), Some(Effect::Notify), "{service:?}");
+            assert_eq!(
+                policy.handle(Event::Service(service), at(start, 30.0)),
+                Some(Effect::Notify),
+                "{service:?}"
+            );
         }
     }
 

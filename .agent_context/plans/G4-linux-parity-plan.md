@@ -1,7 +1,12 @@
 # G4: plan to bring the Linux computer side up to the Mac
 
 Third version, 2026-10-17. Integrates the first test-infrastructure wave and adds reflection checkpoints during
-implementation. This revision is planning only: no implementation steps, test commands or desktop checks are run.
+implementation. The initial revision was planning only; the reflection log below records subsequent execution.
+The follow-up code review is `docs/investigation-report-g4-progress.md`. Its fixes make Advanced recovery work while
+down, recheck inactive service suppression, bound stalled streams, and preserve the Mac notification preference.
+Desktop acceptance and P2 remain pending.
+The review-fix checkpoint passed 58 desktop unit tests, 11 focused outage integration scenarios, desktop Clippy and
+the 285-key localization check offline; `docs/linux-host-testing.md` records scope and remaining acceptance.
 
 The feature scope remains P0–P4 from the second-pass review in `docs/platform-parity.md`. Differences marked
 "by design" stay and get documented. The existing harness and its evidence are described in
@@ -62,12 +67,14 @@ and handled in that item's reflection; an unrelated fix becomes an explicit foll
 
 - **Gap:** the Linux toggle reads "Notify me when the box disconnects or the daemon fails", but nothing on Linux
   notifies when the daemon fails. On the Mac the app does it, when its supervisor gives up after three failed starts
-  (`AppModel.swift`, `onGiveUp`), following the toggle and defaulting to on when no config can be read.
+  (`AppModel.swift`, `onGiveUp`). The original implementation lost the toggle when clearing status; the review fix
+  retains the last reported preference, defaulting to on only before the first status.
 - **Change:** the same in the Linux app (`desktop/src/main.rs`). It already knows when the daemon is gone (the tray's
   daemon-down face) and already sends notifications (`notify_new_firmware`, through `notify-send`). When the daemon has
   been unreachable for 30 s, send one notification, then none until the daemon is back. Skip it when systemd reports the
   unit as `inactive` (`systemctl --user is-active vibebuddyd`), subject to the service-state decisions below. Follow
-  the last known notify toggle, on when unknown, as the Mac does.
+  the last known notify toggle, on when unknown, as the corrected Mac path does. Recheck an inactive unit after another
+  grace period so a subsequent failed restart can notify even without a successful status in between.
 - **Assumptions to resolve before coding:** inspect the packaged unit and effective restart/start-limit settings;
   treat 30 s as a grace policy, not proof that systemd cannot restart again. Distinguish `inactive`, `failed`,
   `activating`, missing unit, unavailable user bus, command failure and timeout. `inactive` alone does not establish
@@ -384,7 +391,7 @@ daemon-failure notification, the tray, and `wmctrl` as optional; the Linux secti
 record was written, and an expected failure that failed for another reason. No code changed in P4, so the P1 checkpoint
 (55 host scenarios, 522 workspace tests) still stands.
 
-**Closeout, what is still open.** Desktop acceptance: the daemon-failure notification and intentional stop on a real
+**Implementation-wave closeout, before the review fixes.** Desktop acceptance: the daemon-failure notification and intentional stop on a real
 desktop and systemd unit (P0); K2 on a real Sway session and a real X11 session, including after completion and after a
 daemon restart, with the systemd daemon's environment checked (P1); the tray on Fedora or upstream GNOME without the
 extension, and on KDE (P3). P2: the apps need installing and the gate running. Decision for a maintainer: the Mac's

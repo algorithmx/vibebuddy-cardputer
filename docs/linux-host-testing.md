@@ -112,6 +112,7 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Real Adv screenshot; synthetic valid BOX frame and malformed run | Adv limitation recorded; existing PNG path works on its supported dimensions; malformed pixels become HTTP errors. |
 | Factory log line followed by several heartbeat intervals, then ROM reset/build | No hello or heartbeat is written to foreign firmware; normal traffic resumes after our build appears. |
 | Daemon stopped (status stream retries every 2 s), with the unit `inactive`, `failed`, unreadable, slow or never read, and the app's notify toggle on, off or never read | `daemon_outage_probe` runs the app's real status stream through the outage policy and its `systemctl`/`notify-send` adapters. One `notify-send` per outage after a 4 s grace (shortened for the probe; the 30 s boundary is unit-tested with explicit instants); none for a brief restart, a stopped unit or a disabled toggle; rearmed after recovery. |
+| Inactive service followed by failed startup with no status recovery; restart requested while HTTP is down | The outage policy rechecks the stopped service and notifies when it later fails. The same restart adapter used by Advanced and the tray calls systemd without HTTP and reports a refused restart. |
 
 `tools/fixtures/cardputer-adv/boot.txt` replays the boot captured in `device-specs.md`, with the redacted box key replaced
 by a synthetic key. `wifi.json` contains synthetic device-layer reports, using test-only network names and a
@@ -147,7 +148,10 @@ For a new case, create a `HostHarness`, register `close` before `start`, then us
 
 The clock control advances **firmware** time only. Host receipt deadlines, reconnect delays and notification grace
 periods still use real time. Existing Rust unit tests cover fast host timing rules; do not claim that advancing the
-firmware clock validates G4 P0's future daemon-failure timer.
+firmware clock validates G4 P0's daemon-failure timer. The desktop client's local TCP regression tests separately
+check response-header stalls, an open stream that stops sending bytes, and SSE keepalives preserving a healthy
+stream beyond its inactivity timeout. Production limits are 10 s for Linux response headers and 45 s for stream
+inactivity (45 s on the Mac too); the 30 s outage grace starts once the Linux client reports the daemon down.
 
 For manual serial-tool development:
 
@@ -200,3 +204,21 @@ Mutation checks: a Sway socket treated as live without checking it, and a refuse
 the scenarios that should catch them; an `x11` session routed to Hyprland failed all X11 scenarios except the Xwayland
 guard, which is meant to pass. Not run: a real Sway or X11 session, a real `swaymsg` or `wmctrl`, and the systemd
 environment of a real daemon. The window listings are synthetic.
+
+## Validation of the G4 review fixes on 2026-10-17
+
+On top of `868b07c`, with the review fixes uncommitted:
+
+- `cargo test --offline --locked -p vibebuddy-desktop --bin vibebuddy-desktop`: 58 passed. New coverage includes stalled
+  response headers, stalled stream bodies, healthy SSE keepalives, inactive-to-failed service transitions, and recovery
+  canceling a scheduled recheck.
+- The focused `DaemonOutageTests` host suite: all 11 passed in 76.7 s. It includes stopped-service rechecks, failed
+  startup without an intervening successful status, and the shared restart adapter's systemd arguments and error handling
+  while the daemon's HTTP endpoint is down. Service and notification commands remain stubs.
+- `cargo clippy --offline --locked -p vibebuddy-desktop --all-targets`: passed with no warnings.
+- Localization: 285 keys passed; `git diff --check` passed. No dependencies were downloaded.
+
+The sandbox initially denied local socket binding; the socket tests passed when run outside it. This checkpoint did
+not rerun the full host suite or workspace tests. Swift is unavailable on this Linux host, so the Mac preference and
+stream-timeout changes have only been inspected. Real UI, notification-server and systemd acceptance, the Sway/X11
+session environment, and P2 session navigation remain pending.

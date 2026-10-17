@@ -475,8 +475,30 @@ class DaemonOutageTests(HostTestCase):
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("Service(Inactive) -> None", 1, timeout=PROBE_WAIT)
+        self.wait_count("Service(Inactive) -> Some(Wait", 2, timeout=PROBE_WAIT + PROBE_GRACE_MS / 1000)
         self.assertEqual(self.vibebuddy_notifications(), [])
+
+    def test_a_failed_restart_after_a_stop_notifies_without_recovering(self):
+        self.host.command_reply("systemctl", stdout="inactive\n", exit=3)
+        self.start_probe()
+        self.wait_count("Status {", 1)
+        self.host.stop_daemon()
+        self.wait_count("Service(Inactive) -> Some(Wait", 1, timeout=PROBE_WAIT)
+        self.host.command_reply("systemctl", stdout="failed\n", exit=3)
+        self.wait_count("Service(Failed) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
+
+    def test_restart_uses_systemd_when_the_daemon_is_down_and_reports_failure(self):
+        self.host.stop_daemon()
+        probe = os.environ.get("VIBEBUDDY_TEST_OUTAGE_PROBE", str(REPO / "target/debug/examples/daemon_outage_probe"))
+        self.host.command_reply("systemctl", stdout="", exit=0)
+        result = subprocess.run([probe, "--restart"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.host.commands("systemctl")[-1]["args"], ["--user", "restart", "vibebuddyd"])
+        self.host.command_reply("systemctl", stderr="restart refused", exit=1)
+        result = subprocess.run([probe, "--restart"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restart refused", result.stderr)
 
     def test_a_crash_looping_unit_notifies(self):
         self.host.command_reply("systemctl", stdout="failed\n", exit=3)

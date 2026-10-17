@@ -43,7 +43,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 | Device: Wi-Fi (scan, join, forget, change), paired computers, take over, make the box blink, box screen (refresh, save) | yes | yes | same |
 | Device: firmware update, flash from a firmware zip, retry with the K0 hint | yes | yes (`firmware_file.rs`) | same |
 | Device: several boards plugged in ("This is the box"), the port pin notice, cable help | yes; the help also mentions macOS's accessory permission | yes; the help also points to "Permission denied" in the daemon log (the serial group) | same, each with its platform's hint |
-| Advanced: daemon status, Open logs folder, Restart daemon, Export diagnostics, config path | yes | yes, plus Show daemon log | Linux has one more |
+| Advanced: daemon status, Open logs folder, Restart daemon, Export diagnostics, config path | yes; restart works while down | yes, plus Show daemon log; restart uses systemd while up or down, as the tray does, and reports errors | Linux has one more |
 | First-run guide | includes connecting agents and launch at login | Welcome, Find the box, Pick a character, Wi-Fi, Done (`install.sh` already connected agents and set autostart; `docs/app.md`) | differs, by design |
 
 ### Notifications
@@ -52,7 +52,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 |---|---|---|---|
 | Box gone for 30 s | the app (`AppModel.swift`, `checkLink`) | the daemon, through `notify-send` (`link_alert.rs`) | same rule, different sender |
 | New box firmware available | the app (`AppModel.swift`) | the app, through `notify-send` (`main.rs`, `notify_new_firmware`) | same |
-| Daemon failed | the app, when its supervisor gives up after three failed starts (`AppModel.swift`, `onGiveUp`). That code reads the toggle from the status, which is already cleared at that point, so it notifies whether or not the toggle is on (read from the code, not run on a Mac) | the app, through `notify-send` (`outage.rs`), once after 30 s without the daemon and again only after it returns. The last toggle the daemon reported applies, on when none was read. A unit stopped with `systemctl --user stop` stays silent; a failed, activating or unreadable unit notifies | differs: the Linux app honours the toggle and stays silent for a unit the user stopped; the Mac's give-up path does not honour its toggle (see gap 2) |
+| Daemon failed | the app, when its supervisor gives up (`AppModel.swift`, `onGiveUp`); retains the last reported notify toggle | the app, through `notify-send` (`outage.rs`), once after 30 s without the daemon and again only after recovery. An inactive/deactivating unit suppresses the alert and is rechecked after another 30 s, so a later failed restart can notify | same last-known-toggle rule (on before the first status); different supervisors and failure timing |
 | "Codex hook config updated" | the app, after migrating legacy hook commands (`HookInstaller.migrateLegacyCommands`) | no such migration on Linux | Mac only, by design |
 
 ### Menu bar and tray
@@ -106,10 +106,11 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
    nothing visible except a tmux pane switch. The Sway and X11 backends (`daemon/src/window_focus.rs`) are checked
    headless against synthetic window listings; desktop acceptance on each is pending. Before this change, the gap
    covered every desktop but Hyprland.
-2. **Daemon-failure notification: closed on Linux, with a Mac question left open.** The Linux app now sends it
-   (`outage.rs`; headless tests in `DaemonOutageTests`; desktop acceptance pending). The Mac's give-up path looks like
-   it ignores the toggle, because its check reads a status that is already cleared (`AppModel.swift:45–50`). Whether to
-   fix that on the Mac is a decision for the maintainers: AGENTS.md asks that a change in one app come with the other.
+2. **Daemon-failure notification: implemented; desktop acceptance pending.** The Linux app sends it (`outage.rs`)
+   and rechecks intentional-stop suppression. Both apps retain the last reported toggle after daemon loss. Linux
+   bounds status response headers to 10 s and stream inactivity to 45 s before reporting the daemon down; the Mac
+   uses a 45 s stream inactivity timeout. SSE keepalives keep quiet healthy streams alive. Advanced and tray restart
+   both use systemd on Linux, including while the daemon is down. Real notification/UI acceptance remains pending.
 3. **K2 reaches the Claude or Codex app window, not the session.** Focus works on Hyprland, Sway and X11 (G4 P1). Whether
    the Linux builds of those apps set `CLAUDE_CODE_HOST_SESSION_ID` and register the `claude:` and `codex:` URL schemes is
    unknown: the apps are not installed on the machine where this was checked, so the G4 P2 gate has not run. The Claude
