@@ -1,5 +1,5 @@
 //! Navigates from an aggregated activity back to its source window: through LaunchServices on the Mac, through
-//! the compositor (Hyprland) on Linux.
+//! the window system on Linux (Hyprland, Sway or X11; see `window_focus`).
 //!
 //! All arguments go straight to the process API, never through a shell. Source data comes from hooks and is still treated
 //! as untrusted input: Codex thread ids, Claude session ids and GitHub repos are narrowed to a safe character set first.
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use crate::activity::{ActivitySource, Surface, TmuxPane};
+use crate::window_focus::{self, Compositor};
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const CODEX_BUNDLE_ID: &str = "com.openai.codex";
@@ -480,7 +481,7 @@ async fn run_osascript(script: &[&str], args: &[&str]) -> Result<String, String>
 }
 
 /// Runs a helper with arguments passed straight through, never a shell, and returns its stdout.
-async fn run(program: &str, args: &[&str]) -> Result<String, String> {
+pub(crate) async fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let output = tokio::time::timeout(OPEN_TIMEOUT, Command::new(program).args(args).kill_on_drop(true).output())
         .await
         .map_err(|_| format!("{program} timed out"))?
@@ -505,12 +506,20 @@ fn activate(bundle_id: &str) -> Result<CommandSpec, String> {
     })
 }
 
-/// Focuses the window that owns the nearest of the agent's ancestors. Only Hyprland is supported: it's the one
-/// compositor here, and it can both list windows with their pids and focus one by address.
+/// Focuses the window that owns the nearest of the agent's ancestors, on whichever window system the session runs
+/// (see `window_focus`). Hyprland, Sway and X11 each list windows with their pids and focus one.
 async fn focus_window(pids: &[u32]) -> Result<String, String> {
+    let environment = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    match window_focus::compositor(environment, |path| Path::new(path).exists()) {
+        Compositor::Hyprland => focus_hyprland(pids).await,
+        Compositor::Sway => window_focus::focus_sway(pids).await,
+        Compositor::X11 => window_focus::focus_x11(pids).await,
+    }
+}
+
+async fn focus_hyprland(pids: &[u32]) -> Result<String, String> {
     let clients = run_hyprctl(&["clients", "-j"]).await?;
-    let address = window_for(&clients, pids)
-        .ok_or_else(|| "session has no host window (SSH, tmux or a background process)".to_owned())?;
+    let address = window_for(&clients, pids).ok_or_else(|| window_focus::NO_HOST_WINDOW.to_owned())?;
     let target = format!("address:{address}");
     // Hyprland 0.56 made dispatch take Lua and rejects the old syntax; older releases only know the old one.
     // The address is plain hex (checked above), so it can't break out of the Lua string.

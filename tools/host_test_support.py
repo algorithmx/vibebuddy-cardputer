@@ -70,14 +70,21 @@ class HostHarness:
 from pathlib import Path
 name = Path(sys.argv[0]).name
 root = Path(os.environ["VIBEBUDDY_TEST_ROOT"])
+argv = sys.argv[1:]
 with (root / "commands.jsonl").open("a") as log:
-    log.write(json.dumps({"program": name, "args": sys.argv[1:]}) + "\\n")
+    log.write(json.dumps({"program": name, "args": argv}) + "\\n")
 reply = root / (name + ".json")
 data = json.loads(reply.read_text()) if reply.exists() else {}
+# A reply for leading arguments takes over from the default for the calls that start with them.
+for match in data.get("matches", []):
+    if argv[:len(match["args"])] == match["args"]:
+        data = {**data, **{key: value for key, value in match.items() if key != "args"}}
+        break
 time.sleep(data.get("sleep", 0))
-if name == "hyprctl" and sys.argv[1:2] == ["clients"]:
+sys.stderr.write(data.get("stderr", ""))
+if name == "hyprctl" and argv[:1] == ["clients"]:
     print(data.get("stdout", json.dumps(data.get("clients", []))))
-elif name == "hyprctl" and sys.argv[1:2] == ["dispatch"] and sys.argv[2].startswith("hl."):
+elif name == "hyprctl" and argv[:1] == ["dispatch"] and argv[1].startswith("hl."):
     print(data.get("lua_stdout", data.get("stdout", "ok")))
     sys.exit(data.get("lua_exit", data.get("exit", 0)))
 else:
@@ -117,8 +124,10 @@ sys.exit(data.get("exit", 0))
         self.files.append(stream)
         return stream
 
-    def start(self, firmware=True):
+    def start(self, firmware=True, environment=None):
         self.firmware = firmware
+        # Session variables for the daemon, such as the desktop's compositor; the rest of the environment stays fresh.
+        self.env.update(environment or {})
         if firmware:
             executable = Path(os.environ.get("VIBEBUDDY_TEST_SIMULATOR", REPO / "target/cardputer-adv/debug/examples/simulator"))
             self.simulator = subprocess.Popen(
@@ -310,8 +319,17 @@ sys.exit(data.get("exit", 0))
         commands = [json.loads(line) for line in log.read_text().splitlines(keepends=True) if line.endswith("\n")]
         return [command for command in commands if program is None or command["program"] == program]
 
-    def command_reply(self, name, **reply):
-        (self.root / f"{name}.json").write_text(json.dumps(reply))
+    def command_reply(self, name, args=None, **reply):
+        """Without `args`, the reply answers every call. With `args`, it answers calls whose leading arguments match, and
+        replaces an earlier reply for the same arguments; the default reply is kept."""
+        path = self.root / f"{name}.json"
+        data = json.loads(path.read_text()) if path.exists() else {}
+        if args is None:
+            data = {"matches": data.get("matches", []), **reply}
+        else:
+            matches = [match for match in data.get("matches", []) if match["args"] != list(args)]
+            data["matches"] = matches + [{"args": list(args), **reply}]
+        path.write_text(json.dumps(data))
 
     @staticmethod
     def _stop(process):
