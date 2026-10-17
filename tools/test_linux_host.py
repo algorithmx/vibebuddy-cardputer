@@ -516,6 +516,194 @@ class DaemonOutageTests(HostTestCase):
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
 
+WINDOW_FIXTURES = Path(__file__).with_name("fixtures") / "linux-windows"
+SWAY_TREE = (WINDOW_FIXTURES / "sway-get-tree.json").read_text()
+WMCTRL_LIST = (WINDOW_FIXTURES / "wmctrl-list.txt").read_text()
+NO_WINDOW = "has no host window"
+
+
+@unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
+class SwayFocusTests(HostTestCase):
+    """K2 on Sway: the daemon lists windows with `swaymsg -t get_tree` and focuses one by container id."""
+
+    def daemon_environment(self):
+        socket = self.host.root / "sway.sock"
+        socket.touch()  # the daemon only believes in a Sway socket that exists
+        return {"SWAYSOCK": str(socket)}
+
+    def restart_daemon_with(self, **variables):
+        self.host.stop_daemon()
+        self.host.env.update(variables)
+        self.host.start_daemon()
+        self.host.wait_device(lambda device: device["paired"], "daemon restart handshake", timeout=12)
+
+    def answer_sway(self, tree=SWAY_TREE, focus_reply='[{"success": true}]'):
+        self.host.command_reply("swaymsg", args=["-t", "get_tree"], stdout=tree)
+        self.host.command_reply("swaymsg", args=["[con_id=17] focus"], stdout=focus_reply)
+        self.host.command_reply("swaymsg", args=["[con_id=9] focus"], stdout=focus_reply)
+
+    def focus_calls(self):
+        return [command["args"] for command in self.host.commands("swaymsg") if command["args"][:1] != ["-t"]]
+
+    def log_text(self):
+        return (self.host.root / "daemon.log").read_text()
+
+    def test_k2_focuses_the_nearest_ancestor_window_by_container(self):
+        self.answer_sway()
+        self.hook("UserPromptSubmit")  # host pids 4242, then 4000
+        self.host.press("K2")
+        wait_for(lambda: self.focus_calls() == [["[con_id=17] focus"]], "Sway focuses the nearest ancestor")
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_k2_prefers_needs_input_over_other_work(self):
+        self.answer_sway()
+        self.hook("UserPromptSubmit", session="needs-input", pids=[4000])
+        self.hook("PermissionRequest", session="needs-input", pids=[4000])
+        self.hook("UserPromptSubmit", session="other-work", pids=[4242])
+        self.host.press("K2")
+        wait_for(lambda: self.focus_calls() == [["[con_id=9] focus"]], "K2 selects needs input")
+
+    def test_a_completed_source_survives_a_daemon_restart(self):
+        self.answer_sway()
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: len(self.focus_calls()) == 1, "first focus")
+        self.hook("Stop")
+        self.host.press("K2")
+        wait_for(lambda: len(self.focus_calls()) == 2, "completed source still focused")
+        self.restart_daemon_with()
+        self.host.press("K2")
+        wait_for(lambda: len(self.focus_calls()) == 3, "source survives daemon restart")
+        self.assertEqual(self.focus_calls(), [["[con_id=17] focus"]] * 3)
+
+    def test_a_window_missing_from_the_tree_focuses_nothing(self):
+        self.answer_sway(tree='{"id": 1, "type": "root", "nodes": [], "floating_nodes": []}')
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: NO_WINDOW in self.log_text(), "missing window logged")
+        self.assertEqual(self.focus_calls(), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_malformed_tree_is_treated_as_no_window(self):
+        self.answer_sway(tree="not json")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: NO_WINDOW in self.log_text(), "malformed tree logged")
+        self.assertEqual(self.focus_calls(), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_a_refused_focus_is_logged_and_the_next_press_recovers(self):
+        self.answer_sway(focus_reply='[{"success": false, "error": "No node with id 17"}]')
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "No node with id 17" in self.log_text(), "refused focus logged")
+        self.host.command_reply("swaymsg", args=["[con_id=17] focus"], stdout='[{"success": true}]')
+        self.host.press("K2")
+        wait_for(lambda: len(self.focus_calls()) == 2, "next K2 recovers")
+
+    def test_a_failing_swaymsg_is_logged_with_its_stderr(self):
+        self.host.command_reply("swaymsg", args=["-t", "get_tree"], exit=1, stderr="unable to connect to the IPC socket")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "unable to connect to the IPC socket" in self.log_text(), "swaymsg stderr logged")
+        self.assertEqual(self.focus_calls(), [])
+
+    def test_a_slow_swaymsg_times_out_and_is_logged(self):
+        self.host.command_reply("swaymsg", args=["-t", "get_tree"], stdout=SWAY_TREE, sleep=6)
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "swaymsg timed out" in self.log_text(), "timeout logged", timeout=12)
+        self.assertEqual(self.focus_calls(), [])
+
+    def test_a_stale_sway_socket_falls_back_to_hyprland(self):
+        self.restart_daemon_with(SWAYSOCK=str(self.host.root / "gone.sock"))
+        self.host.command_reply("hyprctl", clients=[{"pid": 4242, "address": "0xabc"}])
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: any("0xabc" in " ".join(command["args"]) for command in self.host.commands("hyprctl")),
+                 "stale socket ignored")
+        self.assertEqual(self.host.commands("swaymsg"), [])
+
+
+@unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
+class X11FocusTests(HostTestCase):
+    """K2 on X11: `wmctrl -l -p` lists the windows with their pids, and `wmctrl -i -a` raises one by its id."""
+
+    def daemon_environment(self):
+        return {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+
+    def restart_daemon_with(self, **variables):
+        self.host.stop_daemon()
+        self.host.env.update(variables)
+        self.host.start_daemon()
+        self.host.wait_device(lambda device: device["paired"], "daemon restart handshake", timeout=12)
+
+    def raise_calls(self):
+        return [command["args"] for command in self.host.commands("wmctrl") if command["args"][:1] == ["-i"]]
+
+    def log_text(self):
+        return (self.host.root / "daemon.log").read_text()
+
+    def test_k2_raises_the_nearest_ancestor_window_by_id(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"], stdout=WMCTRL_LIST)
+        self.hook("UserPromptSubmit")  # host pids 4242, then 4000
+        self.host.press("K2")
+        wait_for(lambda: self.raise_calls() == [["-i", "-a", "0x01400007"]], "X11 raises the nearest ancestor")
+        self.assertEqual(self.host.commands("hyprctl"), [])
+        self.assertEqual(self.host.commands("swaymsg"), [])
+
+    def test_a_window_missing_from_the_listing_raises_nothing(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"], stdout="0x01600009 -1 5151 host Volume Control\n")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: NO_WINDOW in self.log_text(), "missing window logged")
+        self.assertEqual(self.raise_calls(), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_malformed_and_invalid_rows_are_treated_as_no_window(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"],
+                                stdout="garbage\n\n0x0140000g 0 4242 host Claude\n0x01400007 0 host Claude\n")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: NO_WINDOW in self.log_text(), "malformed listing logged")
+        self.assertEqual(self.raise_calls(), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_a_refused_raise_is_logged_and_the_next_press_recovers(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"], stdout=WMCTRL_LIST)
+        self.host.command_reply("wmctrl", args=["-i", "-a", "0x01400007"], exit=1,
+                                stderr="wmctrl: window 0x01400007 not found")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "not found" in self.log_text(), "refused raise logged")
+        self.host.command_reply("wmctrl", args=["-i", "-a", "0x01400007"], stdout="")
+        self.host.press("K2")
+        wait_for(lambda: len(self.raise_calls()) == 2, "next K2 recovers")
+
+    def test_a_failing_listing_is_logged_with_its_stderr(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"], exit=1, stderr="Cannot open display: :0")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "Cannot open display: :0" in self.log_text(), "listing stderr logged")
+        self.assertEqual(self.raise_calls(), [])
+
+    def test_a_slow_wmctrl_times_out_and_is_logged(self):
+        self.host.command_reply("wmctrl", args=["-l", "-p"], stdout=WMCTRL_LIST, sleep=6)
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: "wmctrl timed out" in self.log_text(), "timeout logged", timeout=12)
+        self.assertEqual(self.raise_calls(), [])
+
+    def test_a_wayland_session_with_xwayland_is_not_treated_as_x11(self):
+        self.restart_daemon_with(XDG_SESSION_TYPE="wayland", WAYLAND_DISPLAY="wayland-0")
+        self.host.command_reply("hyprctl", clients=[{"pid": 4242, "address": "0xabc"}])
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: any("0xabc" in " ".join(command["args"]) for command in self.host.commands("hyprctl")),
+                 "Xwayland session stays on Hyprland")
+        self.assertEqual(self.host.commands("wmctrl"), [])
+
+
 @unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
 class ForeignFirmwareTests(HostTestCase):
     firmware = False
