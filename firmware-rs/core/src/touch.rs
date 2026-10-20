@@ -1,4 +1,4 @@
-//! The touchscreen some boxes have (docs/hardware.md, "Touch, and what else is on I2C0"; ADR-0017): a CHSC5432 at
+//! The touchscreen some boxes have (docs/hardware.md, "Touch, and what else is on I2C0"; ADR-0019): a CHSC5432 at
 //! 0x2E on I2C0. Others have nothing there, so the device layer probes it at boot and the box does without.
 //!
 //! The chip uses 32-bit register addresses, written big-endian before a read. This module turns its report into a

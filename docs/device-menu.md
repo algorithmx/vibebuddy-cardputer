@@ -88,7 +88,7 @@ Every screen shows how the box is linked as a small icon in its top left: a plug
 
 ## Touch
 
-Some boxes have a touchscreen (ADR-0017). The firmware looks for one at boot and, on a box without, nothing here changes. On a box with one, a tap (down and up quickly, in about the same place) does what the keys do:
+Some boxes have a touchscreen (ADR-0019). The firmware looks for one at boot and, on a box without, nothing here changes. On a box with one, a tap (down and up quickly, in about the same place) does what the keys do:
 
 - **A row** is selected and acted on at once, as K1 to the row and then K0 would. VOLUME steps, MUTE toggles, COMPUTERS opens; FORGET ALL and NEW ID still ask first.
 - **A key hint** along the bottom is that key: tap CLOSE to close, BACK to go back.

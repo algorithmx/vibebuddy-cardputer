@@ -82,7 +82,7 @@ pub trait Board: Screen {
     /// K0's level and the levels of K1 and K2 on the expander (true means pressed); None if the expander read fails.
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>);
 
-    /// Looks for a touchscreen and returns its chip's name; None on a box without one (ADR-0017).
+    /// Looks for a touchscreen and returns its chip's name; None on a box without one (ADR-0019).
     fn init_touch(&mut self) -> Option<&'static str> {
         None
     }
@@ -920,7 +920,7 @@ impl Firmware {
         }
     }
 
-    /// A tap (ADR-0017). It counts as a key press for Leisure and Boredom, so in Leisure it only calls the buddy
+    /// A tap (ADR-0019). It counts as a key press for Leisure and Boredom, so in Leisure it only calls the buddy
     /// back, waking a screen dimmed for the night. Otherwise it acts on what it landed on: a menu row is selected
     /// and acted on, a key hint is that key, the buddy is petted. Anything that changes state can also be done
     /// with the keys.

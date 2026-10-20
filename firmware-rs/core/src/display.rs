@@ -177,7 +177,7 @@ pub struct Panel {
     pub hints: Vec<(&'static [u8], &'static [u8])>,
 }
 
-/// Something on the screen a tap can land on (ADR-0017).
+/// Something on the screen a tap can land on (ADR-0019).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     /// A task card, by its place in the stack.

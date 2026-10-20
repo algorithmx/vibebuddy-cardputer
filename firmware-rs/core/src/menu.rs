@@ -202,7 +202,7 @@ impl Menu {
         }
     }
 
-    /// A tap on a row of a list (ADR-0017): selects it and acts on it, as K1 to the row and then K0 would.
+    /// A tap on a row of a list (ADR-0019): selects it and acts on it, as K1 to the row and then K0 would.
     /// Views without rows ignore it.
     pub fn tap_row(&mut self, index: usize, context: Context, now_ms: u32) -> Action {
         match self.view {

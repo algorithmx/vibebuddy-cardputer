@@ -192,7 +192,7 @@ fn main() {
     preview.press(1, 1100);
     preview.snapshot("menu-focus");
 
-    // Touch (ADR-0017): a tapped row is outlined as it acts, and the buddy beside the cards can be petted.
+    // Touch (ADR-0019): a tapped row is outlined as it acts, and the buddy beside the cards can be petted.
     let mut preview = Preview::new(&directory);
     preview.press(1, 1100);
     preview.tap(160, 84);
