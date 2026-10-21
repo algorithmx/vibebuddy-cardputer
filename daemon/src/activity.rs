@@ -14,7 +14,8 @@ use crate::occasions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const MAX_VISIBLE_TASKS: usize = 3;
+/// Two pages of three on the box; six cards keep the line well under the box's 1024 bytes (#155).
+const MAX_VISIBLE_TASKS: usize = 6;
 /// Display limit for task-card titles, including the prefix that tells agents apart.
 const MAX_TITLE_CHARS: usize = 26;
 /// A working activity with no events for a long time usually means the agent process is gone.
@@ -370,6 +371,18 @@ impl ActivityTracker {
         }
     }
 
+    /// An activity's source is attached after the event that created it, so that event's cards don't know their
+    /// agents yet: attach them again, and keep the dedup baseline as it is sent, or the next unchanged event would
+    /// look new.
+    pub fn refresh_cards(&mut self, event: &mut Event) {
+        if event.extra.contains_key("tasks") {
+            self.attach_tasks(event);
+            if self.last_visible.is_some() {
+                self.last_visible = Some(event.clone());
+            }
+        }
+    }
+
     /// Remember the activity whose end was just announced, so K2 can still return to it shortly afterwards.
     fn remember_announced(&mut self, activity: Activity) {
         if let Some(source) = activity.source {
@@ -697,8 +710,8 @@ impl ActivityTracker {
     /// Attach the current card stack to the event. End announcements carry it too: while hearing "done",
     /// the user should see what's still running.
     fn attach_tasks(&self, visible: &mut Event) {
-        let mut activities: Vec<(&String, &Activity)> = self.activities.iter().collect();
-        activities.sort_by_key(|(_, activity)| std::cmp::Reverse(activity.sequence));
+        let activities = self.card_order();
+        visible.extra.insert("tasks_total".to_owned(), json!(activities.len()));
         visible.extra.insert(
             "tasks".to_owned(),
             json!(
@@ -708,6 +721,7 @@ impl ActivityTracker {
                     .map(|(key, activity)| {
                         let mut task = json!({
                             "id": card_id(key),
+                            "agent": agent_of(activity.source.as_ref()),
                             "title": activity.title,
                             "status": match activity.status {
                                 ActivityStatus::Working => "working",
@@ -722,6 +736,14 @@ impl ActivityTracker {
                     .collect::<Vec<_>>()
             ),
         );
+    }
+
+    /// The cards' order: those waiting for an answer first, since they need the user, then the most recently active.
+    /// The card stack, its timers and its ids all follow it.
+    fn card_order(&self) -> Vec<(&String, &Activity)> {
+        let mut activities: Vec<(&String, &Activity)> = self.activities.iter().collect();
+        activities.sort_by_key(|(_, activity)| (activity.status != ActivityStatus::InputRequired, std::cmp::Reverse(activity.sequence)));
+        activities
     }
 
     /// An end announcement must say who ended.
@@ -795,8 +817,7 @@ impl ActivityTracker {
             .insert("stats".to_owned(), json!(self.stats_lines()));
 
         let now = Instant::now();
-        let mut activities: Vec<&Activity> = self.activities.values().collect();
-        activities.sort_by_key(|activity| std::cmp::Reverse(activity.sequence));
+        let activities = self.card_order().into_iter().map(|(_, activity)| activity);
         let Some(tasks) = event
             .extra
             .get_mut("tasks")

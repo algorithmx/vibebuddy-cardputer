@@ -22,7 +22,8 @@ use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
 use crate::spoken_reply::ReplyAudio;
-use crate::touch::{self, Taps};
+use crate::agent_icon::AgentIcon;
+use crate::touch::{self, Direction, Gesture, Gestures};
 use crate::voice_pack::{crc32, decode_base64};
 use crate::lines::LinePicker;
 use crate::lan::{Conn, Lan, Output as LanOutput};
@@ -204,7 +205,7 @@ pub struct Firmware {
     picker: LinePicker,
     buttons: Option<Buttons>,
     /// The touchscreen's chip, taps so far and when to read it next; None on a box without one.
-    touch: Option<(&'static str, Taps, u32)>,
+    touch: Option<(&'static str, Gestures, u32)>,
     settings: Option<SettingsStore>,
     /// The box's key and paired computers, and where they are kept; None without a link partition.
     link: Option<(LinkStore, Link)>,
@@ -468,7 +469,7 @@ impl Firmware {
             }
             None => Self::write_literal(board, "BUTTONS ERROR\n"),
         }
-        self.touch = board.init_touch().map(|chip| (chip, Taps::new(), board.now_ms()));
+        self.touch = board.init_touch().map(|chip| (chip, Gestures::new(), board.now_ms()));
         self.announce_touch(board);
 
         self.last_message_ms = board.now_ms();
@@ -907,7 +908,7 @@ impl Firmware {
 
     fn tick_touch<B: Board>(&mut self, board: &mut B) {
         let now = board.now_ms();
-        let Some((_, taps, next_read)) = self.touch.as_mut() else {
+        let Some((_, gestures, next_read)) = self.touch.as_mut() else {
             return;
         };
         if (now.wrapping_sub(*next_read) as i32) < 0 {
@@ -915,8 +916,32 @@ impl Firmware {
         }
         *next_read = now.wrapping_add(touch::POLL_MS);
         let sample = board.read_touch().and_then(|report| touch::parse_report(&report));
-        if let Some(point) = taps.update(sample, now) {
-            self.on_tap(board, point);
+        match gestures.update(sample, now) {
+            Some(Gesture::Tap(point)) => self.on_tap(board, point),
+            Some(Gesture::Swipe(direction)) => self.on_swipe(board, direction),
+            None => {}
+        }
+    }
+
+    /// A swipe up or down turns the task cards' page (#155). Like a tap, it counts as a key press for Leisure and
+    /// Boredom, and in Leisure only calls the buddy back.
+    fn on_swipe<B: Board>(&mut self, board: &mut B, direction: Direction) {
+        let now = board.now_ms();
+        Self::write_literal(board, if direction == Direction::Up { "SWIPE UP\n" } else { "SWIPE DOWN\n" });
+        self.leisure.note_activity(now);
+        if self.display.mode() == Mode::Leisure {
+            self.leisure.tick(now);
+            self.set_mode(board, Mode::Duty);
+            return;
+        }
+        self.turn_page(board, direction == Direction::Up);
+    }
+
+    fn turn_page<B: Board>(&mut self, board: &mut B, forward: bool) {
+        let now = board.now_ms();
+        if let Some((page, pages)) = self.display.turn_page(board, &scene!(self, now), forward) {
+            let line = text!(24, "CARDS PAGE {}/{}\n", page + 1, pages);
+            board.write(line.as_bytes());
         }
     }
 
@@ -956,6 +981,7 @@ impl Firmware {
             // Tapping away from the menu closes it, as K2 does.
             Target::OutsidePanel => self.on_button(board, ButtonEvent::K2Short),
             Target::Buddy => self.display.pet(board, &scene!(self, now)),
+            Target::PageLine => self.turn_page(board, true),
             // The daemon opens that card's agent, as K2 opens the most pressing one.
             Target::Card(index) => {
                 if let Some(id) = self.display.card_id(index) {
@@ -1587,6 +1613,7 @@ impl Firmware {
                 project: string(item, "project").map(str::as_bytes),
                 // Only a short id of letters and digits goes back out in a JSON line as is.
                 id: string(item, "id").filter(|id| id.len() <= 16 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())).map(str::as_bytes),
+                icon: string(item, "agent").and_then(AgentIcon::for_agent),
             });
         }
 
@@ -1626,7 +1653,7 @@ impl Firmware {
                 self.close_overlays(board);
             }
         }
-        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks);
+        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks, number(fields, "tasks_total").map_or(0, |total| total as usize));
         if shown.is_err() {
             Self::write_literal(board, "DISPLAY ERROR\n");
         } else {

@@ -1934,7 +1934,82 @@ mod touchscreen {
         board.advance(40);
         board.finger = None;
         firmware.poll(&mut board);
-        assert_eq!(board.take_lines(), Vec::<String>::new());
+        assert_eq!(board.take_lines(), ["SWIPE DOWN"], "a swipe, and in the menu it turns nothing");
+    }
+
+    /// A finger from (x, y) to (x, to_y) in 120 ms.
+    fn swipe(firmware: &mut Firmware, board: &mut FakeBoard, x: i32, y: i32, to_y: i32) -> Vec<String> {
+        board.advance(100);
+        for step in 0..=6 {
+            board.finger = Some((x, y + (to_y - y) * step / 6));
+            firmware.poll(board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(board);
+        board.take_lines()
+    }
+
+    /// Five working cards, ids c1 to c5, the first from Claude Code, and seven activities in all.
+    const FIVE_CARDS: &str = r#"{"version":1,"event":"task.start","title":"CC:ONE","tasks_total":7,"tasks":[
+        {"id":"c1","agent":"claude-code","title":"CC:ONE","status":"working","elapsed_s":1},
+        {"id":"c2","agent":"codex","title":"CX:TWO","status":"working","elapsed_s":2},
+        {"id":"c3","agent":"github-actions","title":"CI:THREE","status":"working","elapsed_s":3},
+        {"id":"c4","agent":"opencode","title":"OC:FOUR","status":"working","elapsed_s":4},
+        {"id":"c5","agent":"unknown","title":"XX:FIVE","status":"working","elapsed_s":5}]}"#;
+
+    fn focus(id: &str) -> String {
+        format!(r#"{{"version":1,"event":"focus","task":"{id}"}}"#)
+    }
+
+    #[test]
+    fn a_swipe_turns_the_cards_page_and_taps_follow_it() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(pixel(&board, 22, 58), 0xDBAA, "Claude's spark in its orange, in place of CC:");
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 150, 60), ["SWIPE UP", "CARDS PAGE 2/2"]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c4"));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104", &focus("c5")]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 142), ["TAP 100 142"], "page 2 has two cards");
+
+        // The page line under the cards turns it too, and down goes back.
+        assert_eq!(tap(&mut firmware, &mut board, 160, 212), ["TAP 160 212", "CARDS PAGE 1/2"]);
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 60, 150), ["SWIPE DOWN", "CARDS PAGE 2/2"]);
+        // News starts from the first page.
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+    }
+
+    #[test]
+    fn the_pages_turn_by_themselves_unless_a_card_waits_or_a_finger_just_turned_them() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        let top = |board: &FakeBoard| pixel(board, 22, 58);
+        assert_eq!(top(&board), 0xDBAA);
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF, "page 2 opens with OpenCode's white frame");
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA, "and wraps round");
+
+        // A finger's turn holds the page for 30 s.
+        swipe(&mut firmware, &mut board, 100, 150, 60);
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF);
+        board.advance(11_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
+
+        // A card waiting for an answer keeps the first page up.
+        let waiting = FIVE_CARDS.replace('\n', "").replacen(r#""status":"working""#, r#""status":"input_required""#, 1);
+        send(&mut firmware, &mut board, &waiting.replace("task.start", "agent.input_required"));
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
     }
 
     #[test]

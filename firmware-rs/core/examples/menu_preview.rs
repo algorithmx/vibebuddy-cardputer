@@ -202,4 +202,20 @@ fn main() {
     preview.firmware.poll(&mut preview.board);
     preview.tap(256, 100);
     preview.snapshot("touch-pet");
+
+    // Two pages of cards with their agents' icons (#155), the first turned by a swipe up.
+    let mut preview = Preview::new(&directory);
+    preview.send(
+        r#"{"version":1,"event":"agent.input_required","title":"CC:TOUCH CARDS","tasks_total":8,"tasks":[{"id":"a1","agent":"claude-code","title":"CC:TOUCH CARDS","status":"input_required","elapsed_s":95,"project":"VIBE-BUDDY"},{"id":"a2","agent":"codex","title":"CX:RELEASE NOTES","status":"working","elapsed_s":420,"project":"VIBE-BUDDY"},{"id":"a3","agent":"github-actions","title":"CI:VIBE-BUDDY","status":"working","elapsed_s":180},{"id":"a4","agent":"opencode","title":"OC:RELAY-SERVER","status":"working","elapsed_s":60},{"id":"a5","agent":"copilot","title":"CP:DOCS SITE","status":"working","elapsed_s":3000},{"id":"a6","agent":"pi","title":"PI:SCRATCH","status":"working","elapsed_s":15}]}"#,
+    );
+    preview.snapshot("cards-page-1");
+    preview.board.now.set(preview.board.now.get() + 100);
+    for step in 0..=6 {
+        preview.board.finger = Some((100, 150 - 15 * step));
+        preview.firmware.poll(&mut preview.board);
+        preview.board.now.set(preview.board.now.get() + 20);
+    }
+    preview.board.finger = None;
+    preview.firmware.poll(&mut preview.board);
+    preview.snapshot("cards-page-2");
 }

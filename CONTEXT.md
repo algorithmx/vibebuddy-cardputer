@@ -206,7 +206,7 @@ A piece of work VibeBuddy is currently tracking, together with its current state
 _Avoid_: task, Job, Task (Task refers specifically to the on-device presentation, see below)
 
 **Task card (任务卡)**:
-How an Activity is presented on the device screen. At most 3 are shown at once, with the most recently active on top. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
+How an Activity is presented on the device screen. Up to 6 are sent, three to a page; those waiting for input come first, then the most recently active. Each shows its agent's icon, or the title's prefix for an agent without one. With two pages the box turns the page itself, and a touchscreen can swipe it. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
 _Avoid_: card, entry, Task item
 
 ### State and notifications

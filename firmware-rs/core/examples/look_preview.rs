@@ -63,8 +63,8 @@ fn main() {
     display.set_look(&mut screen, &scene!(), Some(look));
 
     let cards = [
-        TaskInput { title: Some(b"CC:CHARACTERS"), state: State::Working, elapsed_s: 75, project: Some(b"VIBE-BUDDY"), id: None },
-        TaskInput { title: Some(b"CX:EROS-TRAINING"), state: State::Working, elapsed_s: 900, project: None, id: None },
+        TaskInput { title: Some(b"CC:CHARACTERS"), state: State::Working, elapsed_s: 75, project: Some(b"VIBE-BUDDY"), id: None, icon: None },
+        TaskInput { title: Some(b"CX:EROS-TRAINING"), state: State::Working, elapsed_s: 900, project: None, id: None, icon: None },
     ];
     let states: [(&str, State, &[TaskInput], u32); 6] = [
         ("idle", State::Idle, &[], 120),
@@ -76,7 +76,7 @@ fn main() {
     ];
     for (name, state, tasks, frames) in states {
         let shown = if state == State::Offline { State::Idle } else { state };
-        let _ = display.show_tasks(&mut screen, &scene!(), shown, Some(b"CC:VIBE-BUDDY"), tasks);
+        let _ = display.show_tasks(&mut screen, &scene!(), shown, Some(b"CC:VIBE-BUDDY"), tasks, tasks.len());
         display.set_link_lost(&mut screen, &scene!(), state == State::Offline);
         for frame in 0..frames {
             display.preview_pose(Some(frame), None, None);
@@ -85,7 +85,7 @@ fn main() {
         }
     }
     display.set_link_lost(&mut screen, &scene!(), false);
-    let _ = display.show_tasks(&mut screen, &scene!(), State::Idle, None, &[]);
+    let _ = display.show_tasks(&mut screen, &scene!(), State::Idle, None, &[], 0);
 
     let skits = [
         (Skit::Patrol, "patrol", 96),

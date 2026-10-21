@@ -13,6 +13,7 @@ extern crate std;
 pub mod text;
 
 pub mod adpcm;
+pub mod agent_icon;
 pub mod audio;
 pub mod buttons;
 pub mod canvas;

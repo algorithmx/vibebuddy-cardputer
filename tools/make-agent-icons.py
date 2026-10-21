@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Turn the agents' marks into the task cards' 16 × 16 icons (firmware-rs/core/src/agent_icon/pixels.rs).
+
+Usage:
+    tools/make-agent-icons.py <renders directory> > firmware-rs/core/src/agent_icon/pixels.rs
+
+The directory holds a PNG render (256 × 256 or larger) of each mark, named after the icon:
+
+    claude.png    https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/claude-color.svg
+    codex.png     https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/codex-color.svg
+    opencode.png  https://opencode.ai/favicon.svg
+    copilot.png   https://cdn.jsdelivr.net/npm/simple-icons@15.0.0/icons/githubcopilot.svg
+    pi.png        https://pi.dev/favicon.svg
+
+On a Mac, `qlmanage -t -s 256 -o <dir> <file>.svg` renders an SVG (give the LobeHub files a width and height
+first). The CI icon is our own and drawn by hand below. Each cell of the mark becomes one pixel: on when enough of
+it is ink, in its main colour. Needs Pillow.
+"""
+
+from __future__ import annotations
+
+import sys
+from collections import Counter
+from pathlib import Path
+
+from PIL import Image, ImageDraw
+
+SIZE = 16
+CELL = 16
+
+# Our own: two arrows chasing each other round a loop, in teal.
+CI = [
+    "......####......",
+    "....##....##....",
+    "...#........#...",
+    "..#..........#..",
+    ".#.........#####",
+    ".#..........###.",
+    "#............#..",
+    "#...............",
+    "...............#",
+    "..#............#",
+    ".###..........#.",
+    "#####.........#.",
+    "..#..........#..",
+    "...#........#...",
+    "....##....##....",
+    "......####......",
+]
+CI_COLOUR = (45, 212, 191)
+
+
+def clear_outside_white(im: Image.Image) -> Image.Image:
+    """The renderer paints a white page behind the mark: flood it away from the corners."""
+    im = im.convert("RGBA")
+    w, h = im.size
+    for corner in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+        if im.getpixel(corner)[:3] == (255, 255, 255):
+            ImageDraw.floodfill(im, corner, (0, 0, 0, 0), thresh=40)
+    return im
+
+
+def ink_to(im: Image.Image, colour: tuple[int, int, int]) -> Image.Image:
+    """A one-colour mark drawn dark on white: the ink takes the given colour, the rest goes."""
+    im = im.convert("RGBA")
+    px = im.load()
+    for y in range(im.size[1]):
+        for x in range(im.size[0]):
+            r, g, b, a = px[x, y]
+            dark = 255 - (r + g + b) // 3
+            px[x, y] = colour + (min(a, dark),) if dark > 40 else (0, 0, 0, 0)
+    return im
+
+
+def drop_dark(im: Image.Image) -> Image.Image:
+    """A mark on its own dark square: the square goes, the card behind it is dark already."""
+    im = im.convert("RGBA")
+    px = im.load()
+    for y in range(im.size[1]):
+        for x in range(im.size[0]):
+            if max(px[x, y][:3]) < 60:
+                px[x, y] = (0, 0, 0, 0)
+    return im
+
+
+def square(im: Image.Image) -> Image.Image:
+    im = im.crop(im.getbbox())
+    side = max(im.size)
+    sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    sq.paste(im, ((side - im.size[0]) // 2, (side - im.size[1]) // 2))
+    return sq.resize((SIZE * CELL, SIZE * CELL), Image.LANCZOS)
+
+
+def cells(im: Image.Image, cover: float = 0.42) -> list[list[tuple[int, int, int] | None]]:
+    rows = []
+    for cy in range(SIZE):
+        row = []
+        for cx in range(SIZE):
+            ink = []
+            for y in range(cy * CELL, cy * CELL + CELL):
+                for x in range(cx * CELL, cx * CELL + CELL):
+                    r, g, b, a = im.getpixel((x, y))
+                    if a > 128:
+                        ink.append((r, g, b))
+            if len(ink) < CELL * CELL * cover:
+                row.append(None)
+                continue
+            bucket = lambda c: (c[0] // 24, c[1] // 24, c[2] // 24)  # noqa: E731
+            main = Counter(bucket(c) for c in ink).most_common(1)[0][0]
+            near = [c for c in ink if bucket(c) == main]
+            row.append(tuple(sum(c[i] for c in near) // len(near) for i in range(3)))
+        rows.append(row)
+    return rows
+
+
+def rgb565(colour: tuple[int, int, int]) -> int:
+    r, g, b = colour
+    value = (r >> 3) << 11 | (g >> 2) << 5 | b >> 3
+    # 0 means transparent, so pure black moves one step up.
+    return value or 0x0001
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(__doc__, file=sys.stderr)
+        return 1
+    renders = Path(sys.argv[1])
+    load = lambda name: Image.open(renders / f"{name}.png")  # noqa: E731
+    icons = {
+        "CLAUDE": cells(square(clear_outside_white(load("claude"))), 0.5),
+        "CODEX": cells(square(clear_outside_white(load("codex")))),
+        "OPENCODE": cells(square(drop_dark(load("opencode")))),
+        "COPILOT": cells(square(ink_to(load("copilot"), (255, 255, 255)))),
+        "PI": cells(square(ink_to(load("pi"), (246, 246, 246)))),
+        "CI": [[CI_COLOUR if c == "#" else None for c in row] for row in CI],
+    }
+    print("// Generated by tools/make-agent-icons.py; don't edit by hand.")
+    print("// Row by row from the top left, RGB565, 0 for transparent.")
+    print()
+    for name, rows in icons.items():
+        print(f"pub const {name}: [u16; {SIZE * SIZE}] = [")
+        for row in rows:
+            print("    " + " ".join(f"0x{rgb565(c) if c else 0:04X}," for c in row))
+        print("];")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

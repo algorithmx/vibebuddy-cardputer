@@ -133,7 +133,7 @@ impl CiWatcher {
     ) -> Option<Event> {
         if run.status != "completed" {
             state.running.insert(run.database_id);
-            let event = tracker.observe(id, title, ActivityStatus::Working);
+            let mut event = tracker.observe(id, title, ActivityStatus::Working);
             tracker.associate_source(
                 id,
                 ActivitySource::GitHubActions {
@@ -141,6 +141,9 @@ impl CiWatcher {
                     run_id: run.database_id,
                 },
             );
+            if let Some(event) = event.as_mut() {
+                tracker.refresh_cards(event);
+            }
             return event;
         }
 
