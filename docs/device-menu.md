@@ -92,6 +92,7 @@ Some boxes have a touchscreen (ADR-0019). The firmware looks for one at boot and
 
 - **A row** is selected and acted on at once, as K1 to the row and then K0 would. VOLUME steps, MUTE toggles, COMPUTERS opens; FORGET ALL and NEW ID still ask first.
 - **A key hint** along the bottom is that key: tap CLOSE to close, BACK to go back.
+- **The dimmed screen around the panel** closes the menu, as K2 does.
 - **The buddy** on duty, outside the menu, is petted: it hops with a heart for a moment, and nothing else changes.
 
 The tapped row, hint or buddy is outlined for a moment, so a tap that landed is seen to. A tap in Leisure only calls the buddy back, like any key, and wakes a screen dimmed for the night. The menu still opens on K1 held, and the Pomodoro screen has nothing to tap: a box on a desk gets brushed, and the timer stays on K0. Every tap prints `TAP <x> <y>` as a diagnostic line.

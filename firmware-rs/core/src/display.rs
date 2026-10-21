@@ -188,6 +188,8 @@ pub enum Target {
     Row(usize),
     /// A key hint along the bottom of the menu, by its place among the panel's hints.
     Hint(usize),
+    /// The dimmed screen around the menu panel.
+    OutsidePanel,
 }
 
 /// How long a tapped target stays outlined.
@@ -1553,6 +1555,10 @@ impl Display {
     /// with the layout. The Pomodoro and Leisure screens have nothing to tap.
     pub fn target_at(&self, x: i32, y: i32) -> Option<Target> {
         if let Some(panel) = &self.panel {
+            // On the box, fingers went for the dimmed edge to close the menu.
+            if !PANEL_FRAME.contains(x, y) {
+                return Some(Target::OutsidePanel);
+            }
             if let Some(index) = hint_rects(panel).iter().position(|rect| rect.contains(x, y)) {
                 return Some(Target::Hint(index));
             }
@@ -1607,6 +1613,8 @@ impl Display {
 const PANEL_BORDER: u16 = COLOR_PET;
 const PANEL_SELECTED: u16 = 0x2148;
 const PANEL_LEFT: i32 = 44;
+/// The menu panel's border, everything it covers.
+const PANEL_FRAME: Rect = Rect { x: 30, y: 14, width: 260, height: 212 };
 const PANEL_RIGHT: i32 = 276;
 
 fn text_width(text: &[u8], scale: i32) -> i32 {
@@ -1679,7 +1687,7 @@ fn draw_heart(canvas: &mut Canvas, x: i32, y: i32) {
 fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
     canvas.dim();
     canvas.dim();
-    canvas.fill_rect(30, 14, 260, 212, PANEL_BORDER);
+    canvas.fill_rect(PANEL_FRAME.x, PANEL_FRAME.y, PANEL_FRAME.width, PANEL_FRAME.height, PANEL_BORDER);
     canvas.fill_rect(32, 16, 256, 208, COLOR_SCREEN);
     canvas.draw_text(PANEL_LEFT, 26, &panel.title, 2, COLOR_PET_HIGHLIGHT, 19);
     canvas.fill_rect(PANEL_LEFT, 46, PANEL_RIGHT - PANEL_LEFT, 1, COLOR_MUTED);

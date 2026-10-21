@@ -6,7 +6,7 @@ status: accepted
 
 Boxes of the same board (ATK-DNESP32S3-BOX V1.1) differ in their screen module: one we probed has a CHSC5432 capacitive touch controller at `0x2E` on I2C0, another has nothing there ([`hardware.md`](../hardware.md), "Touch, and what else is on I2C0"). A buyer can't tell which they'll get. So the firmware probes `0x2E` at boot, and touch only adds to the keys: anything that changes state or does something can still be done with K0, K1 and K2, whose mapping (ADR-0007) doesn't change. The only touch-only thing allowed is decoration, such as the buddy's reaction when petted.
 
-The first version knows one gesture, the tap, and uses it three ways: a tap on a menu row selects it and acts on it (K1 to the row, then K0), a tap on a key hint at the bottom of the menu is that key, and a tap on a task card takes the user to that card's agent. A tap on the buddy pets it. A tap also counts as a key press for Leisure and Boredom, which wakes a screen dimmed for the night.
+The first version knows one gesture, the tap, and uses it three ways: a tap on a menu row selects it and acts on it (K1 to the row, then K0), a tap on a key hint at the bottom of the menu is that key (and on the dimmed screen around the menu, K2), and a tap on a task card takes the user to that card's agent. A tap on the buddy pets it. A tap also counts as a key press for Leisure and Boredom, which wakes a screen dimmed for the night.
 
 ## Rejected options
 

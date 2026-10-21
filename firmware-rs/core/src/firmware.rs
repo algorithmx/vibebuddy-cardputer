@@ -922,8 +922,8 @@ impl Firmware {
 
     /// A tap (ADR-0019). It counts as a key press for Leisure and Boredom, so in Leisure it only calls the buddy
     /// back, waking a screen dimmed for the night. Otherwise it acts on what it landed on: a menu row is selected
-    /// and acted on, a key hint is that key, the buddy is petted. Anything that changes state can also be done
-    /// with the keys.
+    /// and acted on, a key hint is that key, the dimmed screen around the menu closes it, the buddy is petted.
+    /// Anything that changes state can also be done with the keys.
     fn on_tap<B: Board>(&mut self, board: &mut B, point: touch::Point) {
         let now = board.now_ms();
         let line = text!(24, "TAP {} {}\n", point.x, point.y);
@@ -953,6 +953,8 @@ impl Firmware {
                 };
                 self.on_button(board, event);
             }
+            // Tapping away from the menu closes it, as K2 does.
+            Target::OutsidePanel => self.on_button(board, ButtonEvent::K2Short),
             Target::Buddy => self.display.pet(board, &scene!(self, now)),
             Target::Card(_) => {}
         }

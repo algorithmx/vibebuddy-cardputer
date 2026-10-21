@@ -1869,6 +1869,11 @@ mod touchscreen {
         press(&mut firmware, &mut board, Key::K1, 1100);
         tap(&mut firmware, &mut board, 160, 185);
         assert_eq!(tap(&mut firmware, &mut board, 260, 210), ["TAP 260 210", "MENU CLOSED"]);
+        // Away from the panel, on the dimmed edge, is K2 too.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 305, 130), ["TAP 305 130", "MENU CLOSED"]);
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 5, 130), ["TAP 5 130", "MENU CLOSED"]);
         // Closed, the same place is just the screen.
         assert_eq!(tap(&mut firmware, &mut board, 190, 210), ["TAP 190 210"]);
     }
