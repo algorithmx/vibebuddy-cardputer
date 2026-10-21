@@ -32,7 +32,7 @@ const SLOTS: usize = 2;
 const EXTRA_SOCKETS: usize = 5;
 /// The receive window: a firmware update keeps several 5.7 KB sealed chunks in flight, and the main loop reads the
 /// socket only between its passes, so a small window caps the update at a couple of KB per pass (ADR-0016).
-const SOCKET_RX_BYTES: usize = 16 * 1024;
+const SOCKET_RX_BYTES: usize = 32 * 1024;
 const SOCKET_TX_BYTES: usize = 4096;
 /// Output waiting for a connection; a screenshot is the biggest burst.
 const PIPE_BYTES: usize = 4096;

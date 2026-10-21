@@ -290,18 +290,33 @@ pub fn noise_public(key: &[u8; 32]) -> Option<[u8; 32]> {
     VerifyingKey::from_bytes(key).ok().map(|key| key.to_montgomery().to_bytes())
 }
 
-/// Decodes canonical unpadded base64url of any length.
+/// Decodes canonical unpadded base64url of any length, in one pass: sealed lines are several KB.
 pub fn decode_vec(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 4 == 1 {
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 == 1 {
         return None;
     }
-    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
-    for chunk in text.as_bytes().chunks(4) {
-        let piece = core::str::from_utf8(chunk).ok()?;
-        match chunk.len() {
-            4 => out.extend_from_slice(&decode::<3>(piece)?),
-            3 => out.extend_from_slice(&decode::<2>(piece)?),
-            _ => out.extend_from_slice(&decode::<1>(piece)?),
+    let value = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+        b'a'..=b'z' => Some(u32::from(byte - b'a' + 26)),
+        b'0'..=b'9' => Some(u32::from(byte - b'0' + 52)),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
+    for chunk in bytes.chunks(4) {
+        let mut bits = 0u32;
+        for (index, &byte) in chunk.iter().enumerate() {
+            bits |= value(byte)? << (18 - 6 * index);
+        }
+        let produced = chunk.len() - 1;
+        // The last character's spare bits must be zero for the text to be canonical.
+        if produced < 3 && bits & ((1 << (8 * (3 - produced))) - 1) != 0 {
+            return None;
+        }
+        for index in 0..produced {
+            out.push((bits >> (16 - 8 * index)) as u8);
         }
     }
     Some(out)
