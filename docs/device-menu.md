@@ -101,7 +101,7 @@ The tapped row, hint, card or buddy is outlined for a moment, so a tap that land
 
 ### Task card pages
 
-The daemon sends up to six cards, three a page, those waiting for input first (#155). Each card shows its agent's icon in place of the `CC:`-style prefix; CI has an icon of its own. With two pages:
+The daemon sends up to six cards, three a page, those waiting for input first (#155). Each card shows its agent's icon, the agent's own mark reduced to 16 × 16 pixels (`tools/make-agent-icons.py`), in place of the `CC:`-style prefix; CI has an icon of our own. With two pages:
 
 - the line under the cards says which page is up (`PAGE 1 OF 2`), and how many activities weren't sent at all (`2 MORE`);
 - a thin bar beside the cards shows which page is up;

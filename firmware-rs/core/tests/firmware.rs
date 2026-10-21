@@ -1966,7 +1966,7 @@ mod touchscreen {
     fn a_swipe_turns_the_cards_page_and_taps_follow_it() {
         let (mut firmware, mut board, _) = touch_box();
         send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
-        assert_eq!(pixel(&board, 23, 59), 0xDBAA, "Claude's spark in its orange, in place of CC:");
+        assert_eq!(pixel(&board, 22, 58), 0xDBAA, "Claude's spark in its orange, in place of CC:");
         assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
 
         assert_eq!(swipe(&mut firmware, &mut board, 100, 150, 60), ["SWIPE UP", "CARDS PAGE 2/2"]);
@@ -1986,11 +1986,11 @@ mod touchscreen {
     fn the_pages_turn_by_themselves_unless_a_card_waits_or_a_finger_just_turned_them() {
         let (mut firmware, mut board, _) = touch_box();
         send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
-        let top = |board: &FakeBoard| pixel(board, 23, 59);
+        let top = |board: &FakeBoard| pixel(board, 22, 58);
         assert_eq!(top(&board), 0xDBAA);
         board.advance(8_100);
         firmware.poll(&mut board);
-        assert_eq!(top(&board), 0x8410, "page 2 opens with OpenCode's square, grey in the middle");
+        assert_eq!(top(&board), 0xFFFF, "page 2 opens with OpenCode's white frame");
         board.advance(8_100);
         firmware.poll(&mut board);
         assert_eq!(top(&board), 0xDBAA, "and wraps round");
@@ -1999,7 +1999,7 @@ mod touchscreen {
         swipe(&mut firmware, &mut board, 100, 150, 60);
         board.advance(20_000);
         firmware.poll(&mut board);
-        assert_eq!(top(&board), 0x8410);
+        assert_eq!(top(&board), 0xFFFF);
         board.advance(11_000);
         firmware.poll(&mut board);
         assert_eq!(top(&board), 0xDBAA);

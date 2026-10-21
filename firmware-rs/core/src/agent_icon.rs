@@ -1,11 +1,13 @@
 //! The small icon a task card shows for its agent, in place of the text prefix the daemon puts in its title
-//! (#155). The agents' icons are pixel versions of their makers' marks in their colours; CI isn't an agent, so its
-//! icon is our own. An agent without an icon keeps its prefix.
+//! (#155). The agents' icons are their makers' marks reduced to 16 × 16 by `tools/make-agent-icons.py`, which
+//! names the sources; CI isn't an agent, so its icon is our own. An agent without an icon keeps its prefix.
 
 use crate::canvas::Canvas;
 
+mod pixels;
+
 /// Icons are this many pixels square.
-pub const SIZE: i32 = 12;
+pub const SIZE: i32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentIcon {
@@ -17,15 +19,6 @@ pub enum AgentIcon {
     /// GitHub Actions runs.
     Ci,
 }
-
-const WHITE: u16 = 0xFFFF;
-const GRAY: u16 = 0x8410;
-/// Claude's orange, #D97757.
-const CLAUDE: u16 = 0xDBAA;
-/// Copilot's purple, #8957E5.
-const COPILOT: u16 = 0x8ABC;
-/// A teal of our own for CI, #2DD4BF.
-const CI: u16 = 0x2EB7;
 
 impl AgentIcon {
     /// The icon for an agent as the daemon names it (`agent` in `tasks`).
@@ -53,136 +46,22 @@ impl AgentIcon {
         }
     }
 
-    /// Rows of the icon, a character a pixel: `#` the main colour, `+` the second, anything else left alone.
-    fn pixels(self) -> (&'static [&'static str; 12], u16, u16) {
+    fn pixels(self) -> &'static [u16; (SIZE * SIZE) as usize] {
         match self {
-            // Claude's spark: rays of uneven length from a centre.
-            Self::ClaudeCode => (
-                &[
-                    ".....#......",
-                    "..#..#...#..",
-                    "...#.#..#...",
-                    "....###.#...",
-                    "#...####....",
-                    ".#########..",
-                    "...#####.###",
-                    "..#.###.....",
-                    ".#..#.##....",
-                    "#..#..#.#...",
-                    "...#..#..#..",
-                    "......#.....",
-                ],
-                CLAUDE,
-                CLAUDE,
-            ),
-            // Codex: the prompt in a rounded square.
-            Self::Codex => (
-                &[
-                    "..########..",
-                    ".#........#.",
-                    "#..........#",
-                    "#.#........#",
-                    "#..#.......#",
-                    "#...#......#",
-                    "#..#.......#",
-                    "#.#..++++..#",
-                    "#..........#",
-                    "#..........#",
-                    ".#........#.",
-                    "..########..",
-                ],
-                WHITE,
-                WHITE,
-            ),
-            // OpenCode: its square mark, light above and dark below.
-            Self::OpenCode => (
-                &[
-                    "############",
-                    "############",
-                    "##........##",
-                    "##........##",
-                    "##........##",
-                    "##++++++++##",
-                    "##++++++++##",
-                    "##++++++++##",
-                    "##++++++++##",
-                    "##........##",
-                    "############",
-                    "############",
-                ],
-                WHITE,
-                GRAY,
-            ),
-            // Copilot: the pilot's head with its goggles.
-            Self::Copilot => (
-                &[
-                    "...######...",
-                    "..#......#..",
-                    ".##########.",
-                    "##++##++####",
-                    "##++##++####",
-                    ".##########.",
-                    "#..........#",
-                    "#...#..#...#",
-                    "#...#..#...#",
-                    "#..........#",
-                    ".#........#.",
-                    "..########..",
-                ],
-                COPILOT,
-                WHITE,
-            ),
-            // Pi: the letter.
-            Self::Pi => (
-                &[
-                    "............",
-                    "............",
-                    ".##########.",
-                    ".##########.",
-                    "...##..##...",
-                    "...##..##...",
-                    "...##..##...",
-                    "...##..##...",
-                    "..##...##...",
-                    "..##...###..",
-                    ".##.....##..",
-                    "............",
-                ],
-                WHITE,
-                WHITE,
-            ),
-            // CI: two arrows chasing each other round a loop, our own.
-            Self::Ci => (
-                &[
-                    "....####....",
-                    "..##....#...",
-                    ".#.......#..",
-                    ".#......###.",
-                    "#........#..",
-                    "#...........",
-                    "...........#",
-                    "..#........#",
-                    ".###......#.",
-                    "..#.......#.",
-                    "...#....##..",
-                    "....####....",
-                ],
-                CI,
-                CI,
-            ),
+            Self::ClaudeCode => &pixels::CLAUDE,
+            Self::Codex => &pixels::CODEX,
+            Self::OpenCode => &pixels::OPENCODE,
+            Self::Copilot => &pixels::COPILOT,
+            Self::Pi => &pixels::PI,
+            Self::Ci => &pixels::CI,
         }
     }
 
     pub fn draw(self, canvas: &mut Canvas, x: i32, y: i32) {
-        let (rows, main, second) = self.pixels();
-        for (row, line) in rows.iter().enumerate() {
-            for (column, pixel) in line.bytes().enumerate() {
-                let color = match pixel {
-                    b'#' => main,
-                    b'+' => second,
-                    _ => continue,
-                };
-                canvas.fill_rect(x + column as i32, y + row as i32, 1, 1, color);
+        for (index, &color) in self.pixels().iter().enumerate() {
+            if color != 0 {
+                let index = index as i32;
+                canvas.fill_rect(x + index % SIZE, y + index / SIZE, 1, 1, color);
             }
         }
     }
@@ -191,14 +70,6 @@ impl AgentIcon {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_icon_is_square() {
-        for icon in [AgentIcon::ClaudeCode, AgentIcon::Codex, AgentIcon::OpenCode, AgentIcon::Copilot, AgentIcon::Pi, AgentIcon::Ci] {
-            let (rows, _, _) = icon.pixels();
-            assert!(rows.iter().all(|row| row.len() == SIZE as usize), "{icon:?}");
-        }
-    }
 
     #[test]
     fn agents_map_to_their_icons_and_prefixes() {

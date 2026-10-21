@@ -973,8 +973,8 @@ impl Display {
             // The agent's icon stands in for the title's prefix; the text moves right to make room.
             let (text_x, title, project_chars) = match task.icon {
                 Some(icon) => {
-                    icon.draw(canvas, x + 10, y + 4);
-                    (x + 26, task.title.strip_prefix(icon.prefix()).unwrap_or(&task.title), 13)
+                    icon.draw(canvas, x + 10, y + 8);
+                    (x + 30, task.title.strip_prefix(icon.prefix()).unwrap_or(&task.title), 12)
                 }
                 None => (x + 12, &task.title[..], 16),
             };
