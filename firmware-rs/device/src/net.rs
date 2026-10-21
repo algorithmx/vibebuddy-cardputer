@@ -30,7 +30,9 @@ const PORT: u16 = 7340;
 const SLOTS: usize = 2;
 /// Sockets beyond the servers: DHCP, DNS, SNTP, the Relay and mDNS.
 const EXTRA_SOCKETS: usize = 5;
-const SOCKET_RX_BYTES: usize = 2048;
+/// The receive window: a firmware update keeps several 5.7 KB sealed chunks in flight, and the main loop reads the
+/// socket only between its passes, so a small window caps the update at a couple of KB per pass (ADR-0016).
+const SOCKET_RX_BYTES: usize = 32 * 1024;
 const SOCKET_TX_BYTES: usize = 4096;
 /// Output waiting for a connection; a screenshot is the biggest burst.
 const PIPE_BYTES: usize = 4096;
@@ -317,7 +319,8 @@ async fn server(stack: Stack<'static>, slot: usize) {
     // On the heap, which is PSRAM first: internal RAM is for the Wi-Fi driver and the stack.
     let mut rx = alloc::vec![0u8; SOCKET_RX_BYTES];
     let mut tx = alloc::vec![0u8; SOCKET_TX_BYTES];
-    let mut chunk = [0u8; 256];
+    // A sealed firmware chunk is about 5.7 KB: read it in a few pieces, not twenty, each one an event for the main loop.
+    let mut chunk = alloc::vec![0u8; 1024];
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
         socket.set_timeout(Some(Duration::from_secs(60)));

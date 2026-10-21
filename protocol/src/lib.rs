@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const VERSION: i64 = 1;
+/// The longest message every box takes; what is fitted to a line for the box (spoken text, say) stays within it.
 pub const MAX_MESSAGE_BYTES: usize = 1024;
+/// The longest line that encodes at all: a firmware chunk of 3072 bytes is about 4.2 KB as a line (ADR-0016). Only
+/// those chunks come near it, and they go only to firmware that reports `TRANSFER 1`, which takes this much.
+pub const MAX_LINE_BYTES: usize = 4608;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Event {
@@ -51,7 +55,7 @@ impl Event {
         self.validate()?;
 
         let mut bytes = serde_json::to_vec(self).map_err(ProtocolError::Serialize)?;
-        if bytes.len() > MAX_MESSAGE_BYTES {
+        if bytes.len() > MAX_LINE_BYTES {
             return Err(ProtocolError::MessageTooLarge(bytes.len()));
         }
         bytes.push(b'\n');
@@ -84,7 +88,7 @@ impl fmt::Display for ProtocolError {
             Self::MessageTooLarge(size) => {
                 write!(
                     formatter,
-                    "message is {size} bytes, over the {MAX_MESSAGE_BYTES}-byte limit"
+                    "message is {size} bytes, over the {MAX_LINE_BYTES}-byte limit"
                 )
             }
             Self::Serialize(error) => write!(formatter, "JSON encoding failed: {error}"),
@@ -143,7 +147,7 @@ mod tests {
             event: "message".to_owned(),
             id: None,
             title: None,
-            message: Some("x".repeat(MAX_MESSAGE_BYTES)),
+            message: Some("x".repeat(MAX_LINE_BYTES)),
             extra: BTreeMap::new(),
         };
 

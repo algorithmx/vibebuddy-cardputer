@@ -571,7 +571,7 @@ struct DeviceView: View {
                     Text("This is a \(board) board, which released firmware doesn't run on, so no update is offered.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if model.firmwareUpdateAvailable, connected, !onCable {
+                if model.firmwareUpdateAvailable, connected, !canFlash {
                     Text("Plug in the cable to update the box's firmware.").font(.caption).foregroundStyle(.secondary)
                 } else if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
                     Button("Update to \(offer.version)") { FlashConfirm.update(offer, then: model.updateFirmware) }
@@ -591,13 +591,16 @@ struct DeviceView: View {
                 if let operation = model.operation, operation.kind == .firmware {
                     OperationRow(operation: operation)
                     if operation.state == .failed {
-                        Text("Before retrying, hold K0 on the box and replug the cable to put it in download mode.").font(.caption).foregroundStyle(.secondary)
-                        Button("Retry") { model.updateFirmware() }.disabled(!onCable)
+                        // Firmware that updates over the link carries on from where it got to; download mode is for the rest.
+                        if model.status?.device.transfer != true {
+                            Text("Before retrying, hold K0 on the box and replug the cable to put it in download mode.").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Button("Retry") { model.updateFirmware() }.disabled(!canFlash)
                     }
                 }
                 HStack {
                     // Separately distributed firmware (VibeBuddy-firmware-*.zip on Releases) comes in here.
-                    Button("Flash from file…") { flashFromFile() }.disabled(!onCable)
+                    Button("Flash from file…") { flashFromFile() }.disabled(!canFlash)
                     Button("Make the box blink") { model.identify() }
                 }
                 .disabled(model.operationRunning || !connected)
@@ -633,8 +636,9 @@ struct DeviceView: View {
     }
 
     private var connected: Bool { model.status?.device.connected ?? false }
-    /// Flashing goes over the cable only: over Wi-Fi or the Relay the daemon refuses it.
-    private var onCable: Bool { connected && model.status?.device.network != true }
+    /// Firmware that reports `TRANSFER 1` is updated over whatever carries the link (ADR-0016); older firmware is
+    /// flashed over the cable only, and over Wi-Fi or the Relay the daemon refuses it.
+    private var canFlash: Bool { connected && (model.status?.device.network != true || model.status?.device.transfer == true) }
 
     /// The offered version, or why there is none: a bare dash read as "no update checks at all".
     private var latestFirmware: String {

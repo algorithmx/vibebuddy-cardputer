@@ -36,6 +36,7 @@ pub mod relay_box;
 pub mod spoken_reply;
 pub mod storage;
 pub mod touch;
+pub mod transfer;
 pub mod voice_command;
 pub mod voice_pack;
 pub mod voices;

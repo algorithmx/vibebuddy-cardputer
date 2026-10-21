@@ -78,7 +78,7 @@ When the box reconnects to the Relay while a computer is linked through it, that
 
 The Relay carries a computer's lines but can't read or forge them (ADR-0015). Whenever the Relay links a computer to the box (`linked`, also after either reconnects), the box sends `{"version":1,"event":"link.noise","box":"<box key>"}` as `data`, and the two run the same Noise handshake as over the local network ([`protocol.md`](protocol.md), "Local network link"), each handshake message one `data` line. The box accepts a session only from the computer the Relay linked. After it every `data` line either way is one sealed line: sealing adds a 16-byte tag and base64url a third, so the box's longest line (a screenshot line under 2 KB) is under 2.8 KB, well within the 8 KiB limit. The box acts on nothing in the clear; a line that doesn't open makes it drop the session and send `link.noise` again, and makes the daemon end the link and reconnect.
 
-The daemon starts a session whenever `link.noise` arrives and holds what it would send until the session is up, then sends `device.hello` first. Firmware before ADR-0015 never sends `link.noise`; the daemon talks to it in the clear, unless the box has spoken Noise to it before (`box-noise`, see "Local network link"), and then it waits for `link.noise` and believes nothing in the clear.
+The daemon starts a session whenever `link.noise` arrives and holds what it would send until the session is up, then sends `device.hello` first. A box it knows speaks Noise that hasn't sent `link.noise` 3 s after a link gets the first handshake message from the daemon anyway, and again every 10 s until a session is up: the box may have missed `linked` while it restarted, or its line may have been lost. A box with no computer from `linked` takes a handshake from any paired computer, since the Relay passes on data only from the computer it linked; a handshake while a session is up doesn't open as a line, so the box starts over with `link.noise`. While it holds lines the daemon still sends `{"t":"ping"}` every 30 s, or the Relay would count it silent. Firmware before ADR-0015 never sends `link.noise`; the daemon talks to it in the clear, unless the box has spoken Noise to it before (`box-noise`, see "Local network link"), and then it waits for `link.noise` and believes nothing in the clear.
 
 The Relay itself is unchanged: `data` was always forwarded without being read.
 
@@ -90,4 +90,4 @@ The simulator plays the box on the Relay with `tools/simulate-device.py --relay 
 
 ## Not decided yet
 
-Resuming large writes after a drop. Noticing a box that lost power without closing its socket: the Relay shows it online until the edge notices.
+Noticing a box that lost power without closing its socket: the Relay shows it online until the edge notices.
