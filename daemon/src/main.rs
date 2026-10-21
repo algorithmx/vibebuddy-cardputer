@@ -1025,10 +1025,26 @@ async fn post_voice_pack(
     let task_state = state.clone();
     tokio::spawn(async move {
         let progress_state = task_state.clone();
-        let result = voice_writer::write_pack(task_state.transport.clone(), bus, pack, move |fraction| {
-            report_progress(&progress_state, fraction, None);
-        })
-        .await;
+        // Firmware that takes transfers gets the pack that way: windowed, resumable, over any link (ADR-0016).
+        let over_the_link = task_state.device.lock().await.transfer;
+        let result = if over_the_link {
+            let resuming_state = task_state.clone();
+            transfer::send_image(
+                task_state.transport.clone(),
+                bus,
+                "character",
+                pack,
+                move |fraction| report_progress(&progress_state, fraction, None),
+                move || report_message(&resuming_state, "waiting for the link to come back"),
+            )
+            .await
+            .and_then(|done| done.extra.get("voice").and_then(|voice| voice.as_str()).map(str::to_owned).ok_or_else(|| "the box didn't say which Character it has".to_owned()))
+        } else {
+            voice_writer::write_pack(task_state.transport.clone(), bus, pack, move |fraction| {
+                report_progress(&progress_state, fraction, None);
+            })
+            .await
+        };
         match result {
             Ok(written) => {
                 info!(voice = %written, "voice pack written to device");
@@ -1192,6 +1208,7 @@ async fn update_over_the_link(state: AppState, segments: Vec<rom_flasher::Segmen
         let result = transfer::send_image(
             task_state.transport.clone(),
             bus,
+            "firmware",
             image,
             move |fraction| report_progress(&progress_state, fraction * 0.95, Some("sending the firmware to the box".to_owned())),
             move || report_message(&resuming_state, "waiting for the link to come back"),

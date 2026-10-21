@@ -1,5 +1,5 @@
-//! Sending a firmware image to the box over any link, in chunks, resumably (ADR-0016, docs/protocol.md
-//! "Firmware over the link"). The image goes as `xfer.chunk` lines of at most [`CHUNK_BYTES`], up to [`WINDOW`]
+//! Sending a firmware image or a Character pack to the box over any link, in chunks, resumably (ADR-0016,
+//! docs/protocol.md "Firmware and Character packs over the link"). The image goes as `xfer.chunk` lines of at most [`CHUNK_BYTES`], up to [`WINDOW`]
 //! of them unacknowledged; the box acknowledges each with the next offset it expects. When the link drops or
 //! moves (the Relay to the cable, say), the daemon waits for it to come back and asks again with `xfer.begin`,
 //! and the box answers with where it got to.
@@ -51,8 +51,9 @@ fn event(name: &str, fields: serde_json::Value) -> Event {
     event
 }
 
-pub fn begin_event(size: usize, sha256: &str) -> Event {
-    event("xfer.begin", serde_json::json!({"kind": "firmware", "size": size, "sha256": sha256}))
+/// What goes over: `firmware` (the app image) or `character` (a Character pack).
+pub fn begin_event(kind: &str, size: usize, sha256: &str) -> Event {
+    event("xfer.begin", serde_json::json!({"kind": kind, "size": size, "sha256": sha256}))
 }
 
 pub fn chunk_event(offset: usize, piece: &[u8]) -> Event {
@@ -68,6 +69,14 @@ pub fn chunk_event(offset: usize, piece: &[u8]) -> Event {
 
 /// The box's next answer about the transfer: `xfer.ready`/`xfer.ack` with an offset, `xfer.done`, or a stop.
 async fn answer(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Duration) -> Result<(String, Option<usize>), Stop> {
+    answer_event(bus, timeout).await.map(|event| {
+        let offset = event.extra.get("offset").and_then(serde_json::Value::as_u64).map(|offset| offset as usize);
+        (event.event, offset)
+    })
+}
+
+/// [`answer`], the whole event.
+async fn answer_event(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Duration) -> Result<Event, Stop> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let message = match tokio::time::timeout_at(deadline, bus.recv()).await {
@@ -84,10 +93,7 @@ async fn answer(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Duration)
                 let code = event.extra.get("code").and_then(|value| value.as_str()).unwrap_or("error");
                 return Err(Stop::Fail(format!("the box refused the image: {code}")));
             }
-            DeviceMessage::Event(event) if event.event.starts_with("xfer.") => {
-                let offset = event.extra.get("offset").and_then(serde_json::Value::as_u64).map(|offset| offset as usize);
-                return Ok((event.event, offset));
-            }
+            DeviceMessage::Event(event) if event.event.starts_with("xfer.") => return Ok(event),
             _ => {}
         }
     }
@@ -109,11 +115,12 @@ async fn reconnected(bus: &mut broadcast::Receiver<DeviceMessage>) -> bool {
 async fn send_from_box(
     transport: &Arc<dyn Transport>,
     bus: &mut broadcast::Receiver<DeviceMessage>,
+    kind: &str,
     image: &[u8],
     sha256: &str,
     progress: &impl Fn(f32),
 ) -> Result<(), Stop> {
-    send(transport, begin_event(image.len(), sha256)).await.map_err(|_| Stop::Resume)?;
+    send(transport, begin_event(kind, image.len(), sha256)).await.map_err(|_| Stop::Resume)?;
     let mut acked = loop {
         if let (name, Some(offset)) = answer(bus, READY_TIMEOUT).await?
             && name == "xfer.ready"
@@ -141,24 +148,26 @@ async fn send_from_box(
     Ok(())
 }
 
-/// Sends the whole image and has the box check it and make it boot next; the box then restarts. `progress`
+/// Sends the whole image of `kind` and has the box check and commit it: firmware boots next and the box restarts; a
+/// pack becomes the Character. Returns the box's `xfer.done`, which names the new Character for a pack. `progress`
 /// receives 0 to 1 as the box acknowledges, and `resuming` is told when the transfer waits for the link.
 pub async fn send_image(
     transport: Arc<dyn Transport>,
     mut bus: broadcast::Receiver<DeviceMessage>,
+    kind: &str,
     image: Vec<u8>,
     progress: impl Fn(f32),
     resuming: impl Fn(),
-) -> Result<(), String> {
+) -> Result<Event, String> {
     let sha256: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
     let mut resumes = 0;
     loop {
-        match send_from_box(&transport, &mut bus, &image, &sha256, &progress).await {
+        match send_from_box(&transport, &mut bus, kind, &image, &sha256, &progress).await {
             Ok(()) => {
                 send(&transport, Event::named("xfer.end")).await?;
-                match answer(&mut bus, END_TIMEOUT).await {
-                    Ok((name, _)) if name == "xfer.done" => return Ok(()),
-                    Ok((name, _)) => return Err(format!("unexpected {name} at the end")),
+                match answer_event(&mut bus, END_TIMEOUT).await {
+                    Ok(done) if done.event == "xfer.done" => return Ok(done),
+                    Ok(other) => return Err(format!("unexpected {} at the end", other.event)),
                     // The box keeps what it has: asking again carries on, and ends again.
                     Err(Stop::Resume) => {}
                     Err(Stop::Fail(why)) => return Err(why),
@@ -252,7 +261,7 @@ mod tests {
         let fake = Arc::new(FakeBox { bus, state: Mutex::new((0, Vec::new(), drop_after)) });
         let resumed = Arc::new(Mutex::new(0));
         let counter = resumed.clone();
-        let result = send_image(fake.clone(), receiver, image, |_| {}, move || *counter.lock().unwrap() += 1).await;
+        let result = send_image(fake.clone(), receiver, "firmware", image, |_| {}, move || *counter.lock().unwrap() += 1).await.map(|_| ());
         let written = std::mem::take(&mut fake.state.lock().unwrap().1);
         let resumed = *resumed.lock().unwrap();
         (result, written, resumed)

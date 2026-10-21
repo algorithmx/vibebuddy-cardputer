@@ -1431,6 +1431,56 @@ mod transfer {
         assert_eq!(reply(&send(&mut firmware, &mut board, &line))["offset"], CHUNK_BYTES as u64);
     }
 
+    /// Sends a whole image of `kind` over xfer.*; returns what the box said to xfer.end.
+    fn send_over_xfer(firmware: &mut Firmware, board: &mut FakeBoard, kind: &str, image: &[u8], sha: &str) -> Vec<String> {
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"{kind}","size":{},"sha256":"{sha}"}}"#, image.len());
+        assert_eq!(begin_transfer(firmware, board, &begin)["event"], "xfer.ready");
+        for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
+            let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#, index * CHUNK_BYTES, crc32(0, piece), base64(piece));
+            assert_eq!(reply(&send(firmware, board, &line))["event"], "xfer.ack");
+        }
+        send(firmware, board, r#"{"version":1,"event":"xfer.end"}"#)
+    }
+
+    fn hex_sha(image: &[u8]) -> String {
+        Sha256::digest(image).iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn a_character_pack_comes_over_the_link_and_speaks_at_once() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let lines = send_over_xfer(&mut firmware, &mut board, "character", SAMPLE_PACK, &hex_sha(SAMPLE_PACK));
+        assert_eq!(lines, [r#"{"version":1,"event":"xfer.done","voice":"sample"}"#, "VOICES sample", "AUDIO QUEUED DONE"]);
+        assert_eq!(adpcm_samples(board.played.last()), Some(3), "the done line of the new Character");
+        assert_eq!(board.restarts, 0, "a pack needs no restart");
+    }
+
+    #[test]
+    fn while_a_pack_comes_in_the_built_in_voice_speaks_and_a_failed_one_leaves_it() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send_over_xfer(&mut firmware, &mut board, "character", SAMPLE_PACK, &hex_sha(SAMPLE_PACK));
+        // Another pack, with a hash that won't match: set aside while it comes, and gone after.
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"task.done","title":"A"}"#);
+        assert_eq!(board.played.last(), Some(&Sound::Builtin(Prompt::Done)), "the partition is being rewritten");
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, SAMPLE_PACK), base64(SAMPLE_PACK));
+        send(&mut firmware, &mut board, &line);
+        assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sha256");
+        let hello = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+        assert!(hello.contains(&"VOICES builtin".to_owned()), "the old pack was erased, nothing new took its place: {hello:?}");
+    }
+
+    #[test]
+    fn something_else_is_not_a_pack() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let junk = vec![0x42u8; 2000];
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, junk.len(), hex_sha(&junk));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &junk), base64(&junk));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line))["code"], "bad_image");
+    }
+
     #[test]
     fn a_bad_chunk_ends_the_transfer_with_its_reason() {
         let (mut firmware, mut board, _) = booted(blank_flash());

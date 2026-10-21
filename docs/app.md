@@ -91,7 +91,7 @@ The firmware no longer compiles the five PCM lines into the program. The partiti
 
 A voice pack is a small custom format with no file system: magic number, version, voice id, five `[offset, length]` entries, followed by five PCM segments in the same format as the existing assets. The header is written last, so a half-written pack counts as not written.
 
-Writing goes over the existing serial protocol: the Mac sends base64 in chunks, and the firmware writes the partition itself, verifies it and reports back, without resetting or grabbing the serial port; both connection types behave the same. Over the bridge at 115200 baud, 1.5 MB takes about three minutes; the native USB port takes a few seconds. The esptool path is reserved for firmware updates.
+Writing goes over the link, whichever carries it: the daemon sends base64 in chunks, and the firmware writes the partition itself, verifies it and reports back, without resetting or grabbing the serial port. Firmware that reports `TRANSFER 1` takes the pack as a resumable transfer (`xfer.*`, ADR-0016); older firmware by stop-and-wait `voice.*`. Over the bridge at 115200 baud, 1.5 MB takes about three minutes; the native USB port takes a few seconds. The esptool path is reserved for firmware updates.
 
 The packs the app ships are the Character packs committed as `characters/*/pack.bin` (see [`characters.md`](characters.md)), about 2.5 MB for four.
 

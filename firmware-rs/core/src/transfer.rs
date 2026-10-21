@@ -1,24 +1,28 @@
-//! Receiving a firmware image over any link, in chunks, resumably (ADR-0016). The computer sends
-//! `xfer.begin` with the image's size and SHA-256, then `xfer.chunk`s of at most [`CHUNK_BYTES`], several
-//! unacknowledged, then `xfer.end`. The box erases what the image needs in the OTA slot it isn't running from,
-//! one 64 KB block per main-loop pass, before it answers `xfer.ready`: while chunks arrive it only writes, since an
+//! Receiving a firmware image or a Character pack over any link, in chunks, resumably (ADR-0016). The computer
+//! sends `xfer.begin` with the kind, the image's size and SHA-256, then `xfer.chunk`s of at most [`CHUNK_BYTES`], several
+//! unacknowledged, then `xfer.end`. The box erases what the image needs where it goes (the OTA slot it isn't
+//! running from, or the `voices` partition), one 64 KB block per main-loop pass, before it answers `xfer.ready`: while chunks arrive it only writes, since an
 //! erase stops interrupts long enough to lose bytes on the UART bridge, and block erases are far faster than
 //! sector ones. It acknowledges each chunk with the next offset it expects; a chunk at any other offset is
 //! acknowledged with that offset again, since every way of carrying a link delivers in order and a chunk only
 //! goes missing when the link drops.
 //!
 //! What has been written is kept in memory, so an `xfer.begin` for the same image, over any way of carrying the
-//! link, carries on from there. On `xfer.end` the box reads the slot back and checks the length and SHA-256 before
-//! it touches otadata, so a transfer that fails anywhere leaves the box running what it ran.
+//! link, carries on from there. On `xfer.end` the box reads what it wrote back and checks the length and SHA-256
+//! before it commits: firmware by selecting the slot in otadata, so a transfer that fails anywhere leaves the box
+//! running what it ran; a Character pack by writing its header last, which it kept in memory until then, so a
+//! partition with a pack half written never looks like a pack (ADR-0008).
+
+use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
 
-use crate::ota;
 use crate::storage::{Flash, Region, SECTOR_BYTES, find_partition};
+use crate::voice_pack::crc32;
+use crate::{character_pack, ota, voice_pack};
 
 /// What one erase step covers: a flash block, erased with one command.
 const ERASE_STEP: u32 = 64 * 1024;
-use crate::voice_pack::crc32;
 
 /// Most image bytes in one chunk: as base64 inside its line, about 4.2 KB.
 pub const CHUNK_BYTES: usize = 3072;
@@ -57,11 +61,35 @@ impl Error {
     }
 }
 
+/// What a transfer carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An app image, for the OTA slot the box isn't running from.
+    Firmware,
+    /// A Character pack (or an old voice pack), for the `voices` partition.
+    Character,
+}
+
+impl Kind {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "firmware" => Some(Self::Firmware),
+            "character" => Some(Self::Character),
+            _ => None,
+        }
+    }
+}
+
 struct Image {
+    kind: Kind,
     size: u32,
     sha256: [u8; 32],
+    /// The OTA slot a firmware image goes to.
     slot: usize,
     target: Region,
+    /// A pack's header, kept here until the pack checks out; its length, from the magic in the first chunk.
+    header: Vec<u8>,
+    header_bytes: usize,
     /// Bytes of the image written so far.
     next: u32,
     /// Flash erased up to here, absolute; chunks are taken once it reaches [`Image::erase_end`].
@@ -99,6 +127,11 @@ impl Transfer {
         self.image.is_some()
     }
 
+    /// The kind of a transfer still erasing before it can take chunks.
+    pub fn erasing(&self) -> Option<Kind> {
+        self.image.as_ref().filter(|image| !image.erased()).map(|image| image.kind)
+    }
+
     /// How far along, 0 to 100.
     pub fn percent(&self) -> Option<u8> {
         self.image.as_ref().map(|image| (u64::from(image.next) * 100 / u64::from(image.size.max(1))) as u8)
@@ -106,29 +139,36 @@ impl Transfer {
 
     /// Starts a transfer, or resumes the same one. Returns the offset to send from once the slot is erased for it;
     /// None while erasing, and [`Self::erase_step`] gives the offset when done.
-    pub fn begin(&mut self, flash: &mut dyn Flash, kind: &str, size: u32, sha256: [u8; 32]) -> Result<Option<u32>, Error> {
+    pub fn begin(&mut self, flash: &mut dyn Flash, kind: Kind, size: u32, sha256: [u8; 32]) -> Result<Option<u32>, Error> {
         if let Some(image) = &self.image
+            && image.kind == kind
             && image.size == size
             && image.sha256 == sha256
-            && kind == "firmware"
         {
             return Ok(image.erased().then_some(image.next));
         }
         self.image = None;
-        if kind != "firmware" {
-            return Err(Error::Unsupported);
-        }
-        let (Some(otadata), Some(ota_0), Some(ota_1)) =
-            (find_partition(flash, "otadata"), find_partition(flash, "ota_0"), find_partition(flash, "ota_1"))
-        else {
-            return Err(Error::Unsupported);
+        let (slot, target) = match kind {
+            Kind::Firmware => {
+                let (Some(otadata), Some(ota_0), Some(ota_1)) =
+                    (find_partition(flash, "otadata"), find_partition(flash, "ota_0"), find_partition(flash, "ota_1"))
+                else {
+                    return Err(Error::Unsupported);
+                };
+                let slot = 1 - ota::running_slot(flash, otadata).map_err(|_| Error::Flash)?;
+                (slot, if slot == 0 { ota_0 } else { ota_1 })
+            }
+            Kind::Character => (0, find_partition(flash, "voices").ok_or(Error::Unsupported)?),
         };
-        let slot = 1 - ota::running_slot(flash, otadata).map_err(|_| Error::Flash)?;
-        let target = if slot == 0 { ota_0 } else { ota_1 };
-        if size == 0 || size > target.size {
+        // A pack is at least a header and something after it.
+        let smallest = if kind == Kind::Character { voice_pack::HEADER_BYTES as u32 + 1 } else { 1 };
+        if size < smallest {
+            return Err(Error::BadImage);
+        }
+        if size > target.size {
             return Err(Error::TooBig);
         }
-        self.image = Some(Image { size, sha256, slot, target, next: 0, erased_until: target.offset });
+        self.image = Some(Image { kind, size, sha256, slot, target, header: Vec::new(), header_bytes: 0, next: 0, erased_until: target.offset });
         Ok(None)
     }
 
@@ -168,31 +208,56 @@ impl Transfer {
         if data.is_empty() || data.len() > CHUNK_BYTES || crc32(0, data) != crc {
             return Err(if data.len() > CHUNK_BYTES { Error::TooBig } else { Error::Crc });
         }
-        if offset == 0 && !is_esp32s3_image(data) {
-            return Err(Error::BadImage);
-        }
         let end = offset + data.len() as u32;
         if end > image.size {
             return Err(Error::TooBig);
         }
-        let at = image.target.offset + offset;
-        // Flash writes go in whole words; the last chunk is padded with what erased flash holds anyway.
-        let mut padded = [0xFFu8; CHUNK_BYTES];
-        padded[..data.len()].copy_from_slice(data);
-        flash.write(at, &padded[..data.len().next_multiple_of(4)]).map_err(|_| Error::Flash)?;
+        if offset == 0 {
+            match image.kind {
+                Kind::Firmware if !is_esp32s3_image(data) => return Err(Error::BadImage),
+                Kind::Firmware => {}
+                Kind::Character => {
+                    image.header_bytes = match data.get(..4) {
+                        Some(magic) if magic == character_pack::MAGIC => character_pack::HEADER_BYTES,
+                        Some(b"VBVP") => voice_pack::HEADER_BYTES,
+                        _ => return Err(Error::BadImage),
+                    };
+                    if image.size as usize <= image.header_bytes {
+                        return Err(Error::BadImage);
+                    }
+                }
+            }
+        }
+        // A pack's header stays in memory until the end; the rest goes to flash where it belongs.
+        let mut rest = data;
+        let mut at = offset;
+        if (at as usize) < image.header_bytes {
+            let take = (image.header_bytes - at as usize).min(rest.len());
+            image.header.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            at += take as u32;
+        }
+        if !rest.is_empty() {
+            // Flash writes go in whole words; the last chunk is padded with what erased flash holds anyway.
+            let mut padded = [0xFFu8; CHUNK_BYTES];
+            padded[..rest.len()].copy_from_slice(rest);
+            flash.write(image.target.offset + at, &padded[..rest.len().next_multiple_of(4)]).map_err(|_| Error::Flash)?;
+        }
         image.next = end;
         Ok(end)
     }
 
-    /// The last chunk is in: checks the slot holds the image, then makes it boot next. The caller restarts.
-    pub fn end(&mut self, flash: &mut dyn Flash) -> Result<(), Error> {
+    /// The last chunk is in: checks what was written, then commits it. Firmware is made to boot next, and the caller
+    /// restarts; a pack gets its header, and the caller loads it.
+    pub fn end(&mut self, flash: &mut dyn Flash) -> Result<Kind, Error> {
         let image = self.image.take().ok_or(Error::Sequence)?;
         if image.next != image.size {
             return Err(Error::Sequence);
         }
         let mut hasher = Sha256::new();
+        hasher.update(&image.header);
         let mut block = [0u8; SECTOR_BYTES as usize];
-        let mut done = 0;
+        let mut done = image.header_bytes as u32;
         while done < image.size {
             let length = (image.size - done).min(SECTOR_BYTES) as usize;
             flash.read(image.target.offset + done, &mut block[..length.next_multiple_of(4)]).map_err(|_| Error::Flash)?;
@@ -202,8 +267,14 @@ impl Transfer {
         if <[u8; 32]>::from(hasher.finalize()) != image.sha256 {
             return Err(Error::Sha256);
         }
-        let otadata = find_partition(flash, "otadata").ok_or(Error::Unsupported)?;
-        ota::select(flash, otadata, image.slot).map_err(|_| Error::Flash)
+        match image.kind {
+            Kind::Firmware => {
+                let otadata = find_partition(flash, "otadata").ok_or(Error::Unsupported)?;
+                ota::select(flash, otadata, image.slot).map_err(|_| Error::Flash)?;
+            }
+            Kind::Character => flash.write(image.target.offset, &image.header).map_err(|_| Error::Flash)?,
+        }
+        Ok(image.kind)
     }
 
     pub fn cancel(&mut self) {
@@ -256,7 +327,7 @@ mod tests {
 
     /// Begins and erases, as the main loop would; returns the offset to send from.
     fn start(transfer: &mut Transfer, flash: &mut MemoryFlash, image: &[u8], sha256: [u8; 32]) -> u32 {
-        if let Some(offset) = transfer.begin(flash, "firmware", image.len() as u32, sha256).unwrap() {
+        if let Some(offset) = transfer.begin(flash, Kind::Firmware, image.len() as u32, sha256).unwrap() {
             return offset;
         }
         loop {
@@ -282,15 +353,15 @@ mod tests {
         let image = test_image(10_000);
         let mut transfer = Transfer::new();
         flash.bytes[0x610000..0x620000].fill(0);
-        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(None), "erasing first");
+        assert_eq!(transfer.begin(&mut flash, Kind::Firmware, image.len() as u32, sha(&image)), Ok(None), "erasing first");
         let first = &image[..CHUNK_BYTES];
         assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Err(Error::Sequence), "no chunks before ready");
-        transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)).unwrap();
+        transfer.begin(&mut flash, Kind::Firmware, image.len() as u32, sha(&image)).unwrap();
         assert_eq!(start(&mut transfer, &mut flash, &image, sha(&image)), 0);
         assert!(flash.bytes[0x610000..0x620000].iter().all(|&byte| byte == 0xFF), "the block it needs is erased");
         assert_eq!(send(&mut transfer, &mut flash, &image, 0), 10_000);
         assert_eq!(transfer.percent(), Some(100));
-        transfer.end(&mut flash).unwrap();
+        assert_eq!(transfer.end(&mut flash), Ok(Kind::Firmware));
         assert_eq!(&flash.bytes[0x610000..0x610000 + image.len()], &image[..], "ota_1, since a USB flash runs ota_0");
         let otadata = find_partition(&mut flash, "otadata").unwrap();
         assert_eq!(ota::running_slot(&mut flash, otadata), Ok(1), "selected; the bootloader will run it");
@@ -306,13 +377,13 @@ mod tests {
         let first = &image[..CHUNK_BYTES];
         assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Ok(CHUNK_BYTES as u32));
         // The link dropped and came back, perhaps another way: the same image carries on, with no erasing.
-        assert_eq!(transfer.begin(&mut flash, "firmware", image.len() as u32, sha(&image)), Ok(Some(CHUNK_BYTES as u32)));
+        assert_eq!(transfer.begin(&mut flash, Kind::Firmware, image.len() as u32, sha(&image)), Ok(Some(CHUNK_BYTES as u32)));
         // A chunk sent twice, or one ahead of a lost one, gets the expected offset again.
         assert_eq!(transfer.chunk(&mut flash, 0, first, crc(first)), Ok(CHUNK_BYTES as u32));
         let later = &image[2 * CHUNK_BYTES..3 * CHUNK_BYTES];
         assert_eq!(transfer.chunk(&mut flash, 2 * CHUNK_BYTES as u32, later, crc(later)), Ok(CHUNK_BYTES as u32));
         send(&mut transfer, &mut flash, &image, CHUNK_BYTES as u32);
-        assert_eq!(transfer.end(&mut flash), Ok(()));
+        assert_eq!(transfer.end(&mut flash), Ok(Kind::Firmware));
 
         // Another image starts over.
         let other = test_image(5_000);
@@ -346,9 +417,9 @@ mod tests {
     fn what_the_box_cannot_take_is_refused_at_begin() {
         let mut flash = flash();
         let mut transfer = Transfer::new();
-        assert_eq!(transfer.begin(&mut flash, "character", 100, [0; 32]), Err(Error::Unsupported));
-        assert_eq!(transfer.begin(&mut flash, "firmware", 0x400001, [0; 32]), Err(Error::TooBig));
-        assert_eq!(transfer.begin(&mut MemoryFlash::new(0x10000), "firmware", 100, [0; 32]), Err(Error::Unsupported), "no OTA layout");
+        assert_eq!(transfer.begin(&mut flash, Kind::Character, 100, [0; 32]), Err(Error::Unsupported), "no voices partition here");
+        assert_eq!(transfer.begin(&mut flash, Kind::Firmware, 0x400001, [0; 32]), Err(Error::TooBig));
+        assert_eq!(transfer.begin(&mut MemoryFlash::new(0x10000), Kind::Firmware, 100, [0; 32]), Err(Error::Unsupported), "no OTA layout");
         assert_eq!(transfer.end(&mut flash), Err(Error::Sequence));
     }
 }
