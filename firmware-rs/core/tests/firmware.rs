@@ -1304,6 +1304,32 @@ mod relay {
         assert!(relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": first})).is_empty());
         assert!(!relay.has_peer());
     }
+
+    #[test]
+    fn a_box_that_missed_linked_takes_a_handshake_from_a_paired_computer() {
+        // The computer linked while the box was restarting, and the box never heard `linked`: the computer starts
+        // the handshake itself (daemon/src/relay.rs).
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{}","name":"b"}}"#, computer_key()));
+        board.advance(USB_QUIET_MS);
+        let mut relay = RelayBox::new();
+        relay.message(&mut firmware, &mut board, &json!({"t": "welcome"}));
+        let box_key = firmware.link().unwrap().public_key();
+        let (initiator, first) = Initiator::start([2; 32], &box_key, [6; 32], b"{}").unwrap();
+        let reply = relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": first}));
+        let (mut sealer, _) = initiator.finish(parse(&reply[0])["line"].as_str().unwrap().as_bytes()).unwrap();
+        assert!(relay.has_peer() && board.relay_peer);
+        assert_eq!(firmware.link_mark(board.now_ms()).0, Some(vibebuddy_firmware_core::display::LinkPath::Relay), "linked through the Relay now");
+        board.take_lines();
+        say(&mut relay, &mut firmware, &mut board, &mut sealer, r#"{"version":1,"event":"device.hello"}"#);
+        assert!(board.take_lines().contains(&"MODE DUTY".to_owned()));
+
+        // A second handshake while the session is up doesn't open as a line: the box starts over and says so.
+        let (_, again) = Initiator::start([2; 32], &box_key, [7; 32], b"{}").unwrap();
+        let answer = relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": again}));
+        assert_eq!(parse(parse(&answer[0])["line"].as_str().unwrap())["event"], "link.noise");
+        assert!(!relay.has_peer());
+    }
 }
 
 mod transfer {

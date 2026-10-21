@@ -119,11 +119,17 @@ impl RelayBox {
                             out.extend(self.opener_line(firmware));
                         }
                     }
-                } else if let (Some(computer), Some(link), Some(ephemeral)) = (self.computer, firmware.link(), board.random())
+                } else if let (Some(link), Some(ephemeral)) = (firmware.link(), board.random())
                     && let Ok(accepted) = noise::accept(link, ephemeral, line.as_bytes())
-                    // The session must be with the computer the Relay linked, not just any paired one.
-                    && accepted.computer == computer
+                    // With the computer the Relay linked. A box that missed `linked` (it was restarting when the
+                    // computer linked) takes a handshake from any paired computer: the Relay passes on data only from
+                    // the computer it linked, and a handshake only succeeds for a paired one.
+                    && self.computer.is_none_or(|computer| computer == accepted.computer)
                 {
+                    if self.computer.is_none() {
+                        self.computer = Some(accepted.computer);
+                        firmware.relay_linked(board.now_ms(), Some(accepted.computer));
+                    }
                     out.push(data(&accepted.reply));
                     self.opener = Some(accepted.opener);
                     board.relay_peer(Some(accepted.sealer));

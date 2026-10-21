@@ -151,7 +151,8 @@ pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
         SOCKET.store(NEXT_SOCKET.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         let result = session(stack, &tls, host, &box_id).await;
         SOCKET.store(0, Ordering::Relaxed);
-        let _ = IN.try_send(RelayIn::Gone);
+        // Waits for room rather than drop it: a main loop that never hears the socket went keeps its session.
+        IN.send(RelayIn::Gone).await;
         match result {
             Err(MOVED) => continue,
             Err(STOPPED) => return,
