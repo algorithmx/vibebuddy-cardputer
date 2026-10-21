@@ -1503,6 +1503,8 @@ mod transfer {
         send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, piece), base64(piece)));
         let panel = firmware.overlay().unwrap();
         assert_eq!((panel.kind, panel.lines[0].0.as_slice()), (PanelKind::Progress(25), &b"25%"[..]));
+        // The panel draws a hint's first 12 characters (seen cut on a box as "HOLD TO CANC").
+        assert!(panel.hints.iter().all(|(_, action)| action.len() <= 12));
 
         // Announcements wait for the restart; K0 and K1 and a short K2 do nothing; a long K2 cancels.
         let played = board.played.len();

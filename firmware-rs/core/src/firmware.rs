@@ -1283,7 +1283,8 @@ impl Firmware {
             title: title.to_vec(),
             lines: alloc::vec![(line, alloc::vec::Vec::new(), Tone::Plain)],
             selected: None,
-            hints: alloc::vec![(&b"K2"[..], &b"HOLD TO CANCEL"[..])],
+            // A hint shows at most 12 characters.
+            hints: alloc::vec![(&b"K2"[..], &b"HOLD: CANCEL"[..])],
         })
     }
 

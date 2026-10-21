@@ -141,7 +141,7 @@ A voice command has an overlay of its own, drawn like the menu's panel and, like
 
 ## Updates over the link
 
-While firmware or a Character pack comes in over the link (ADR-0016), a panel covers the screen, the menu and a voice command included: **UPDATING** or **NEW CHARACTER**, a progress bar and its percent, and `K2 HOLD TO CANCEL`. Only a long K2 counts then: it cancels the transfer. The other keys, a short K2 and touch do nothing until the transfer ends; one its computer has left for 5 minutes ends on its own ([`protocol.md`](protocol.md), "Firmware and Character packs over the link").
+While firmware or a Character pack comes in over the link (ADR-0016), a panel covers the screen, the menu and a voice command included: **UPDATING** or **NEW CHARACTER**, a progress bar and its percent, and `K2 HOLD: CANCEL`. Only a long K2 counts then: it cancels the transfer. The other keys, a short K2 and touch do nothing until the transfer ends; one its computer has left for 5 minutes ends on its own ([`protocol.md`](protocol.md), "Firmware and Character packs over the link").
 
 ## Constraints from the hardware
 
