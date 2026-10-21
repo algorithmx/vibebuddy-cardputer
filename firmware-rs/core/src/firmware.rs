@@ -254,8 +254,11 @@ pub struct Firmware {
     menu: Menu,
     /// voice.begin arrived and we are waiting for playback to stop before erasing the partition: total bytes and when the wait began.
     pending_voice_begin: Option<(u32, u32)>,
-    /// A firmware image coming in over the link (ADR-0016).
+    /// A firmware image or a Character pack coming in over the link (ADR-0016).
     transfer: Transfer,
+    /// A Character pack transfer set the current pack aside, since when (for the line playing to finish first);
+    /// the pack is loaded again whenever that transfer ends, however it ends.
+    pack_set_aside: Option<u32>,
     /// The last task end that was spoken: whether it was a failure, and when.
     last_end_spoken: Option<(bool, u32)>,
 
@@ -397,6 +400,7 @@ impl Firmware {
             menu: Menu::new(),
             pending_voice_begin: None,
             transfer: Transfer::new(),
+            pack_set_aside: None,
             last_end_spoken: None,
             reported_tier: Tier::Alert,
             reported_lights_out: false,
@@ -691,11 +695,17 @@ impl Firmware {
     }
 
     pub fn poll<B: Board>(&mut self, board: &mut B) {
-        // A firmware transfer erases its slot one block per pass, so the network and the screen keep running.
-        match self.transfer.erase_step(board.flash()) {
-            Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
-            Ok(None) => {}
-            Err(failure) => Self::transfer_error(board, failure),
+        // A transfer erases one block per pass, so the network and the screen keep running. A pack waits for the line
+        // playing to finish first: it is read from the partition being erased (see continue_voice_begin).
+        let draining = self.transfer.erasing() == Some(transfer::Kind::Character)
+            && self.pack_set_aside.is_some_and(|since| board.audio_busy() && (board.now_ms().wrapping_sub(since) as i32) < AUDIO_DRAIN_MS as i32);
+        if !draining {
+            match self.transfer.erase_step(board.flash()) {
+                Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+                Ok(None) => {}
+                Err(failure) => Self::transfer_error(board, failure),
+            }
+            self.after_transfer(board);
         }
         let now = board.now_ms();
         let outputs = self.lan.poll(now);
@@ -2054,31 +2064,43 @@ impl Firmware {
         board.write(line.as_bytes());
     }
 
-    /// `xfer.*`: a firmware image over any link, in chunks, resumable (ADR-0016, [`crate::transfer`]).
+    /// `xfer.*`: a firmware image or a Character pack over any link, in chunks, resumable (ADR-0016, [`crate::transfer`]).
     fn handle_transfer<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
         match event {
             "xfer.begin" => {
-                let kind = string(fields, "kind").unwrap_or("");
+                let kind = string(fields, "kind").and_then(transfer::Kind::parse);
                 let sha256 = string(fields, "sha256").and_then(decode_hex::<32>);
                 let (Some(size), Some(sha256)) = (number(fields, "size"), sha256) else {
                     return Self::transfer_error(board, transfer::Error::BadMessage);
                 };
+                let Some(kind) = kind else {
+                    return Self::transfer_error(board, transfer::Error::Unsupported);
+                };
                 match self.transfer.begin(board.flash(), kind, size as u32, sha256) {
                     Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
                     // Erasing first; poll answers once it is done.
-                    Ok(None) => {}
+                    Ok(None) => {
+                        if kind == transfer::Kind::Character && self.pack_set_aside.is_none() {
+                            board.stop_audio();
+                            self.voices.set_aside();
+                            self.pack_set_aside = Some(board.now_ms());
+                            self.load_look(board);
+                        }
+                    }
                     Err(failure) => Self::transfer_error(board, failure),
                 }
             }
             "xfer.chunk" => {
                 let (Some(offset), Some(crc), Some(data)) = (number(fields, "offset"), number(fields, "crc"), string(fields, "data")) else {
                     self.transfer.cancel();
-                    return Self::transfer_error(board, transfer::Error::BadMessage);
+                    Self::transfer_error(board, transfer::Error::BadMessage);
+                    return self.after_transfer(board);
                 };
                 let mut bytes = alloc::vec![0u8; transfer::CHUNK_BYTES + 3];
                 let Some(length) = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes) else {
                     self.transfer.cancel();
-                    return Self::transfer_error(board, transfer::Error::BadMessage);
+                    Self::transfer_error(board, transfer::Error::BadMessage);
+                    return self.after_transfer(board);
                 };
                 match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
                     Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
@@ -2086,10 +2108,19 @@ impl Firmware {
                 }
             }
             "xfer.end" => match self.transfer.end(board.flash()) {
-                Ok(()) => {
+                Ok(transfer::Kind::Firmware) => {
                     Self::transfer_reply(board, "xfer.done", None);
                     // The new image boots once and confirms itself, or the bootloader goes back (ADR-0013).
                     board.restart();
+                }
+                Ok(transfer::Kind::Character) => {
+                    self.after_transfer(board);
+                    let id = alloc::string::String::from(self.voices.current_id());
+                    let quoted = serde_json::to_string(&id).unwrap_or_default();
+                    Self::write_value_line(board, "", alloc::format!(r#"{{"version":1,"event":"xfer.done","voice":{quoted}}}"#).as_bytes());
+                    Self::write_value_line(board, "VOICES ", id.as_bytes());
+                    // As after voice.end: the new voice says it is in.
+                    self.announce(board, Occasion::Done);
                 }
                 Err(failure) => Self::transfer_error(board, failure),
             },
@@ -2099,6 +2130,18 @@ impl Firmware {
             }
             _ => Self::transfer_error(board, transfer::Error::BadMessage),
         }
+        self.after_transfer(board);
+    }
+
+    /// A pack transfer that set the current pack aside has ended, however: load what the partition holds now (the new
+    /// pack, or nothing after a failure partway, and then the built-in voice).
+    fn after_transfer<B: Board>(&mut self, board: &mut B) {
+        if self.pack_set_aside.is_none() || self.transfer.active() {
+            return;
+        }
+        self.pack_set_aside = None;
+        self.voices.reload(board.flash());
+        self.load_look(board);
     }
 
     /// Reports the device's whole static state: firmware build and version, its key, mode, voice and volume.
