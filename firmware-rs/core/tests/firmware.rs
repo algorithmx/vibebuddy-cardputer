@@ -1482,6 +1482,77 @@ mod transfer {
     }
 
     #[test]
+    fn the_screen_shows_the_update_and_only_a_long_k2_counts() {
+        use vibebuddy_firmware_core::display::PanelKind;
+        let mut board = FakeBoard::new(blank_flash());
+        board.touchscreen = true;
+        let mut firmware = Firmware::new(1, board.now_ms(), b"abc1234 2026-09-26 10:00", "1.2.3");
+        firmware.boot(&mut board);
+        board.take_lines();
+        let image = vec![0xA5u8; CHUNK_BYTES * 4];
+        let mut image = image;
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{}"}}"#, image.len(), hex_sha(&image));
+        send(&mut firmware, &mut board, &begin);
+        let panel = firmware.overlay().expect("a panel while erasing");
+        assert_eq!((panel.title.as_slice(), panel.kind), (&b"UPDATING"[..], PanelKind::Progress(0)));
+        assert_eq!(panel.lines[0].0, b"GETTING READY");
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let piece = &image[..CHUNK_BYTES];
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, piece), base64(piece)));
+        let panel = firmware.overlay().unwrap();
+        assert_eq!((panel.kind, panel.lines[0].0.as_slice()), (PanelKind::Progress(25), &b"25%"[..]));
+
+        // Announcements wait for the restart; K0 and K1 and a short K2 do nothing; a long K2 cancels.
+        let played = board.played.len();
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"task.done","title":"A"}"#).contains(&"AUDIO UPDATING DONE".to_owned()));
+        assert_eq!(board.played.len(), played, "silent");
+        for key in [Key::K0, Key::K1, Key::K2] {
+            assert!(!press(&mut firmware, &mut board, key, 100).iter().any(|line| line.contains("MODE") || line.contains("button")));
+        }
+        assert!(press(&mut firmware, &mut board, Key::K1, 1500).iter().all(|line| !line.contains("MENU OPEN")), "not even the menu");
+        // Nor does a tap.
+        board.finger = Some((5, 5));
+        for _ in 0..4 {
+            firmware.poll(&mut board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(&mut board);
+        assert!(firmware.overlay().is_some_and(|panel| panel.title == b"UPDATING"));
+        let lines = press(&mut firmware, &mut board, Key::K2, 1500);
+        assert!(lines.contains(&r#"{"version":1,"event":"xfer.error","code":"cancelled"}"#.to_owned()), "{lines:?}");
+        assert!(firmware.overlay().is_none(), "the screen comes back");
+        assert!(press(&mut firmware, &mut board, Key::K1, 100).iter().any(|line| line.starts_with("MODE")), "and the keys");
+    }
+
+    #[test]
+    fn a_pack_shows_as_a_new_character() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), hex_sha(SAMPLE_PACK));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        assert_eq!(firmware.overlay().unwrap().title, b"NEW CHARACTER");
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, SAMPLE_PACK), base64(SAMPLE_PACK)));
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#);
+        assert!(firmware.overlay().is_none());
+    }
+
+    #[test]
+    fn a_transfer_its_computer_left_is_given_up() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), hex_sha(SAMPLE_PACK));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        board.advance(4 * 60_000);
+        firmware.poll(&mut board);
+        assert!(firmware.overlay().is_some(), "four minutes is still a link coming back");
+        board.advance(60_000);
+        firmware.poll(&mut board);
+        assert!(board.take_lines().contains(&"XFER ABANDONED".to_owned()));
+        assert!(firmware.overlay().is_none());
+    }
+
+    #[test]
     fn a_bad_chunk_ends_the_transfer_with_its_reason() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));

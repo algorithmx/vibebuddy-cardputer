@@ -139,6 +139,10 @@ A voice command has an overlay of its own, drawn like the menu's panel and, like
 - **Events that need the user win**, as with the menu: input required, failed, or a Pomodoro phase ending closes the overlay, and a recording in progress is given up (`VOICE CANCEL`).
 - **Text only.** Spoken replies are text until there is speech synthesis, so mute changes nothing here. Chinese draws in a 12 px pixel font beside the 5×7 ASCII one, and text with Chinese in it uses small type throughout ([`firmware-bringup.md`](firmware-bringup.md), "Fonts").
 
+## Updates over the link
+
+While firmware or a Character pack comes in over the link (ADR-0016), a panel covers the screen, the menu and a voice command included: **UPDATING** or **NEW CHARACTER**, a progress bar and its percent, and `K2 HOLD TO CANCEL`. Only a long K2 counts then: it cancels the transfer. The other keys, a short K2 and touch do nothing until the transfer ends; one its computer has left for 5 minutes ends on its own ([`protocol.md`](protocol.md), "Firmware and Character packs over the link").
+
 ## Constraints from the hardware
 
 - **Backlight is on or off**: it is bit 7 of the XL9555 expander, not a PWM pin, so there is no brightness row.

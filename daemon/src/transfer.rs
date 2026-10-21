@@ -91,6 +91,10 @@ async fn answer_event(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Dur
             }
             DeviceMessage::Event(event) if event.event == "xfer.error" => {
                 let code = event.extra.get("code").and_then(|value| value.as_str()).unwrap_or("error");
+                // A long K2 on the box (ADR-0016).
+                if code == "cancelled" {
+                    return Err(Stop::Fail("cancelled on the box".to_owned()));
+                }
                 return Err(Stop::Fail(format!("the box refused the image: {code}")));
             }
             DeviceMessage::Event(event) if event.event.starts_with("xfer.") => return Ok(event),
