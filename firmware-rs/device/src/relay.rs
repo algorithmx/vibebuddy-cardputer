@@ -200,7 +200,9 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, host: &str, box_id: 
         _ => return Err("dns"),
     };
     // On the heap, which is PSRAM first.
-    let mut rx = alloc::vec![0u8; 4096];
+    // The receive window bounds a firmware update through the Relay to one window per round trip: 32 KB at
+    // 130-250 ms keeps up with the 40 chunks a second the daemon sends (ADR-0016). On the heap, which is PSRAM first.
+    let mut rx = alloc::vec![0u8; 32 * 1024];
     let mut tx = alloc::vec![0u8; 4096];
     let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
     socket.set_timeout(Some(DEAD_AFTER));
