@@ -8,6 +8,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::agent_icon::AgentIcon;
 use crate::canvas::{Canvas, FRAME_BYTES, HEIGHT, WIDTH, half_bright};
 use crate::font;
 use crate::leisure::{self, Skit};
@@ -16,7 +17,13 @@ use crate::pomodoro::{self, Phase, Run};
 use crate::text;
 use crate::text::{Text, truncated};
 
-pub const MAX_TASKS: usize = 3;
+/// Cards the box keeps: two pages of [`CARDS_PER_PAGE`] (#155).
+pub const MAX_TASKS: usize = 6;
+const CARDS_PER_PAGE: usize = 3;
+/// With more than one page, the box turns it by itself this often...
+const PAGE_TURN_MS: u32 = 8000;
+/// ...but not for this long after the user turned it.
+const PAGE_PAUSE_MS: u32 = 30_000;
 pub const MAX_STATS: usize = 3;
 
 const COLOR_BACKGROUND: u16 = 0x0841;
@@ -100,10 +107,16 @@ pub struct TaskInput<'a> {
     /// Owning project; drawn on the second line when the title is a session name, skipped when empty or
     /// the same as the title.
     pub project: Option<&'a [u8]>,
+    /// The daemon's id for the card's activity, which a tap on the card names (ADR-0019); None from an older daemon.
+    pub id: Option<&'a [u8]>,
+    /// The card's agent, drawn as its icon in place of the title's prefix; None for one without an icon.
+    pub icon: Option<AgentIcon>,
 }
 
 struct Task {
     title: Vec<u8>,
+    id: Vec<u8>,
+    icon: Option<AgentIcon>,
     project: Vec<u8>,
     state: State,
     elapsed_base: i32,
@@ -177,6 +190,59 @@ pub struct Panel {
     pub hints: Vec<(&'static [u8], &'static [u8])>,
 }
 
+/// Something on the screen a tap can land on (ADR-0019).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    /// A task card, by its place in the stack.
+    Card(usize),
+    /// The buddy on duty.
+    Buddy,
+    /// A row of a menu list.
+    Row(usize),
+    /// A key hint along the bottom of the menu, by its place among the panel's hints.
+    Hint(usize),
+    /// The dimmed screen around the menu panel.
+    OutsidePanel,
+    /// The line under the task cards that says which page is up: a tap turns it.
+    PageLine,
+}
+
+/// How long a tapped target stays outlined.
+const HIGHLIGHT_MS: u32 = 150;
+/// How long the buddy enjoys being petted.
+const PET_MS: u32 = 1200;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl Rect {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        (self.x..self.x + self.width).contains(&x) && (self.y..self.y + self.height).contains(&y)
+    }
+
+    fn outline(&self, canvas: &mut Canvas, color: u16) {
+        canvas.fill_rect(self.x, self.y, self.width, 2, color);
+        canvas.fill_rect(self.x, self.y + self.height - 2, self.width, 2, color);
+        canvas.fill_rect(self.x, self.y, 2, self.height, color);
+        canvas.fill_rect(self.x + self.width - 2, self.y, 2, self.height, color);
+    }
+}
+
+/// The task card in place `slot` of the page, drawn and tapped alike.
+fn card_rect(slot: usize) -> Rect {
+    Rect { x: 8, y: 50 + slot as i32 * 38, width: 186, height: 32 }
+}
+
+/// The buddy on duty, robot or look, with the tasks' shift to the right: a tap anywhere on it pets it.
+fn buddy_rect(x_offset: i32) -> Rect {
+    Rect { x: 104 + x_offset, y: 28, width: 112, height: 128 }
+}
+
 /// External state needed to draw a frame: the pomodoro and the leisure director belong to the main program.
 pub struct Scene<'a> {
     pub now_ms: u32,
@@ -214,6 +280,15 @@ pub struct Display {
     panel: Option<Panel>,
     /// The current Character's look; None draws the robot.
     look: Option<Box<Look>>,
+    /// A tapped target outlined until this time. It goes when the panel changes: what was tapped is gone.
+    highlight: Option<(Target, u32)>,
+    /// The buddy is being petted until this time.
+    petted_until: Option<u32>,
+    /// The task cards' page up now, when the box turns it next by itself, and how many activities there are in all,
+    /// sent or not.
+    page: usize,
+    page_turn_at: u32,
+    tasks_total: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -826,13 +901,18 @@ impl Display {
             ring_alarm_shake_frames: 0,
             panel: None,
             look: None,
+            highlight: None,
+            petted_until: None,
+            page: 0,
+            page_turn_at: 0,
+            tasks_total: 0,
         }
     }
 
     /// The screen hardware is initialized and the backlight is still off: draw the first frame, then turn on the backlight.
     pub fn start(&mut self, screen: &mut dyn Screen, scene: &Scene) -> Result<(), ()> {
         self.ready = true;
-        self.show_tasks(screen, scene, State::Idle, None, &[])?;
+        self.show_tasks(screen, scene, State::Idle, None, &[], 0)?;
         screen.set_backlight(true)?;
         self.backlight_on = true;
         Ok(())
@@ -883,22 +963,27 @@ impl Display {
     }
 
     fn draw_task_cards(&self, canvas: &mut Canvas, now_ms: u32) {
-        for (index, task) in self.tasks.iter().enumerate() {
-            let index = index as i32;
-            let x = 8 + index * 4;
-            let y = 50 + index * 38;
-            let width = 188 - index * 4;
-            let card_color = if index == 0 { 0x18c6 } else { 0x1083 };
+        for (slot, task) in self.tasks_on_page().iter().enumerate() {
+            let Rect { x, y, width, .. } = card_rect(slot);
+            let card_color = if self.page == 0 && slot == 0 { 0x18c6 } else { 0x1083 };
             let color = self.state_color(task.state);
             canvas.fill_rect(x, y, width, 32, COLOR_MUTED);
             canvas.fill_rect(x + 2, y + 2, width - 4, 28, card_color);
             canvas.fill_rect(x + 2, y + 2, 4, 28, color);
-            canvas.draw_str(x + 12, y + 5, &task.title, 1, COLOR_TEXT, 26 * 6 - 1);
-            canvas.draw_text(x + 12, y + 17, short_state_label(task.state), 1, color, 4);
+            // The agent's icon stands in for the title's prefix; the text moves right to make room.
+            let (text_x, title, project_chars) = match task.icon {
+                Some(icon) => {
+                    icon.draw(canvas, x + 10, y + 8);
+                    (x + 30, task.title.strip_prefix(icon.prefix()).unwrap_or(&task.title), 12)
+                }
+                None => (x + 12, &task.title[..], 16),
+            };
+            canvas.draw_str(text_x, y + 5, title, 1, COLOR_TEXT, (x + width - 8 - text_x).min(26 * 6 - 1));
+            canvas.draw_text(text_x, y + 17, short_state_label(task.state), 1, color, 4);
             // When the first line is a session name, the project name moves to the second line; if the title is the
             // project name, don't repeat it.
             if !task.project.is_empty() && !contains(&task.title, &task.project) {
-                canvas.draw_str(x + 42, y + 17, &task.project, 1, COLOR_MUTED, 16 * 6 - 1);
+                canvas.draw_str(text_x + 30, y + 17, &task.project, 1, COLOR_MUTED, project_chars * 6 - 1);
             }
             let elapsed = format_elapsed(self.task_elapsed_seconds(task, now_ms));
             let elapsed_width = elapsed.len() as i32 * 6 - 1;
@@ -1137,18 +1222,24 @@ impl Display {
         if !self.tasks.is_empty() {
             self.draw_task_cards(canvas, scene.now_ms);
         }
-        let state = if self.link_lost { State::Offline } else { self.state };
-        let x_offset = if self.tasks.is_empty() { 0 } else { 96 };
+        let petted = self.petted(scene.now_ms);
+        // Petted, it hops for joy the way it does when work is done.
+        let state = if self.link_lost { State::Offline } else if petted { State::Done } else { self.state };
+        let x_offset = self.buddy_offset();
         match &self.look {
             Some(look) => draw_look_on_duty(canvas, look, state, self.animation_frame, LOOK_CENTER_X + x_offset, status_color),
             None => draw_buddy(canvas, state, self.animation_frame, x_offset, status_color),
+        }
+        if petted {
+            draw_heart(canvas, buddy_rect(x_offset).x + 96, 34 + if self.animation_frame.is_multiple_of(2) { 0 } else { 4 });
         }
         // The third task card ends at y = 158: the label and the line under it move down, into the free space at the bottom, to keep clear of it.
         let crowded = self.tasks.len() >= 3;
         let label_y = if crowded { 178 } else { 162 };
         canvas.draw_text_centered(label_y, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
         if !self.tasks.is_empty() {
-            canvas.draw_text_centered(if crowded { 212 } else { 195 }, b"LATEST ON TOP", 1, COLOR_MUTED);
+            canvas.draw_text_centered(self.page_line_y(), self.page_line().as_bytes(), 1, COLOR_MUTED);
+            self.draw_page_bar(canvas);
         } else if self.state == State::Idle && !self.link_lost {
             // No rotation while the link is lost: a moving screen looks alive, the exact opposite of NO LINK.
             self.draw_idle_line(canvas, scene);
@@ -1207,6 +1298,11 @@ impl Display {
         if let Some(panel) = &self.panel {
             draw_panel(&mut canvas, panel);
         }
+        if let Some((target, _)) = self.highlight
+            && let Some(rect) = self.target_rect(target)
+        {
+            rect.outline(&mut canvas, COLOR_TEXT);
+        }
         screen.present()
     }
 
@@ -1216,6 +1312,7 @@ impl Display {
             // The countdown changes every second; blinking while paused needs a frame every half second; the alarm
             // shake is faster still.
             Mode::Pomodoro => if self.ring_alarm_shaking() { RING_ALARM_SHAKE_FRAME_MS } else { 500 },
+            Mode::Duty if self.petted_until.is_some() => 200,
             Mode::Duty => match self.state {
                 State::Working => 250,
                 State::Done => 200,
@@ -1233,6 +1330,7 @@ impl Display {
         state: State,
         title: Option<&[u8]>,
         tasks: &[TaskInput],
+        total: usize,
     ) -> Result<(), ()> {
         if !self.ready {
             return Err(());
@@ -1246,11 +1344,17 @@ impl Display {
             .map(|task| Task {
                 title: truncated(task.title.unwrap_or(b"CODEX"), TITLE_BYTES),
                 project: truncated(task.project.unwrap_or(b""), TITLE_BYTES),
+                id: task.id.unwrap_or_default().to_vec(),
+                icon: task.icon,
                 state: task.state,
                 elapsed_base: task.elapsed_s,
                 received_ms: scene.now_ms,
             })
             .collect();
+        self.tasks_total = total.max(self.tasks.len());
+        // News starts from the first page: the cards waiting for an answer are there.
+        self.page = 0;
+        self.page_turn_at = scene.now_ms.wrapping_add(PAGE_TURN_MS);
         self.next_animation_at = scene.now_ms.wrapping_add(self.animation_period());
         self.render(screen, scene)
     }
@@ -1265,6 +1369,8 @@ impl Display {
         }
         self.tasks
             .retain(|task| matches!(task.state, State::Working | State::InputRequired));
+        self.tasks_total = self.tasks.len();
+        self.page = 0;
         self.state = if self.tasks.iter().any(|task| task.state == State::InputRequired) {
             State::InputRequired
         } else if self.tasks.is_empty() {
@@ -1380,6 +1486,9 @@ impl Display {
         if self.panel == panel {
             return;
         }
+        if self.panel.as_ref().map(|panel| &panel.title) != panel.as_ref().map(|panel| &panel.title) {
+            self.highlight = None;
+        }
         self.panel = panel;
         if self.ready {
             let _ = self.render(screen, scene);
@@ -1432,6 +1541,34 @@ impl Display {
                 self.identify_next_toggle = now.wrapping_add(150);
             }
         }
+        let mut ended = false;
+        if let Some((_, until)) = self.highlight
+            && now.wrapping_sub(until) as i32 >= 0
+        {
+            self.highlight = None;
+            ended = true;
+        }
+        if let Some(until) = self.petted_until
+            && now.wrapping_sub(until) as i32 >= 0
+        {
+            self.petted_until = None;
+            ended = true;
+        }
+        // More than one page turns by itself, except while a card waits for an answer: the box stays on it then.
+        let waiting = self.tasks.iter().any(|task| task.state == State::InputRequired);
+        if self.mode == Mode::Duty
+            && self.panel.is_none()
+            && self.pages() > 1
+            && !waiting
+            && now.wrapping_sub(self.page_turn_at) as i32 >= 0
+        {
+            self.page = (self.page + 1) % self.pages();
+            self.page_turn_at = now.wrapping_add(PAGE_TURN_MS);
+            ended = true;
+        }
+        if ended {
+            let _ = self.render(screen, scene);
+        }
         if (now.wrapping_sub(self.next_animation_at) as i32) < 0 {
             return;
         }
@@ -1443,6 +1580,136 @@ impl Display {
         if self.render(screen, scene).is_err() {
             self.next_animation_at = now.wrapping_add(1000);
         }
+    }
+
+    /// How far right the buddy stands on duty: beside the cards when there are any.
+    fn buddy_offset(&self) -> i32 {
+        if self.tasks.is_empty() { 0 } else { 96 }
+    }
+
+    fn petted(&self, now_ms: u32) -> bool {
+        self.petted_until.is_some_and(|until| (now_ms.wrapping_sub(until) as i32) < 0)
+    }
+
+    /// The id of the activity behind the card at `index`; None when the daemon sent none.
+    fn pages(&self) -> usize {
+        self.tasks.len().div_ceil(CARDS_PER_PAGE).max(1)
+    }
+
+    fn tasks_on_page(&self) -> &[Task] {
+        let start = (self.page * CARDS_PER_PAGE).min(self.tasks.len());
+        &self.tasks[start..(start + CARDS_PER_PAGE).min(self.tasks.len())]
+    }
+
+    /// Under the cards: which page is up and how many activities aren't sent at all, or the old hint when it all
+    /// fits on one page.
+    fn page_line(&self) -> Text<24> {
+        let unsent = self.tasks_total.saturating_sub(self.tasks.len());
+        match (self.pages(), unsent) {
+            (1, 0) => text!(24, "LATEST ON TOP"),
+            // The font has no `/` or `+`.
+            (1, unsent) => text!(24, "{} MORE", unsent % 100),
+            (pages, 0) => text!(24, "PAGE {} OF {}", self.page + 1, pages),
+            (pages, unsent) => text!(24, "PAGE {} OF {}   {} MORE", self.page + 1, pages, unsent % 100),
+        }
+    }
+
+    /// The page line and a finger's width around it.
+    fn page_line_rect(&self) -> Rect {
+        Rect { x: 40, y: self.page_line_y() - 8, width: 240, height: 23 }
+    }
+
+    fn page_line_y(&self) -> i32 {
+        if self.tasks.len() >= 3 { 212 } else { 195 }
+    }
+
+    /// A thin bar beside the cards, one segment a page, the one up lit: there is more than what shows.
+    fn draw_page_bar(&self, canvas: &mut Canvas) {
+        let pages = self.pages() as i32;
+        if pages < 2 {
+            return;
+        }
+        let top = card_rect(0).y;
+        let height = card_rect(CARDS_PER_PAGE - 1).y + 32 - top;
+        let segment = (height - (pages - 1) * 3) / pages;
+        for page in 0..pages {
+            let color = if page == self.page as i32 { COLOR_TEXT } else { COLOR_MUTED };
+            canvas.fill_rect(198, top + page * (segment + 3), 3, segment, color);
+        }
+    }
+
+    /// Turns the cards' page forward or back, as a swipe or a tap on the page line asks; the box then leaves the
+    /// pages alone for a while. Returns the page now up and the number of pages, or None with only one.
+    pub fn turn_page(&mut self, screen: &mut dyn Screen, scene: &Scene, forward: bool) -> Option<(usize, usize)> {
+        let pages = self.pages();
+        if self.mode != Mode::Duty || self.panel.is_some() || pages < 2 {
+            return None;
+        }
+        self.page = if forward { (self.page + 1) % pages } else { (self.page + pages - 1) % pages };
+        self.page_turn_at = scene.now_ms.wrapping_add(PAGE_PAUSE_MS);
+        self.refresh(screen, scene);
+        Some((self.page, pages))
+    }
+
+    pub fn card_id(&self, index: usize) -> Option<&[u8]> {
+        self.tasks.get(index).map(|task| task.id.as_slice()).filter(|id| !id.is_empty())
+    }
+
+    /// Where a target is drawn now, if it's on the screen at all.
+    fn target_rect(&self, target: Target) -> Option<Rect> {
+        match (target, &self.panel) {
+            (Target::Row(index), Some(panel)) if panel.kind == PanelKind::List && index < panel.lines.len() => Some(panel_row_rect(index)),
+            (Target::Hint(index), Some(panel)) => hint_rects(panel).get(index).copied(),
+            (Target::Card(index), None) if self.mode == Mode::Duty && index < self.tasks.len() => {
+                index.checked_sub(self.page * CARDS_PER_PAGE).filter(|&slot| slot < CARDS_PER_PAGE).map(card_rect)
+            }
+            (Target::PageLine, None) if self.mode == Mode::Duty && self.pages() > 1 => Some(self.page_line_rect()),
+            (Target::Buddy, None) if self.mode == Mode::Duty => Some(buddy_rect(self.buddy_offset())),
+            _ => None,
+        }
+    }
+
+    /// What a tap at (x, y) lands on: the menu panel's rows and key hints while it's open, otherwise the task
+    /// cards and the buddy on duty. The rectangles are the ones the screen is drawn with, so the targets move
+    /// with the layout. The Pomodoro and Leisure screens have nothing to tap.
+    pub fn target_at(&self, x: i32, y: i32) -> Option<Target> {
+        if let Some(panel) = &self.panel {
+            // On the box, fingers went for the dimmed edge to close the menu.
+            if !PANEL_FRAME.contains(x, y) {
+                return Some(Target::OutsidePanel);
+            }
+            if let Some(index) = hint_rects(panel).iter().position(|rect| rect.contains(x, y)) {
+                return Some(Target::Hint(index));
+            }
+            if panel.kind == PanelKind::List {
+                let rows = panel.lines.len();
+                return (0..rows).find(|&index| panel_row_hit_rect(index, rows).contains(x, y)).map(Target::Row);
+            }
+            return None;
+        }
+        if self.mode != Mode::Duty {
+            return None;
+        }
+        if let Some(slot) = (0..self.tasks_on_page().len()).find(|&slot| card_rect(slot).contains(x, y)) {
+            return Some(Target::Card(self.page * CARDS_PER_PAGE + slot));
+        }
+        if self.pages() > 1 && self.page_line_rect().contains(x, y) {
+            return Some(Target::PageLine);
+        }
+        buddy_rect(self.buddy_offset()).contains(x, y).then_some(Target::Buddy)
+    }
+
+    /// Outlines a tapped target for a moment, so the user sees the tap landed.
+    pub fn highlight(&mut self, screen: &mut dyn Screen, scene: &Scene, target: Target) {
+        self.highlight = Some((target, scene.now_ms.wrapping_add(HIGHLIGHT_MS)));
+        self.refresh(screen, scene);
+    }
+
+    /// The buddy was petted: it hops with a heart for a moment. Decoration only.
+    pub fn pet(&mut self, screen: &mut dyn Screen, scene: &Scene) {
+        self.petted_until = Some(scene.now_ms.wrapping_add(PET_MS));
+        self.next_animation_at = scene.now_ms.wrapping_add(self.animation_period());
+        self.refresh(screen, scene);
     }
 
     pub fn backlight_on(&self) -> bool {
@@ -1468,6 +1735,8 @@ impl Display {
 const PANEL_BORDER: u16 = COLOR_PET;
 const PANEL_SELECTED: u16 = 0x2148;
 const PANEL_LEFT: i32 = 44;
+/// The menu panel's border, everything it covers.
+const PANEL_FRAME: Rect = Rect { x: 30, y: 14, width: 260, height: 212 };
 const PANEL_RIGHT: i32 = 276;
 
 fn text_width(text: &[u8], scale: i32) -> i32 {
@@ -1483,12 +1752,64 @@ fn tone_color(tone: Tone) -> u16 {
     }
 }
 
+/// A row of a menu list, as drawn with the selection bar.
+fn panel_row_rect(index: usize) -> Rect {
+    Rect { x: 38, y: 51 + index as i32 * 23, width: 244, height: 21 }
+}
+
+/// Where a tap picks a row: the whole pitch, gaps included, and the last row down to the line above the hints. A
+/// finger on the box landed up to 15 px under the row it aimed at.
+fn panel_row_hit_rect(index: usize, rows: usize) -> Rect {
+    let row = panel_row_rect(index);
+    let bottom = if index + 1 == rows { 196 } else { row.y + 23 };
+    Rect { x: row.x, y: row.y - 1, width: row.width, height: bottom - row.y + 1 }
+}
+
+/// Where a Facts panel's lines go: closer together when there are more than five, to stay above the hints.
+fn facts_line_y(panel: &Panel, index: usize) -> i32 {
+    let step = if panel.lines.len() > 5 { 23 } else { 26 };
+    58 + index as i32 * step
+}
+
+/// Each key hint along the bottom: the key's chip and what it does, and the space down to the panel's edge, so a
+/// finger needn't hit the small text. The last hint takes the rest of the bar: on the box, fingers went for the
+/// empty right half to close the menu.
+fn hint_rects(panel: &Panel) -> Vec<Rect> {
+    let mut x = PANEL_LEFT;
+    let mut rects: Vec<Rect> = panel
+        .hints
+        .iter()
+        .map(|(key, action)| {
+            let width = text_width(key, 1) + 10 + text_width(action, 1) + 14;
+            let rect = Rect { x: x - 4, y: 199, width, height: 25 };
+            x += width;
+            rect
+        })
+        .collect();
+    if let Some(last) = rects.last_mut() {
+        last.width = 288 - last.x;
+    }
+    rects
+}
+
+/// A small heart over the petted buddy, 16 pixels wide.
+fn draw_heart(canvas: &mut Canvas, x: i32, y: i32) {
+    const ROWS: [u8; 6] = [0b0110_0110, 0b1111_1111, 0b1111_1111, 0b0111_1110, 0b0011_1100, 0b0001_1000];
+    for (row, bits) in ROWS.iter().enumerate() {
+        for column in 0..8 {
+            if bits & (0x80 >> column) != 0 {
+                canvas.fill_rect(x + column * 2, y + row as i32 * 2, 2, 2, COLOR_FAILED);
+            }
+        }
+    }
+}
+
 /// The menu panel: the screen underneath dimmed twice, a bordered box, the title, the lines, and
 /// key hints along the bottom.
 fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
     canvas.dim();
     canvas.dim();
-    canvas.fill_rect(30, 14, 260, 212, PANEL_BORDER);
+    canvas.fill_rect(PANEL_FRAME.x, PANEL_FRAME.y, PANEL_FRAME.width, PANEL_FRAME.height, PANEL_BORDER);
     canvas.fill_rect(32, 16, 256, 208, COLOR_SCREEN);
     canvas.draw_text(PANEL_LEFT, 26, &panel.title, 2, COLOR_PET_HIGHLIGHT, 19);
     canvas.fill_rect(PANEL_LEFT, 46, PANEL_RIGHT - PANEL_LEFT, 1, COLOR_MUTED);
@@ -1498,7 +1819,8 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
             PanelKind::List => {
                 let y = 54 + index * 23;
                 if panel.selected == Some(index as usize) {
-                    canvas.fill_rect(38, y - 3, 244, 21, PANEL_SELECTED);
+                    let bar = panel_row_rect(index as usize);
+                    canvas.fill_rect(bar.x, bar.y, bar.width, bar.height, PANEL_SELECTED);
                     canvas.draw_text(42, y, b">", 2, COLOR_PET_HIGHLIGHT, 1);
                 }
                 canvas.draw_text(58, y, label, 2, COLOR_TEXT, 12);
@@ -1506,7 +1828,7 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
                 canvas.draw_text(PANEL_RIGHT - text_width(value, 2), y, value, 2, tone_color(*tone), 8);
             }
             PanelKind::Facts => {
-                let y = 58 + index * 26;
+                let y = facts_line_y(panel, index as usize);
                 let mut label = label.splitn(2, |&byte| byte == b'\n');
                 canvas.draw_text(PANEL_LEFT, y, label.next().unwrap_or_default(), 1, COLOR_MUTED, 12);
                 if let Some(note) = label.next() {

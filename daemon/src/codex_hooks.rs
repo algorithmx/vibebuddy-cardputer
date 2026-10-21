@@ -86,7 +86,7 @@ pub fn apply(
             None,
         ),
     };
-    let event = match hook.hook_event_name.as_str() {
+    let mut event = match hook.hook_event_name.as_str() {
         "UserPromptSubmit" => {
             tracker.clear_session(&hook.session_id);
             tracker.observe(&id, &title, ActivityStatus::Working)
@@ -105,6 +105,9 @@ pub fn apply(
         _ => None,
     };
     tracker.associate_source(&id, source);
+    if let Some(event) = event.as_mut() {
+        tracker.refresh_cards(event);
+    }
     event
 }
 
@@ -403,23 +406,21 @@ mod tests {
     }
 
     #[test]
-    fn task_cards_are_newest_first_and_limited_to_three() {
+    fn task_cards_put_waiting_ones_first_then_the_newest_up_to_six() {
         let mut tracker = ActivityTracker::default();
-        apply(&mut tracker, &mut SessionTitles::disabled(), hook("one", "UserPromptSubmit", "/work/one"));
-        apply(&mut tracker, &mut SessionTitles::disabled(), hook("two", "UserPromptSubmit", "/work/two"));
-        apply(
-            &mut tracker,
-            &mut SessionTitles::disabled(),
-            hook("three", "UserPromptSubmit", "/work/three"),
-        );
-        let latest = apply(&mut tracker, &mut SessionTitles::disabled(), hook("four", "UserPromptSubmit", "/work/four"))
-            .expect("new task should refresh the card stack");
+        for name in ["one", "two", "three", "four", "five", "six", "seven"] {
+            apply(&mut tracker, &mut SessionTitles::disabled(), hook(name, "UserPromptSubmit", &format!("/work/{name}")));
+        }
+        let latest = apply(&mut tracker, &mut SessionTitles::disabled(), hook("two", "PermissionRequest", "/work/two"))
+            .expect("a question should refresh the card stack");
 
         let tasks = latest.extra["tasks"].as_array().expect("tasks should be an array");
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0]["title"], "CX:FOUR");
-        assert_eq!(tasks[1]["title"], "CX:THREE");
-        assert_eq!(tasks[2]["title"], "CX:TWO");
+        let titles: Vec<&str> = tasks.iter().map(|task| task["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, ["CX:TWO", "CX:SEVEN", "CX:SIX", "CX:FIVE", "CX:FOUR", "CX:THREE"]);
+        assert_eq!(latest.extra["tasks_total"], 7, "the box says one more than it shows");
+        assert!(tasks.iter().all(|task| task["agent"] == "codex"), "every card knows its agent from its first event");
+        let line = latest.to_ndjson().expect("the event should encode");
+        assert!(line.len() < 1024, "six cards fit the box's line: {} bytes", line.len());
     }
 
     #[test]

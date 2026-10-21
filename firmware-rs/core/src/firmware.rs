@@ -14,7 +14,7 @@ use vibebuddy_protocol::{Event, ProtocolError, VERSION};
 use crate::audio::{ES8311_ADDRESS, Occasion, SAMPLE_RATE, Sound, clamp_volume, VOLUME_DEFAULT};
 use crate::mic;
 use crate::buttons::{ButtonEvent, Buttons, Levels};
-use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, SNAPSHOT_LINE_BYTES, Scene, Screen, Snapshot, State, TaskInput, Tone};
+use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, SNAPSHOT_LINE_BYTES, Scene, Screen, Snapshot, State, Target, TaskInput, Tone};
 use crate::leisure::{Leisure, Tier};
 use crate::menu::{self, Action as MenuAction, ComputersRow, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
@@ -22,6 +22,8 @@ use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
 use crate::spoken_reply::ReplyAudio;
+use crate::agent_icon::AgentIcon;
+use crate::touch::{self, Direction, Gesture, Gestures};
 use crate::voice_pack::{crc32, decode_base64};
 use crate::lines::LinePicker;
 use crate::lan::{Conn, Lan, Output as LanOutput};
@@ -83,6 +85,15 @@ pub trait Board: Screen {
 
     /// K0's level and the levels of K1 and K2 on the expander (true means pressed); None if the expander read fails.
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>);
+
+    /// Looks for a touchscreen and returns its chip's name; None on a box without one (ADR-0019).
+    fn init_touch(&mut self) -> Option<&'static str> {
+        None
+    }
+    /// The touch controller's report ([`touch::parse_report`]); None if the read fails.
+    fn read_touch(&mut self) -> Option<[u8; touch::REPORT_BYTES]> {
+        None
+    }
 
     /// Queues a sound to play after whatever is already queued. Returns Err when the queue is full.
     fn play(&mut self, sound: Sound) -> Result<(), ()>;
@@ -196,6 +207,8 @@ pub struct Firmware {
     voices: Voices,
     picker: LinePicker,
     buttons: Option<Buttons>,
+    /// The touchscreen's chip, taps so far and when to read it next; None on a box without one.
+    touch: Option<(&'static str, Gestures, u32)>,
     settings: Option<SettingsStore>,
     /// The box's key and paired computers, and where they are kept; None without a link partition.
     link: Option<(LinkStore, Link)>,
@@ -355,6 +368,7 @@ impl Firmware {
             voices: Voices::new(),
             picker: LinePicker::new(seed ^ 0x9E37_79B9),
             buttons: None,
+            touch: None,
             settings: None,
             link: None,
             // Good enough for tests and the simulator; the device passes hardware entropy.
@@ -476,6 +490,8 @@ impl Firmware {
             }
             None => Self::write_literal(board, "BUTTONS ERROR\n"),
         }
+        self.touch = board.init_touch().map(|chip| (chip, Gestures::new(), board.now_ms()));
+        self.announce_touch(board);
 
         self.last_message_ms = board.now_ms();
         board.write(b"READY vibebuddy-fw ");
@@ -707,6 +723,7 @@ impl Firmware {
             self.show_overlay(board);
         }
         self.tick_buttons(board);
+        self.tick_touch(board);
         let transition = self.pomodoro.tick(board.now_ms());
         self.handle_pomodoro_transition(board, transition);
         self.tend_leisure(board);
@@ -913,6 +930,92 @@ impl Firmware {
         let events = buttons.update(k0, expander, board.now_ms());
         for event in events.into_iter().flatten() {
             self.on_button(board, event);
+        }
+    }
+
+    fn tick_touch<B: Board>(&mut self, board: &mut B) {
+        let now = board.now_ms();
+        let Some((_, gestures, next_read)) = self.touch.as_mut() else {
+            return;
+        };
+        if (now.wrapping_sub(*next_read) as i32) < 0 {
+            return;
+        }
+        *next_read = now.wrapping_add(touch::POLL_MS);
+        let sample = board.read_touch().and_then(|report| touch::parse_report(&report));
+        match gestures.update(sample, now) {
+            Some(Gesture::Tap(point)) => self.on_tap(board, point),
+            Some(Gesture::Swipe(direction)) => self.on_swipe(board, direction),
+            None => {}
+        }
+    }
+
+    /// A swipe up or down turns the task cards' page (#155). Like a tap, it counts as a key press for Leisure and
+    /// Boredom, and in Leisure only calls the buddy back.
+    fn on_swipe<B: Board>(&mut self, board: &mut B, direction: Direction) {
+        let now = board.now_ms();
+        Self::write_literal(board, if direction == Direction::Up { "SWIPE UP\n" } else { "SWIPE DOWN\n" });
+        self.leisure.note_activity(now);
+        if self.display.mode() == Mode::Leisure {
+            self.leisure.tick(now);
+            self.set_mode(board, Mode::Duty);
+            return;
+        }
+        self.turn_page(board, direction == Direction::Up);
+    }
+
+    fn turn_page<B: Board>(&mut self, board: &mut B, forward: bool) {
+        let now = board.now_ms();
+        if let Some((page, pages)) = self.display.turn_page(board, &scene!(self, now), forward) {
+            let line = text!(24, "CARDS PAGE {}/{}\n", page + 1, pages);
+            board.write(line.as_bytes());
+        }
+    }
+
+    /// A tap (ADR-0019). It counts as a key press for Leisure and Boredom, so in Leisure it only calls the buddy
+    /// back, waking a screen dimmed for the night. Otherwise it acts on what it landed on: a menu row is selected
+    /// and acted on, a key hint is that key, the dimmed screen around the menu closes it, the buddy is petted.
+    /// Anything that changes state can also be done with the keys.
+    fn on_tap<B: Board>(&mut self, board: &mut B, point: touch::Point) {
+        let now = board.now_ms();
+        let line = text!(24, "TAP {} {}\n", point.x, point.y);
+        board.write(line.as_bytes());
+        self.leisure.note_activity(now);
+        if self.display.mode() == Mode::Leisure {
+            self.leisure.tick(now);
+            self.set_mode(board, Mode::Duty);
+            return;
+        }
+        let Some(target) = self.display.target_at(point.x, point.y) else {
+            return;
+        };
+        self.display.highlight(board, &scene!(self, now), target);
+        match target {
+            Target::Row(index) => {
+                let action = self.menu.tap_row(index, self.menu_context(now), now);
+                self.on_menu_action(board, action);
+            }
+            Target::Hint(index) => {
+                let key = self.menu.view().and_then(|view| self.menu_panel(view, now).hints.get(index).map(|hint| hint.0));
+                let event = match key {
+                    Some(b"K0") => ButtonEvent::K0Short,
+                    Some(b"K1") => ButtonEvent::K1Short,
+                    Some(b"K2") => ButtonEvent::K2Short,
+                    _ => return,
+                };
+                self.on_button(board, event);
+            }
+            // Tapping away from the menu closes it, as K2 does.
+            Target::OutsidePanel => self.on_button(board, ButtonEvent::K2Short),
+            Target::Buddy => self.display.pet(board, &scene!(self, now)),
+            Target::PageLine => self.turn_page(board, true),
+            // The daemon opens that card's agent, as K2 opens the most pressing one.
+            Target::Card(index) => {
+                if let Some(id) = self.display.card_id(index) {
+                    let line = text!(80, "{{\"version\":1,\"event\":\"focus\",\"task\":\"{}\"}}\n", core::str::from_utf8(id).unwrap_or_default());
+                    board.write(line.as_bytes());
+                }
+            }
         }
     }
 
@@ -1418,6 +1521,7 @@ impl Firmware {
                         self.link_line(now),
                         line(b"VOICE", voice.as_bytes(), Tone::Plain),
                         line(b"TODAY", today.as_bytes(), Tone::Plain),
+                        line(b"TOUCH", self.touch_chip().as_bytes(), Tone::Plain),
                     ],
                     selected: None,
                     hints: alloc::vec![(b"K0", b"BACK"), (b"K2", b"CLOSE")],
@@ -1534,6 +1638,9 @@ impl Firmware {
                 state: task_state(status),
                 elapsed_s: number(item, "elapsed_s").map(|value| value as i32).unwrap_or(0),
                 project: string(item, "project").map(str::as_bytes),
+                // Only a short id of letters and digits goes back out in a JSON line as is.
+                id: string(item, "id").filter(|id| id.len() <= 16 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())).map(str::as_bytes),
+                icon: string(item, "agent").and_then(AgentIcon::for_agent),
             });
         }
 
@@ -1573,7 +1680,7 @@ impl Firmware {
                 self.close_overlays(board);
             }
         }
-        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks);
+        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks, number(fields, "tasks_total").map_or(0, |total| total as usize));
         if shown.is_err() {
             Self::write_literal(board, "DISPLAY ERROR\n");
         } else {
@@ -2003,6 +2110,15 @@ impl Firmware {
         Self::write_value_line(board, "MODE ", self.display.mode().name().as_bytes());
         Self::write_value_line(board, "VOICES ", self.voices.current_id().as_bytes());
         self.announce_volume(board);
+        self.announce_touch(board);
+    }
+
+    fn touch_chip(&self) -> &'static str {
+        self.touch.as_ref().map_or("NONE", |(chip, _, _)| chip)
+    }
+
+    fn announce_touch<B: Board>(&self, board: &mut B) {
+        Self::write_value_line(board, "TOUCH ", self.touch_chip().as_bytes());
     }
 
     /// Voice pack write acknowledgements are all JSON lines: the Mac does stop-and-wait flow control by sequence number, which diagnostic lines can't support.

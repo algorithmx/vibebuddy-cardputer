@@ -13,6 +13,7 @@ extern crate std;
 pub mod text;
 
 pub mod adpcm;
+pub mod agent_icon;
 pub mod audio;
 pub mod buttons;
 pub mod canvas;
@@ -34,6 +35,7 @@ pub mod pomodoro;
 pub mod relay_box;
 pub mod spoken_reply;
 pub mod storage;
+pub mod touch;
 pub mod transfer;
 pub mod voice_command;
 pub mod voice_pack;

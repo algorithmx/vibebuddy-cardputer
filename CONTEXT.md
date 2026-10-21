@@ -132,6 +132,20 @@ _Avoid_: session
 The box's own settings on its screen, opened by holding K1: volume, mute, giving up a Pomodoro phase, and a status view. It's stepped through with short presses and closes itself; it is an overlay, not a mode, and the mode underneath keeps running. It holds only what the box owns; everything else stays in the App.
 _Avoid_: settings (that's the App's window), menu on its own (that's the App's menu bar menu)
 
+### Touch
+
+**Touchscreen (触摸屏)**:
+A capacitive touch layer over the box's screen. Only some boxes have one: boxes of the same board differ in their screen module, and a buyer can't tell which they'll get. The firmware looks for it at boot and does without it when it isn't there, so touch only ever adds a faster way to something the keys already do, or a reaction that is pure decoration.
+_Avoid_: touch panel, touch box (it's the same box), touch mode (it isn't a Mode)
+
+**Tap (点按)**:
+The one touch gesture: a finger down and up again quickly, in about the same place. A tap acts on what is under it (a task card, a menu row, a key hint, the buddy) and counts as a key press for Leisure and Boredom.
+_Avoid_: click, touch on its own (that's the hardware), press (that's a key)
+
+**Pet (摸摸)**:
+A tap on the buddy. The buddy reacts on screen and nothing else changes; there is no key for it because there is nothing to do.
+_Avoid_: poke, stroke
+
 **Leisure (休闲)**:
 The mode the buddy wanders off into on its own after being idle long enough in On duty. It is driven by boredom, not switched by the user; any Agent activity, a button press or a dropped link sends it straight back to On duty.
 _Avoid_: entertainment mode, screensaver, idle mode (idle is a state within On duty)
@@ -166,6 +180,7 @@ Fixed wording for the App's English UI and English logs. Use these words when wr
 | 当日战绩 | today's stats | Written in the menu as Today: done · asks · busy |
 | 需要确认 | needs input | The voice line is Hey, I need you for a sec.; counted as asks in the stats |
 | 任务卡 | task card | |
+| 触摸屏 / 点按 / 摸摸 | touchscreen / tap / pet | Only some boxes have a touchscreen; on the box's STATUS view the row is TOUCH |
 | 固件 / 刷入 | firmware / flash | |
 | 配对 / 已配对的电脑 | pair / paired computers | On the box's menu the row is COMPUTERS; "this computer" marks the one the App runs on |
 | UART 桥 / 原生 USB | UART bridge / native USB | |
@@ -191,7 +206,7 @@ A piece of work VibeBuddy is currently tracking, together with its current state
 _Avoid_: task, Job, Task (Task refers specifically to the on-device presentation, see below)
 
 **Task card (任务卡)**:
-How an Activity is presented on the device screen. At most 3 are shown at once, with the most recently active on top. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
+How an Activity is presented on the device screen. Up to 6 are sent, three to a page; those waiting for input come first, then the most recently active. Each shows its agent's icon, or the title's prefix for an agent without one. With two pages the box turns the page itself, and a touchscreen can swipe it. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
 _Avoid_: card, entry, Task item
 
 ### State and notifications

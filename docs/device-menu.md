@@ -52,7 +52,7 @@ Volume steps are coarse on purpose: six presses cover the range, and the app's s
 
 ![The status view](images/menu-status.png)
 
-What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), how it is linked to its computer (LINK, as in the network view), the voice pack and today's focus tally. Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the computer?" gets answered without opening the app.
+What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), how it is linked to its computer (LINK, as in the network view), the voice pack, today's focus tally and whether the box has a touchscreen (TOUCH: the chip's name, or NONE). Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the computer?" gets answered without opening the app.
 
 ### Computers
 
@@ -85,6 +85,33 @@ How the box reaches its computer, as rows a glance can read; anything dimmed isn
 Every screen shows how the box is linked as a small icon in its top left: a plug for USB, Wi-Fi waves for the local network, a cloud for the Relay. While that link goes through the staging Relay, `STG` follows the cloud in orange, so a development build is never mistaken for a release; over USB or the local network the Relay isn't in the way, so no `STG` shows (the NETWORK view still names the Relay). No icon shows without a link: the screen already says NO LINK. MUTE, when on, comes after them.
 
 ![USB, local network and Relay icons](images/link-icons.png)
+
+## Touch
+
+Some boxes have a touchscreen (ADR-0019). The firmware looks for one at boot and, on a box without, nothing here changes. On a box with one, a tap (down and up quickly, in about the same place) does what the keys do:
+
+- **A row** is selected and acted on at once, as K1 to the row and then K0 would. VOLUME steps, MUTE toggles, COMPUTERS opens; FORGET ALL and NEW ID still ask first.
+- **A key hint** along the bottom is that key: tap CLOSE to close, BACK to go back.
+- **The dimmed screen around the panel** closes the menu, as K2 does.
+- **A task card** on duty takes you to that card's agent: the box sends the card's id in a `focus` event and the daemon opens it, the way K2 opens the most pressing one ([`protocol.md`](protocol.md)).
+- **A swipe** up or down the screen, or a tap on the page line under the cards, turns the cards' page (below).
+- **The buddy** on duty, outside the menu, is petted: it hops with a heart for a moment, and nothing else changes.
+
+The tapped row, hint, card or buddy is outlined for a moment, so a tap that landed is seen to. A tap in Leisure only calls the buddy back, like any key, and wakes a screen dimmed for the night. The menu still opens on K1 held, and the Pomodoro screen has nothing to tap: a box on a desk gets brushed, and the timer stays on K0. Every tap prints `TAP <x> <y>` as a diagnostic line, and a swipe `SWIPE UP` or `SWIPE DOWN`.
+
+### Task card pages
+
+The daemon sends up to six cards, three a page, those waiting for input first (#155). Each card shows its agent's icon, the agent's own mark reduced to 16 × 16 pixels (`tools/make-agent-icons.py`), in place of the `CC:`-style prefix; CI has an icon of our own. With two pages:
+
+- the line under the cards says which page is up (`PAGE 1 OF 2`), and how many activities weren't sent at all (`2 MORE`);
+- a thin bar beside the cards shows which page is up;
+- every box turns the page by itself every 8 s, except while a card waits for input, when it stays on the first page;
+- on a touchscreen, a swipe or a tap on the page line turns it, and the box then leaves the pages alone for 30 s;
+- any new task event goes back to the first page.
+
+![The first page](images/cards-page-1.png) ![The second page, after a swipe up](images/cards-page-2.png)
+
+![A tapped row](images/touch-row.png) ![The buddy petted](images/touch-pet.png)
 
 ## Behavior around the menu
 

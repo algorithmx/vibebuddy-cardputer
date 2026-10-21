@@ -12,6 +12,7 @@ use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameActio
 use vibebuddy_firmware_core::noise::Sealer;
 use vibebuddy_firmware_core::spoken_reply::{ReplyAudio, ReplyPlayer};
 use vibebuddy_firmware_core::storage::{Flash, FlashError};
+use vibebuddy_firmware_core::touch;
 use vibebuddy_firmware_core::voice_pack;
 
 struct MemoryFlash {
@@ -103,6 +104,9 @@ struct FakeBoard {
     /// What the spoken reply player was handed, and whether it says a reply is sounding.
     reply_audio: Vec<ReplyAudio>,
     speaking: bool,
+    /// The box has a touchscreen, and where a finger is on it.
+    touchscreen: bool,
+    finger: Option<(i32, i32)>,
 }
 
 impl FakeBoard {
@@ -137,6 +141,8 @@ impl FakeBoard {
             stream: Vec::new(),
             reply_audio: Vec::new(),
             speaking: false,
+            touchscreen: false,
+            finger: None,
         }
     }
 
@@ -215,6 +221,22 @@ impl Board for FakeBoard {
     }
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>) {
         (self.k0, Some((self.k1, self.k2)))
+    }
+    fn init_touch(&mut self) -> Option<&'static str> {
+        self.touchscreen.then_some("CHSC5432")
+    }
+    /// The report the chip would send, the inverse of `touch::parse_report`.
+    fn read_touch(&mut self) -> Option<[u8; touch::REPORT_BYTES]> {
+        let mut report = [0; touch::REPORT_BYTES];
+        if let Some((x, y)) = self.finger {
+            let short = (239 - y) as u16;
+            let long = x as u16;
+            report[1] = 1;
+            report[2] = short as u8;
+            report[3] = long as u8;
+            report[5] = ((long >> 8) as u8) << 4 | (short >> 8) as u8;
+        }
+        Some(report)
     }
     fn play(&mut self, sound: Sound) -> Result<(), ()> {
         self.played.push(sound);
@@ -309,6 +331,7 @@ fn boot_reports_like_the_c_firmware() {
             "AUDIO CODEC ES8311",
             "VOLUME 65",
             "BUTTONS READY",
+            "TOUCH NONE",
             "READY vibebuddy-fw 1.2.3",
         ]
     );
@@ -554,7 +577,7 @@ fn echo_reports_length_and_crc() {
 fn hello_repeats_the_static_state() {
     let (mut firmware, mut board, _) = booted(blank_flash());
     let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
-    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", "TRANSFER 1", "LINK NOISE", BOX_KEY, RELAY_URL, "MODE DUTY", "VOICES builtin", "VOLUME 65"]);
+    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", "TRANSFER 1", "LINK NOISE", BOX_KEY, RELAY_URL, "MODE DUTY", "VOICES builtin", "VOLUME 65", "TOUCH NONE"]);
 }
 
 #[test]
@@ -1860,4 +1883,262 @@ fn the_text_stays_up_while_a_reply_is_spoken_and_k2_stops_it() {
     board.reply_audio.clear();
     assert!(press(&mut firmware, &mut board, Key::K2, 50).is_empty());
     assert_eq!(board.reply_audio, [ReplyAudio::Stop]);
+}
+
+mod touchscreen {
+    use super::*;
+
+    fn touch_box() -> (Firmware, FakeBoard, Vec<String>) {
+        let mut board = FakeBoard::new(blank_flash());
+        board.touchscreen = true;
+        let mut firmware = Firmware::new(7, board.now_ms(), b"abc1234 2026-09-26 10:00", "1.2.3");
+        firmware.boot(&mut board);
+        let lines = board.take_lines();
+        (firmware, board, lines)
+    }
+
+    /// A finger down at (x, y) for about 80 ms, polling along the way; returns what was printed.
+    fn tap(firmware: &mut Firmware, board: &mut FakeBoard, x: i32, y: i32) -> Vec<String> {
+        board.advance(100);
+        board.finger = Some((x, y));
+        for _ in 0..4 {
+            firmware.poll(board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(board);
+        board.take_lines()
+    }
+
+    fn pixel(board: &FakeBoard, x: usize, y: usize) -> u16 {
+        let at = (y * 320 + x) * 2;
+        u16::from_be_bytes([board.frame[at], board.frame[at + 1]])
+    }
+
+    /// The middle of the menu list's row `index`.
+    fn row(index: i32) -> (i32, i32) {
+        (160, 61 + index * 23)
+    }
+
+    #[test]
+    fn a_touchscreen_is_reported_at_boot_and_on_hello() {
+        let (mut firmware, mut board, lines) = touch_box();
+        assert!(lines.contains(&"TOUCH CHSC5432".to_owned()), "{lines:?}");
+        let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+        assert_eq!(lines.last().map(String::as_str), Some("TOUCH CHSC5432"));
+    }
+
+    #[test]
+    fn a_box_without_one_never_reads_it() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        board.finger = Some((160, 100));
+        assert!(tap(&mut firmware, &mut board, 160, 100).is_empty());
+    }
+
+    #[test]
+    fn a_tapped_menu_row_is_selected_and_acted_on() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        // VOLUME, MUTE, COMPUTERS, NETWORK, STATUS.
+        let (x, y) = row(1);
+        assert_eq!(tap(&mut firmware, &mut board, x, y), [format!("TAP {x} {y}"), "MUTE ON".to_owned()]);
+        let (x, y) = row(0);
+        assert_eq!(tap(&mut firmware, &mut board, x, y), [format!("TAP {x} {y}"), "VOLUME 80".to_owned(), "AUDIO MUTED DONE".to_owned()]);
+        // The keys still work alongside, from the row the finger left selected.
+        assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["VOLUME 100", "AUDIO MUTED DONE"]);
+    }
+
+    /// The panel's inside, which covers whatever the screen underneath is doing.
+    fn panel(board: &FakeBoard) -> Vec<u16> {
+        (20..196).flat_map(|y| (34..286).map(move |x| (x, y))).map(|(x, y)| pixel(board, x, y)).collect()
+    }
+
+    #[test]
+    fn under_the_last_row_is_still_the_last_row() {
+        let (mut firmware, mut board, _) = touch_box();
+        // STATUS by the keys: VOLUME, MUTE, COMPUTERS, NETWORK, STATUS.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        for _ in 0..4 {
+            press(&mut firmware, &mut board, Key::K1, 50);
+        }
+        press(&mut firmware, &mut board, Key::K0, 50);
+        let status = panel(&board);
+        press(&mut firmware, &mut board, Key::K2, 50);
+
+        // On the box a finger aimed at STATUS landed 15 px under it, between the row and the hints.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        tap(&mut firmware, &mut board, 160, 185);
+        assert!(panel(&board) == status, "the tap opened STATUS");
+    }
+
+    #[test]
+    fn a_tapped_key_hint_is_that_key() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        // K1 NEXT, K0 CHANGE, K2 CLOSE along the bottom.
+        assert_eq!(tap(&mut firmware, &mut board, 60, 210), ["TAP 60 210"]);
+        assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["MUTE ON"], "K1's hint moved to MUTE");
+        assert_eq!(tap(&mut firmware, &mut board, 190, 210), ["TAP 190 210", "MENU CLOSED"]);
+        // On the STATUS view the hints are BACK and CLOSE, and the empty bar to the right is CLOSE too.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        tap(&mut firmware, &mut board, 160, 185);
+        assert_eq!(tap(&mut firmware, &mut board, 260, 210), ["TAP 260 210", "MENU CLOSED"]);
+        // Away from the panel, on the dimmed edge, is K2 too.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 305, 130), ["TAP 305 130", "MENU CLOSED"]);
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 5, 130), ["TAP 5 130", "MENU CLOSED"]);
+        // Closed, the same place is just the screen.
+        assert_eq!(tap(&mut firmware, &mut board, 190, 210), ["TAP 190 210"]);
+    }
+
+    #[test]
+    fn petting_the_buddy_changes_nothing_but_the_screen() {
+        let (mut firmware, mut board, _) = touch_box();
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
+        assert_eq!(tap(&mut firmware, &mut board, 160, 100), ["TAP 160 100"]);
+        assert_eq!(pixel(&board, 202, 34), 0xF800, "a heart over the buddy");
+        board.advance(1500);
+        firmware.poll(&mut board);
+        assert_ne!(pixel(&board, 202, 34), 0xF800, "and it goes");
+        // Off the buddy there's nothing to tap.
+        tap(&mut firmware, &mut board, 20, 200);
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
+    }
+
+    #[test]
+    fn a_tapped_card_asks_for_its_agent() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(
+            &mut firmware,
+            &mut board,
+            r#"{"version":1,"event":"task.start","title":"B","tasks":[{"title":"B","status":"working","elapsed_s":5,"id":"9f2c01ab"},{"title":"A","status":"input_required","elapsed_s":60,"id":"0d4e77c3"}]}"#,
+        );
+        // The second card sits 38 px under the first.
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104", r#"{"version":1,"event":"focus","task":"0d4e77c3"}"#]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66", r#"{"version":1,"event":"focus","task":"9f2c01ab"}"#]);
+        // Under the cards there's nothing; in Pomodoro there are no cards.
+        assert_eq!(tap(&mut firmware, &mut board, 100, 130), ["TAP 100 130"]);
+        press(&mut firmware, &mut board, Key::K1, 50);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66"]);
+    }
+
+    #[test]
+    fn a_card_from_an_older_daemon_or_with_an_odd_id_names_nothing() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(
+            &mut firmware,
+            &mut board,
+            r#"{"version":1,"event":"task.start","title":"B","tasks":[{"title":"B","status":"working","elapsed_s":5},{"title":"A","status":"working","elapsed_s":6,"id":"a\"b"}]}"#,
+        );
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66"]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104"]);
+    }
+
+    #[test]
+    fn a_slide_is_not_a_tap() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        board.advance(100);
+        board.finger = Some((160, 61));
+        firmware.poll(&mut board);
+        board.advance(40);
+        board.finger = Some((160, 130));
+        firmware.poll(&mut board);
+        board.advance(40);
+        board.finger = None;
+        firmware.poll(&mut board);
+        assert_eq!(board.take_lines(), ["SWIPE DOWN"], "a swipe, and in the menu it turns nothing");
+    }
+
+    /// A finger from (x, y) to (x, to_y) in 120 ms.
+    fn swipe(firmware: &mut Firmware, board: &mut FakeBoard, x: i32, y: i32, to_y: i32) -> Vec<String> {
+        board.advance(100);
+        for step in 0..=6 {
+            board.finger = Some((x, y + (to_y - y) * step / 6));
+            firmware.poll(board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(board);
+        board.take_lines()
+    }
+
+    /// Five working cards, ids c1 to c5, the first from Claude Code, and seven activities in all.
+    const FIVE_CARDS: &str = r#"{"version":1,"event":"task.start","title":"CC:ONE","tasks_total":7,"tasks":[
+        {"id":"c1","agent":"claude-code","title":"CC:ONE","status":"working","elapsed_s":1},
+        {"id":"c2","agent":"codex","title":"CX:TWO","status":"working","elapsed_s":2},
+        {"id":"c3","agent":"github-actions","title":"CI:THREE","status":"working","elapsed_s":3},
+        {"id":"c4","agent":"opencode","title":"OC:FOUR","status":"working","elapsed_s":4},
+        {"id":"c5","agent":"unknown","title":"XX:FIVE","status":"working","elapsed_s":5}]}"#;
+
+    fn focus(id: &str) -> String {
+        format!(r#"{{"version":1,"event":"focus","task":"{id}"}}"#)
+    }
+
+    #[test]
+    fn a_swipe_turns_the_cards_page_and_taps_follow_it() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(pixel(&board, 22, 58), 0xDBAA, "Claude's spark in its orange, in place of CC:");
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 150, 60), ["SWIPE UP", "CARDS PAGE 2/2"]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c4"));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104", &focus("c5")]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 142), ["TAP 100 142"], "page 2 has two cards");
+
+        // The page line under the cards turns it too, and down goes back.
+        assert_eq!(tap(&mut firmware, &mut board, 160, 212), ["TAP 160 212", "CARDS PAGE 1/2"]);
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 60, 150), ["SWIPE DOWN", "CARDS PAGE 2/2"]);
+        // News starts from the first page.
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+    }
+
+    #[test]
+    fn the_pages_turn_by_themselves_unless_a_card_waits_or_a_finger_just_turned_them() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        let top = |board: &FakeBoard| pixel(board, 22, 58);
+        assert_eq!(top(&board), 0xDBAA);
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF, "page 2 opens with OpenCode's white frame");
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA, "and wraps round");
+
+        // A finger's turn holds the page for 30 s.
+        swipe(&mut firmware, &mut board, 100, 150, 60);
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF);
+        board.advance(11_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
+
+        // A card waiting for an answer keeps the first page up.
+        let waiting = FIVE_CARDS.replace('\n', "").replacen(r#""status":"working""#, r#""status":"input_required""#, 1);
+        send(&mut firmware, &mut board, &waiting.replace("task.start", "agent.input_required"));
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
+    }
+
+    #[test]
+    fn a_tap_calls_the_buddy_back_from_leisure_and_does_nothing_else() {
+        let (mut firmware, mut board, _) = touch_box();
+        let mut lines = Vec::new();
+        for _ in 0..(10 * 60 / 5) {
+            board.advance(5_000);
+            lines.extend(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.heartbeat"}"#));
+            firmware.poll(&mut board);
+            lines.extend(board.take_lines());
+        }
+        assert!(lines.contains(&"MODE LEISURE".to_owned()), "{lines:?}");
+        // Where the buddy stands on duty: in Leisure it's no pet, only a way back.
+        assert_eq!(tap(&mut firmware, &mut board, 160, 100), ["TAP 160 100", "MODE DUTY", "LEISURE ALERT"]);
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
+    }
 }

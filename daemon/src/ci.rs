@@ -133,7 +133,7 @@ impl CiWatcher {
     ) -> Option<Event> {
         if run.status != "completed" {
             state.running.insert(run.database_id);
-            let event = tracker.observe(id, title, ActivityStatus::Working);
+            let mut event = tracker.observe(id, title, ActivityStatus::Working);
             tracker.associate_source(
                 id,
                 ActivitySource::GitHubActions {
@@ -141,6 +141,9 @@ impl CiWatcher {
                     run_id: run.database_id,
                 },
             );
+            if let Some(event) = event.as_mut() {
+                tracker.refresh_cards(event);
+            }
             return event;
         }
 
@@ -403,7 +406,9 @@ mod tests {
             &mut tracker,
             vec![run(11, "in_progress", ""), run(10, "completed", "failure")],
         );
-        assert_eq!(names(&events), ["task.error"]);
+        // Run 11 moves to the top first. Both cards read CI:VIBE-BUDDY, but their ids swap places, and a box
+        // with a touchscreen needs them in their new order (ADR-0019).
+        assert_eq!(names(&events), ["task.start", "task.error"]);
 
         let events = poll(
             &mut watcher,

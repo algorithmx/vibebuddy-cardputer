@@ -14,7 +14,8 @@ use crate::occasions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-const MAX_VISIBLE_TASKS: usize = 3;
+/// Two pages of three on the box; six cards keep the line well under the box's 1024 bytes (#155).
+const MAX_VISIBLE_TASKS: usize = 6;
 /// Display limit for task-card titles, including the prefix that tells agents apart.
 const MAX_TITLE_CHARS: usize = 26;
 /// A working activity with no events for a long time usually means the agent process is gone.
@@ -370,6 +371,18 @@ impl ActivityTracker {
         }
     }
 
+    /// An activity's source is attached after the event that created it, so that event's cards don't know their
+    /// agents yet: attach them again, and keep the dedup baseline as it is sent, or the next unchanged event would
+    /// look new.
+    pub fn refresh_cards(&mut self, event: &mut Event) {
+        if event.extra.contains_key("tasks") {
+            self.attach_tasks(event);
+            if self.last_visible.is_some() {
+                self.last_visible = Some(event.clone());
+            }
+        }
+    }
+
     /// Remember the activity whose end was just announced, so K2 can still return to it shortly afterwards.
     fn remember_announced(&mut self, activity: Activity) {
         if let Some(source) = activity.source {
@@ -697,8 +710,8 @@ impl ActivityTracker {
     /// Attach the current card stack to the event. End announcements carry it too: while hearing "done",
     /// the user should see what's still running.
     fn attach_tasks(&self, visible: &mut Event) {
-        let mut activities: Vec<(&String, &Activity)> = self.activities.iter().collect();
-        activities.sort_by_key(|(_, activity)| std::cmp::Reverse(activity.sequence));
+        let activities = self.card_order();
+        visible.extra.insert("tasks_total".to_owned(), json!(activities.len()));
         visible.extra.insert(
             "tasks".to_owned(),
             json!(
@@ -707,6 +720,8 @@ impl ActivityTracker {
                     .take(MAX_VISIBLE_TASKS)
                     .map(|(key, activity)| {
                         let mut task = json!({
+                            "id": card_id(key),
+                            "agent": agent_of(activity.source.as_ref()),
                             "title": activity.title,
                             "status": match activity.status {
                                 ActivityStatus::Working => "working",
@@ -721,6 +736,14 @@ impl ActivityTracker {
                     .collect::<Vec<_>>()
             ),
         );
+    }
+
+    /// The cards' order: those waiting for an answer first, since they need the user, then the most recently active.
+    /// The card stack, its timers and its ids all follow it.
+    fn card_order(&self) -> Vec<(&String, &Activity)> {
+        let mut activities: Vec<(&String, &Activity)> = self.activities.iter().collect();
+        activities.sort_by_key(|(_, activity)| (activity.status != ActivityStatus::InputRequired, std::cmp::Reverse(activity.sequence)));
+        activities
     }
 
     /// An end announcement must say who ended.
@@ -776,6 +799,12 @@ impl ActivityTracker {
         })
     }
 
+    /// Where a tapped card leads (ADR-0019): the source of the activity whose `card_id` the box named. None when
+    /// that activity has ended since, or has no source to open.
+    pub fn card_source(&self, card: &str) -> Option<ActivitySource> {
+        self.activities.iter().find(|(key, _)| card_id(key) == card).and_then(|(_, activity)| activity.source.clone())
+    }
+
     /// Stamp the fields that only mean something at send time: card timers and today's stats.
     ///
     /// They can't go into `activity_snapshot`, because that snapshot takes part in dedup. Both fields
@@ -788,8 +817,7 @@ impl ActivityTracker {
             .insert("stats".to_owned(), json!(self.stats_lines()));
 
         let now = Instant::now();
-        let mut activities: Vec<&Activity> = self.activities.values().collect();
-        activities.sort_by_key(|activity| std::cmp::Reverse(activity.sequence));
+        let activities = self.card_order().into_iter().map(|(_, activity)| activity);
         let Some(tasks) = event
             .extra
             .get_mut("tasks")
@@ -1004,6 +1032,13 @@ fn format_duration(seconds: u64) -> String {
     } else {
         format!("{}H{:02}", minutes / 60, minutes % 60)
     }
+}
+
+/// A task card's id: short, so the box can send it back on a tap, and the same for an activity as long as it lasts.
+/// FNV-1a of the activity's key; a clash between the few cards on screen is unlikely, and would only open the other one.
+fn card_id(key: &str) -> String {
+    let hash = key.bytes().fold(0x811c_9dc5_u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193));
+    format!("{hash:08x}")
 }
 
 fn event(name: &str, session_id: &str, title: &str) -> Event {
@@ -1249,6 +1284,31 @@ mod tests {
         assert_eq!(ended.len(), RECENTLY_ENDED);
         assert_eq!(ended[0].title, format!("TASK {}", RECENTLY_ENDED + 4));
         assert_eq!(ended[RECENTLY_ENDED - 1].title, "TASK 5");
+    }
+
+    #[test]
+    fn a_tapped_card_leads_to_its_own_activity() {
+        let mut tracker = ActivityTracker::default();
+        let older = id("older", "older:1");
+        tracker.observe(&older, "CC:OLDER", ActivityStatus::Working);
+        let codex = ActivitySource::Codex {
+            thread_id: "older".to_owned(),
+            surface: Surface::default(),
+        };
+        tracker.associate_source(&older, codex.clone());
+        let newer = id("newer", "newer:1");
+        tracker.require_input(&newer, "CX:NEWER");
+
+        let snapshot = tracker.activity_snapshot().expect("there should be a visible activity");
+        let tasks = snapshot.extra["tasks"].as_array().expect("cards");
+        let older_card = tasks[1]["id"].as_str().expect("every card has an id");
+        assert_eq!(tasks[1]["title"], "CC:OLDER");
+        assert_eq!(older_card, card_id("older:1"));
+        assert_eq!(older_card.len(), 8);
+        // Not K2's choice, which would be the one waiting for input: the card that was tapped.
+        assert_eq!(tracker.card_source(older_card), Some(codex));
+        assert_eq!(tracker.card_source(tasks[0]["id"].as_str().unwrap()), None, "no source to open");
+        assert_eq!(tracker.card_source("00000000"), None, "gone, or never there");
     }
 
     #[test]
