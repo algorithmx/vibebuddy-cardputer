@@ -44,6 +44,9 @@ const LINK_TIMEOUT_MS: u32 = 15000;
 const DONE_TO_IDLE_MS: u32 = 5000;
 /// voice.begin waits at most this long for the line being played to finish; the longest line is under 7 seconds.
 const AUDIO_DRAIN_MS: u32 = 10000;
+/// A transfer whose computer has said nothing about it this long is given up, so the keys and the screen come back:
+/// the daemon waits 3 minutes for a dropped link before it gives up itself (ADR-0016).
+const TRANSFER_ABANDONED_MS: u32 = 5 * 60_000;
 /// Task ends this close together speak once: a burst of three dones read out back to back is noise, and the
 /// screen already shows every card. Longer than the longest line, so the window also covers its playback.
 const MERGE_WINDOW_MS: u32 = 15000;
@@ -259,6 +262,8 @@ pub struct Firmware {
     /// A Character pack transfer set the current pack aside, since when (for the line playing to finish first);
     /// the pack is loaded again whenever that transfer ends, however it ends.
     pack_set_aside: Option<u32>,
+    /// When the computer last said anything about the transfer: one gone for [`TRANSFER_ABANDONED_MS`] is given up.
+    transfer_heard: u32,
     /// The last task end that was spoken: whether it was a failure, and when.
     last_end_spoken: Option<(bool, u32)>,
 
@@ -401,6 +406,7 @@ impl Firmware {
             pending_voice_begin: None,
             transfer: Transfer::new(),
             pack_set_aside: None,
+            transfer_heard: 0,
             last_end_spoken: None,
             reported_tier: Tier::Alert,
             reported_lights_out: false,
@@ -699,13 +705,20 @@ impl Firmware {
         // playing to finish first: it is read from the partition being erased (see continue_voice_begin).
         let draining = self.transfer.erasing() == Some(transfer::Kind::Character)
             && self.pack_set_aside.is_some_and(|since| board.audio_busy() && (board.now_ms().wrapping_sub(since) as i32) < AUDIO_DRAIN_MS as i32);
-        if !draining {
+        if !draining && self.transfer.erasing().is_some() {
             match self.transfer.erase_step(board.flash()) {
                 Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
                 Ok(None) => {}
                 Err(failure) => Self::transfer_error(board, failure),
             }
             self.after_transfer(board);
+            self.show_overlay(board);
+        }
+        if self.transfer.active() && board.now_ms().wrapping_sub(self.transfer_heard) >= TRANSFER_ABANDONED_MS {
+            self.transfer.cancel();
+            Self::write_literal(board, "XFER ABANDONED\n");
+            self.after_transfer(board);
+            self.show_overlay(board);
         }
         let now = board.now_ms();
         let outputs = self.lan.poll(now);
@@ -874,6 +887,11 @@ impl Firmware {
             Self::write_value_line(board, "AUDIO MUTED ", label.as_bytes());
             return;
         }
+        // A firmware update is silent: the box restarts at its end, and the news comes again after (ADR-0016).
+        if self.transfer.kind() == Some(transfer::Kind::Firmware) {
+            Self::write_value_line(board, "AUDIO UPDATING ", label.as_bytes());
+            return;
+        }
         // While a write is about to start, the partition is no longer trusted.
         let pick = if self.pending_voice_begin.is_some() { None } else { self.voices.pick(occasion, &mut self.picker) };
         let (first, then) = match pick {
@@ -990,6 +1008,10 @@ impl Firmware {
         let now = board.now_ms();
         let line = text!(24, "TAP {} {}\n", point.x, point.y);
         board.write(line.as_bytes());
+        // A transfer's panel covers everything, and only a long K2 cancels it.
+        if self.transfer.active() {
+            return;
+        }
         self.leisure.note_activity(now);
         if self.display.mode() == Mode::Leisure {
             self.leisure.tick(now);
@@ -1035,6 +1057,17 @@ impl Firmware {
     /// its own job: leisure hides nothing that needs a look first.
     fn on_button<B: Board>(&mut self, board: &mut B, event: ButtonEvent) {
         let now = board.now_ms();
+        // While a transfer comes in only a long K2 counts: it cancels (ADR-0016).
+        if self.transfer.active() {
+            if event == ButtonEvent::K2Long {
+                self.transfer.cancel();
+                Self::transfer_error(board, transfer::Error::Cancelled);
+                Self::write_literal(board, "XFER CANCELLED\n");
+                self.after_transfer(board);
+                self.show_overlay(board);
+            }
+            return;
+        }
         // Letting go of K0 after a long press only ends a recording.
         if event == ButtonEvent::K0LongEnd {
             if self.voice.listening() {
@@ -1226,9 +1259,41 @@ impl Firmware {
         }
     }
 
+    /// The panel over the screen now: the menu, a voice command or a transfer.
+    pub fn overlay(&self) -> Option<&Panel> {
+        self.display.panel()
+    }
+
+    /// A transfer coming in covers everything else: how far along it is, and how to cancel it (ADR-0016).
+    fn transfer_panel(&self) -> Option<Panel> {
+        let kind = self.transfer.kind()?;
+        let title: &[u8] = match kind {
+            transfer::Kind::Firmware => b"UPDATING",
+            transfer::Kind::Character => b"NEW CHARACTER",
+        };
+        let (percent, line) = match self.transfer.erasing() {
+            Some(_) => (0, alloc::vec::Vec::from(&b"GETTING READY"[..])),
+            None => {
+                let percent = self.transfer.percent().unwrap_or(0);
+                (percent, crate::text!(8, "{percent}%").as_bytes().to_vec())
+            }
+        };
+        Some(Panel {
+            kind: PanelKind::Progress(percent),
+            title: title.to_vec(),
+            lines: alloc::vec![(line, alloc::vec::Vec::new(), Tone::Plain)],
+            selected: None,
+            // A hint shows at most 12 characters.
+            hints: alloc::vec![(&b"K2"[..], &b"HOLD: CANCEL"[..])],
+        })
+    }
+
     /// Hands the display the panel for what the menu shows now, or the voice command's overlay, or none.
     fn show_overlay<B: Board>(&mut self, board: &mut B) {
         let now = board.now_ms();
+        if let Some(panel) = self.transfer_panel() {
+            return self.display.set_panel(board, &scene!(self, now), Some(panel));
+        }
         let panel = match self.menu.view() {
             Some(view) => Some(self.menu_panel(view, now)),
             None => self.voice.panel(now).map(|mut panel| {
@@ -2066,6 +2131,7 @@ impl Firmware {
 
     /// `xfer.*`: a firmware image or a Character pack over any link, in chunks, resumable (ADR-0016, [`crate::transfer`]).
     fn handle_transfer<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
+        self.transfer_heard = board.now_ms();
         match event {
             "xfer.begin" => {
                 let kind = string(fields, "kind").and_then(transfer::Kind::parse);
@@ -2131,6 +2197,7 @@ impl Firmware {
             _ => Self::transfer_error(board, transfer::Error::BadMessage),
         }
         self.after_transfer(board);
+        self.show_overlay(board);
     }
 
     /// A pack transfer that set the current pack aside has ended, however: load what the partition holds now (the new

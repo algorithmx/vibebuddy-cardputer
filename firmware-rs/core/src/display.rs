@@ -150,6 +150,8 @@ pub enum PanelKind {
     Meter(u8),
     /// Wrapped text, one row per line's label, at this scale (2 or 1); see [`VOICE_TEXT_LARGE`].
     Text(u8),
+    /// A transfer coming in (ADR-0016): a bar filled to this percent, and the lines' labels under it.
+    Progress(u8),
 }
 
 /// How wide a `Text` panel's rows are in pixels: 19 ASCII characters in large type, 38 in small, and 19
@@ -1482,6 +1484,11 @@ impl Display {
     }
 
     /// Shows a panel over the screen, or takes it away; redraws only on a change.
+    /// The panel over the screen now, if any.
+    pub fn panel(&self) -> Option<&Panel> {
+        self.panel.as_ref()
+    }
+
     pub fn set_panel(&mut self, screen: &mut dyn Screen, scene: &Scene, panel: Option<Panel>) {
         if self.panel == panel {
             return;
@@ -1836,7 +1843,7 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
                 }
                 canvas.draw_text(120, y - 3, value, 2, tone_color(*tone), 13);
             }
-            PanelKind::Meter(_) => canvas.draw_text_centered(150 + index * 18, label, 2, tone_color(*tone)),
+            PanelKind::Meter(_) | PanelKind::Progress(_) => canvas.draw_text_centered(150 + index * 18, label, 2, tone_color(*tone)),
             PanelKind::Text(scale) => {
                 let pitch = voice_text_pitch(scale, panel.lines.iter().any(|(label, _, _)| font::has_wide(label)));
                 // Room for one hanging closing mark past the row's width (font::wrap).
@@ -1847,6 +1854,9 @@ fn draw_panel(canvas: &mut Canvas, panel: &Panel) {
     }
     if let PanelKind::Meter(level) = panel.kind {
         draw_meter(canvas, level);
+    }
+    if let PanelKind::Progress(percent) = panel.kind {
+        draw_progress(canvas, percent);
     }
     canvas.fill_rect(PANEL_LEFT, 196, PANEL_RIGHT - PANEL_LEFT, 1, COLOR_MUTED);
     let mut x = PANEL_LEFT;
@@ -1873,6 +1883,14 @@ fn draw_meter(canvas: &mut Canvas, level: u8) {
         };
         canvas.fill_rect(x + step * 14, 92, 12, 40, color);
     }
+}
+
+/// A transfer's progress: one bar, as wide as the meter, filled from the left in the colour of done.
+fn draw_progress(canvas: &mut Canvas, percent: u8) {
+    let width = crate::voice_command::METER_STEPS as i32 * 14 - 2;
+    let x = PANEL_LEFT + 5;
+    canvas.fill_rect(x, 92, width, 40, half_bright(COLOR_MUTED));
+    canvas.fill_rect(x, 92, width * i32::from(percent.min(100)) / 100, 40, COLOR_DONE);
 }
 
 /// How the box is linked to its computer (USB wins, then the local network, then the Relay).

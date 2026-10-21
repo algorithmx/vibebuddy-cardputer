@@ -71,6 +71,7 @@ fn glyph_row(character: u8, row: usize) -> u8 {
         b'>' => [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10][row],
         b' ' => 0,
         b'_' => if row == 6 { 0x1f } else { 0 },
+        b'%' => [0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03][row],
         _ => match row {
             0 | 3 => 0x0e,
             1 | 2 => 0x11,

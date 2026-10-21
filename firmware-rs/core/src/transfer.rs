@@ -127,6 +127,11 @@ impl Transfer {
         self.image.is_some()
     }
 
+    /// What the transfer under way carries.
+    pub fn kind(&self) -> Option<Kind> {
+        self.image.as_ref().map(|image| image.kind)
+    }
+
     /// The kind of a transfer still erasing before it can take chunks.
     pub fn erasing(&self) -> Option<Kind> {
         self.image.as_ref().filter(|image| !image.erased()).map(|image| image.kind)
