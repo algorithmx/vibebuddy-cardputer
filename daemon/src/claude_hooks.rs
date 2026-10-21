@@ -73,7 +73,7 @@ pub fn apply(
             hook.desktop_session_id.clone(),
         ),
     };
-    let event = match hook.hook_event_name.as_str() {
+    let mut event = match hook.hook_event_name.as_str() {
         "UserPromptSubmit" => {
             tracker.clear_turns(&hook.session_id);
             tracker.observe(&id, &title, ActivityStatus::Working)
@@ -96,6 +96,9 @@ pub fn apply(
         _ => None,
     };
     tracker.associate_source(&id, source);
+    if let Some(event) = event.as_mut() {
+        tracker.refresh_cards(event);
+    }
     event
 }
 

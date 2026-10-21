@@ -8,9 +8,11 @@ Boxes of the same board (ATK-DNESP32S3-BOX V1.1) differ in their screen module: 
 
 The first version knows one gesture, the tap, and uses it three ways: a tap on a menu row selects it and acts on it (K1 to the row, then K0), a tap on a key hint at the bottom of the menu is that key (and on the dimmed screen around the menu, K2), and a tap on a task card takes the user to that card's agent. A tap on the buddy pets it. A tap also counts as a key press for Leisure and Boredom, which wakes a screen dimmed for the night.
 
+Amended 2026-10-21 (#155): the task cards now come in two pages of three. Besides the tap there is one more gesture, the vertical swipe, and it only turns that page. A tap on the page line under the cards turns it too. Every box, touch or not, turns the page by itself every 8 s, so the keys lose nothing.
+
 ## Rejected options
 
-Making touch the main input and dropping the key hints: half the boxes would lose features. Swipes, long presses and settings that need sliders or a keyboard on the box: more to get wrong for little gain over the keys, and the settings belong in the App anyway (ADR-0007). Starting or pausing the Pomodoro by touch: a box on a desk gets brushed, and a timer that starts by accident is worse than one more key press. Falling back to K2's destination when a tapped card's agent is gone: opening something other than what was tapped is more confusing than nothing.
+Making touch the main input and dropping the key hints: half the boxes would lose features. Other swipes, long presses and settings that need sliders or a keyboard on the box: more to get wrong for little gain over the keys, and the settings belong in the App anyway (ADR-0007). Starting or pausing the Pomodoro by touch: a box on a desk gets brushed, and a timer that starts by accident is worse than one more key press. Falling back to K2's destination when a tapped card's agent is gone: opening something other than what was tapped is more confusing than nothing.
 
 ## Consequences
 

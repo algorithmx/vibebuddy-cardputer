@@ -94,9 +94,22 @@ Some boxes have a touchscreen (ADR-0019). The firmware looks for one at boot and
 - **A key hint** along the bottom is that key: tap CLOSE to close, BACK to go back.
 - **The dimmed screen around the panel** closes the menu, as K2 does.
 - **A task card** on duty takes you to that card's agent: the box sends the card's id in a `focus` event and the daemon opens it, the way K2 opens the most pressing one ([`protocol.md`](protocol.md)).
+- **A swipe** up or down the screen, or a tap on the page line under the cards, turns the cards' page (below).
 - **The buddy** on duty, outside the menu, is petted: it hops with a heart for a moment, and nothing else changes.
 
-The tapped row, hint, card or buddy is outlined for a moment, so a tap that landed is seen to. A tap in Leisure only calls the buddy back, like any key, and wakes a screen dimmed for the night. The menu still opens on K1 held, and the Pomodoro screen has nothing to tap: a box on a desk gets brushed, and the timer stays on K0. Every tap prints `TAP <x> <y>` as a diagnostic line.
+The tapped row, hint, card or buddy is outlined for a moment, so a tap that landed is seen to. A tap in Leisure only calls the buddy back, like any key, and wakes a screen dimmed for the night. The menu still opens on K1 held, and the Pomodoro screen has nothing to tap: a box on a desk gets brushed, and the timer stays on K0. Every tap prints `TAP <x> <y>` as a diagnostic line, and a swipe `SWIPE UP` or `SWIPE DOWN`.
+
+### Task card pages
+
+The daemon sends up to six cards, three a page, those waiting for input first (#155). Each card shows its agent's icon in place of the `CC:`-style prefix; CI has an icon of its own. With two pages:
+
+- the line under the cards says which page is up (`PAGE 1 OF 2`), and how many activities weren't sent at all (`2 MORE`);
+- a thin bar beside the cards shows which page is up;
+- every box turns the page by itself every 8 s, except while a card waits for input, when it stays on the first page;
+- on a touchscreen, a swipe or a tap on the page line turns it, and the box then leaves the pages alone for 30 s;
+- any new task event goes back to the first page.
+
+![The first page](images/cards-page-1.png) ![The second page, after a swipe up](images/cards-page-2.png)
 
 ![A tapped row](images/touch-row.png) ![The buddy petted](images/touch-pet.png)
 

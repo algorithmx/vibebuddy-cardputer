@@ -8,6 +8,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::agent_icon::AgentIcon;
 use crate::canvas::{Canvas, FRAME_BYTES, HEIGHT, WIDTH, half_bright};
 use crate::font;
 use crate::leisure::{self, Skit};
@@ -16,7 +17,13 @@ use crate::pomodoro::{self, Phase, Run};
 use crate::text;
 use crate::text::{Text, truncated};
 
-pub const MAX_TASKS: usize = 3;
+/// Cards the box keeps: two pages of [`CARDS_PER_PAGE`] (#155).
+pub const MAX_TASKS: usize = 6;
+const CARDS_PER_PAGE: usize = 3;
+/// With more than one page, the box turns it by itself this often...
+const PAGE_TURN_MS: u32 = 8000;
+/// ...but not for this long after the user turned it.
+const PAGE_PAUSE_MS: u32 = 30_000;
 pub const MAX_STATS: usize = 3;
 
 const COLOR_BACKGROUND: u16 = 0x0841;
@@ -102,11 +109,14 @@ pub struct TaskInput<'a> {
     pub project: Option<&'a [u8]>,
     /// The daemon's id for the card's activity, which a tap on the card names (ADR-0019); None from an older daemon.
     pub id: Option<&'a [u8]>,
+    /// The card's agent, drawn as its icon in place of the title's prefix; None for one without an icon.
+    pub icon: Option<AgentIcon>,
 }
 
 struct Task {
     title: Vec<u8>,
     id: Vec<u8>,
+    icon: Option<AgentIcon>,
     project: Vec<u8>,
     state: State,
     elapsed_base: i32,
@@ -193,6 +203,8 @@ pub enum Target {
     Hint(usize),
     /// The dimmed screen around the menu panel.
     OutsidePanel,
+    /// The line under the task cards that says which page is up: a tap turns it.
+    PageLine,
 }
 
 /// How long a tapped target stays outlined.
@@ -221,10 +233,9 @@ impl Rect {
     }
 }
 
-/// The task card at `index` in the stack, drawn and tapped alike.
-fn card_rect(index: usize) -> Rect {
-    let index = index as i32;
-    Rect { x: 8 + index * 4, y: 50 + index * 38, width: 188 - index * 4, height: 32 }
+/// The task card in place `slot` of the page, drawn and tapped alike.
+fn card_rect(slot: usize) -> Rect {
+    Rect { x: 8, y: 50 + slot as i32 * 38, width: 186, height: 32 }
 }
 
 /// The buddy on duty, robot or look, with the tasks' shift to the right: a tap anywhere on it pets it.
@@ -273,6 +284,11 @@ pub struct Display {
     highlight: Option<(Target, u32)>,
     /// The buddy is being petted until this time.
     petted_until: Option<u32>,
+    /// The task cards' page up now, when the box turns it next by itself, and how many activities there are in all,
+    /// sent or not.
+    page: usize,
+    page_turn_at: u32,
+    tasks_total: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -887,13 +903,16 @@ impl Display {
             look: None,
             highlight: None,
             petted_until: None,
+            page: 0,
+            page_turn_at: 0,
+            tasks_total: 0,
         }
     }
 
     /// The screen hardware is initialized and the backlight is still off: draw the first frame, then turn on the backlight.
     pub fn start(&mut self, screen: &mut dyn Screen, scene: &Scene) -> Result<(), ()> {
         self.ready = true;
-        self.show_tasks(screen, scene, State::Idle, None, &[])?;
+        self.show_tasks(screen, scene, State::Idle, None, &[], 0)?;
         screen.set_backlight(true)?;
         self.backlight_on = true;
         Ok(())
@@ -944,19 +963,27 @@ impl Display {
     }
 
     fn draw_task_cards(&self, canvas: &mut Canvas, now_ms: u32) {
-        for (index, task) in self.tasks.iter().enumerate() {
-            let Rect { x, y, width, .. } = card_rect(index);
-            let card_color = if index == 0 { 0x18c6 } else { 0x1083 };
+        for (slot, task) in self.tasks_on_page().iter().enumerate() {
+            let Rect { x, y, width, .. } = card_rect(slot);
+            let card_color = if self.page == 0 && slot == 0 { 0x18c6 } else { 0x1083 };
             let color = self.state_color(task.state);
             canvas.fill_rect(x, y, width, 32, COLOR_MUTED);
             canvas.fill_rect(x + 2, y + 2, width - 4, 28, card_color);
             canvas.fill_rect(x + 2, y + 2, 4, 28, color);
-            canvas.draw_str(x + 12, y + 5, &task.title, 1, COLOR_TEXT, 26 * 6 - 1);
-            canvas.draw_text(x + 12, y + 17, short_state_label(task.state), 1, color, 4);
+            // The agent's icon stands in for the title's prefix; the text moves right to make room.
+            let (text_x, title, project_chars) = match task.icon {
+                Some(icon) => {
+                    icon.draw(canvas, x + 10, y + 4);
+                    (x + 26, task.title.strip_prefix(icon.prefix()).unwrap_or(&task.title), 13)
+                }
+                None => (x + 12, &task.title[..], 16),
+            };
+            canvas.draw_str(text_x, y + 5, title, 1, COLOR_TEXT, (x + width - 8 - text_x).min(26 * 6 - 1));
+            canvas.draw_text(text_x, y + 17, short_state_label(task.state), 1, color, 4);
             // When the first line is a session name, the project name moves to the second line; if the title is the
             // project name, don't repeat it.
             if !task.project.is_empty() && !contains(&task.title, &task.project) {
-                canvas.draw_str(x + 42, y + 17, &task.project, 1, COLOR_MUTED, 16 * 6 - 1);
+                canvas.draw_str(text_x + 30, y + 17, &task.project, 1, COLOR_MUTED, project_chars * 6 - 1);
             }
             let elapsed = format_elapsed(self.task_elapsed_seconds(task, now_ms));
             let elapsed_width = elapsed.len() as i32 * 6 - 1;
@@ -1211,7 +1238,8 @@ impl Display {
         let label_y = if crowded { 178 } else { 162 };
         canvas.draw_text_centered(label_y, label, if self.state == State::InputRequired { 2 } else { 3 }, status_color);
         if !self.tasks.is_empty() {
-            canvas.draw_text_centered(if crowded { 212 } else { 195 }, b"LATEST ON TOP", 1, COLOR_MUTED);
+            canvas.draw_text_centered(self.page_line_y(), self.page_line().as_bytes(), 1, COLOR_MUTED);
+            self.draw_page_bar(canvas);
         } else if self.state == State::Idle && !self.link_lost {
             // No rotation while the link is lost: a moving screen looks alive, the exact opposite of NO LINK.
             self.draw_idle_line(canvas, scene);
@@ -1302,6 +1330,7 @@ impl Display {
         state: State,
         title: Option<&[u8]>,
         tasks: &[TaskInput],
+        total: usize,
     ) -> Result<(), ()> {
         if !self.ready {
             return Err(());
@@ -1316,11 +1345,16 @@ impl Display {
                 title: truncated(task.title.unwrap_or(b"CODEX"), TITLE_BYTES),
                 project: truncated(task.project.unwrap_or(b""), TITLE_BYTES),
                 id: task.id.unwrap_or_default().to_vec(),
+                icon: task.icon,
                 state: task.state,
                 elapsed_base: task.elapsed_s,
                 received_ms: scene.now_ms,
             })
             .collect();
+        self.tasks_total = total.max(self.tasks.len());
+        // News starts from the first page: the cards waiting for an answer are there.
+        self.page = 0;
+        self.page_turn_at = scene.now_ms.wrapping_add(PAGE_TURN_MS);
         self.next_animation_at = scene.now_ms.wrapping_add(self.animation_period());
         self.render(screen, scene)
     }
@@ -1335,6 +1369,8 @@ impl Display {
         }
         self.tasks
             .retain(|task| matches!(task.state, State::Working | State::InputRequired));
+        self.tasks_total = self.tasks.len();
+        self.page = 0;
         self.state = if self.tasks.iter().any(|task| task.state == State::InputRequired) {
             State::InputRequired
         } else if self.tasks.is_empty() {
@@ -1518,6 +1554,18 @@ impl Display {
             self.petted_until = None;
             ended = true;
         }
+        // More than one page turns by itself, except while a card waits for an answer: the box stays on it then.
+        let waiting = self.tasks.iter().any(|task| task.state == State::InputRequired);
+        if self.mode == Mode::Duty
+            && self.panel.is_none()
+            && self.pages() > 1
+            && !waiting
+            && now.wrapping_sub(self.page_turn_at) as i32 >= 0
+        {
+            self.page = (self.page + 1) % self.pages();
+            self.page_turn_at = now.wrapping_add(PAGE_TURN_MS);
+            ended = true;
+        }
         if ended {
             let _ = self.render(screen, scene);
         }
@@ -1544,6 +1592,65 @@ impl Display {
     }
 
     /// The id of the activity behind the card at `index`; None when the daemon sent none.
+    fn pages(&self) -> usize {
+        self.tasks.len().div_ceil(CARDS_PER_PAGE).max(1)
+    }
+
+    fn tasks_on_page(&self) -> &[Task] {
+        let start = (self.page * CARDS_PER_PAGE).min(self.tasks.len());
+        &self.tasks[start..(start + CARDS_PER_PAGE).min(self.tasks.len())]
+    }
+
+    /// Under the cards: which page is up and how many activities aren't sent at all, or the old hint when it all
+    /// fits on one page.
+    fn page_line(&self) -> Text<24> {
+        let unsent = self.tasks_total.saturating_sub(self.tasks.len());
+        match (self.pages(), unsent) {
+            (1, 0) => text!(24, "LATEST ON TOP"),
+            // The font has no `/` or `+`.
+            (1, unsent) => text!(24, "{} MORE", unsent % 100),
+            (pages, 0) => text!(24, "PAGE {} OF {}", self.page + 1, pages),
+            (pages, unsent) => text!(24, "PAGE {} OF {}   {} MORE", self.page + 1, pages, unsent % 100),
+        }
+    }
+
+    /// The page line and a finger's width around it.
+    fn page_line_rect(&self) -> Rect {
+        Rect { x: 40, y: self.page_line_y() - 8, width: 240, height: 23 }
+    }
+
+    fn page_line_y(&self) -> i32 {
+        if self.tasks.len() >= 3 { 212 } else { 195 }
+    }
+
+    /// A thin bar beside the cards, one segment a page, the one up lit: there is more than what shows.
+    fn draw_page_bar(&self, canvas: &mut Canvas) {
+        let pages = self.pages() as i32;
+        if pages < 2 {
+            return;
+        }
+        let top = card_rect(0).y;
+        let height = card_rect(CARDS_PER_PAGE - 1).y + 32 - top;
+        let segment = (height - (pages - 1) * 3) / pages;
+        for page in 0..pages {
+            let color = if page == self.page as i32 { COLOR_TEXT } else { COLOR_MUTED };
+            canvas.fill_rect(198, top + page * (segment + 3), 3, segment, color);
+        }
+    }
+
+    /// Turns the cards' page forward or back, as a swipe or a tap on the page line asks; the box then leaves the
+    /// pages alone for a while. Returns the page now up and the number of pages, or None with only one.
+    pub fn turn_page(&mut self, screen: &mut dyn Screen, scene: &Scene, forward: bool) -> Option<(usize, usize)> {
+        let pages = self.pages();
+        if self.mode != Mode::Duty || self.panel.is_some() || pages < 2 {
+            return None;
+        }
+        self.page = if forward { (self.page + 1) % pages } else { (self.page + pages - 1) % pages };
+        self.page_turn_at = scene.now_ms.wrapping_add(PAGE_PAUSE_MS);
+        self.refresh(screen, scene);
+        Some((self.page, pages))
+    }
+
     pub fn card_id(&self, index: usize) -> Option<&[u8]> {
         self.tasks.get(index).map(|task| task.id.as_slice()).filter(|id| !id.is_empty())
     }
@@ -1553,7 +1660,10 @@ impl Display {
         match (target, &self.panel) {
             (Target::Row(index), Some(panel)) if panel.kind == PanelKind::List && index < panel.lines.len() => Some(panel_row_rect(index)),
             (Target::Hint(index), Some(panel)) => hint_rects(panel).get(index).copied(),
-            (Target::Card(index), None) if self.mode == Mode::Duty && index < self.tasks.len() => Some(card_rect(index)),
+            (Target::Card(index), None) if self.mode == Mode::Duty && index < self.tasks.len() => {
+                index.checked_sub(self.page * CARDS_PER_PAGE).filter(|&slot| slot < CARDS_PER_PAGE).map(card_rect)
+            }
+            (Target::PageLine, None) if self.mode == Mode::Duty && self.pages() > 1 => Some(self.page_line_rect()),
             (Target::Buddy, None) if self.mode == Mode::Duty => Some(buddy_rect(self.buddy_offset())),
             _ => None,
         }
@@ -1580,8 +1690,11 @@ impl Display {
         if self.mode != Mode::Duty {
             return None;
         }
-        if let Some(index) = (0..self.tasks.len()).find(|&index| card_rect(index).contains(x, y)) {
-            return Some(Target::Card(index));
+        if let Some(slot) = (0..self.tasks_on_page().len()).find(|&slot| card_rect(slot).contains(x, y)) {
+            return Some(Target::Card(self.page * CARDS_PER_PAGE + slot));
+        }
+        if self.pages() > 1 && self.page_line_rect().contains(x, y) {
+            return Some(Target::PageLine);
         }
         buddy_rect(self.buddy_offset()).contains(x, y).then_some(Target::Buddy)
     }

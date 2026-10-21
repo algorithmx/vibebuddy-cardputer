@@ -53,37 +53,67 @@ pub fn parse_report(report: &[u8; REPORT_BYTES]) -> Option<Point> {
     Some(point)
 }
 
-/// Turns samples into taps: a finger down and up again quickly, in about the same place.
-#[derive(Default)]
-pub struct Taps {
-    /// Where and when the finger went down, and whether it has strayed or stayed too long since.
-    down: Option<(Point, u32, bool)>,
+/// What a finger did, from down to up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    /// Down and up again quickly, in about the same place: where it went down.
+    Tap(Point),
+    /// A quick stroke up or down the screen: turns the task cards' page (#155).
+    Swipe(Direction),
 }
 
-impl Taps {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Down,
+}
+
+/// A swipe covers at least this far up or down...
+const SWIPE_MIN: i32 = 40;
+/// ...within this long.
+const SWIPE_MS: u32 = 800;
+
+/// Turns samples into gestures: taps and vertical swipes, nothing else (ADR-0019).
+#[derive(Default)]
+pub struct Gestures {
+    /// Where and when the finger went down, where it was last seen, and whether it has strayed or stayed too long
+    /// for a tap since.
+    down: Option<(Point, u32, Point, bool)>,
+}
+
+impl Gestures {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// One sample: where the finger is, or None when it's up. Returns the tap when one ends here, at the place
-    /// the finger went down (the place the user aimed at, before any slide on the way up).
-    pub fn update(&mut self, sample: Option<Point>, now_ms: u32) -> Option<Point> {
+    /// One sample: where the finger is, or None when it's up. Returns the gesture when one ends here. A tap is
+    /// placed where the finger went down, the place the user aimed at, before any slide on the way up.
+    pub fn update(&mut self, sample: Option<Point>, now_ms: u32) -> Option<Gesture> {
         match (sample, &mut self.down) {
             (Some(point), None) => {
-                self.down = Some((point, now_ms, false));
+                self.down = Some((point, now_ms, point, false));
                 None
             }
-            (Some(point), Some((start, since, spoiled))) => {
+            (Some(point), Some((start, since, last, spoiled))) => {
                 let strayed = (point.x - start.x).abs() > TAP_SLOP || (point.y - start.y).abs() > TAP_SLOP;
                 if strayed || now_ms.wrapping_sub(*since) > TAP_MS {
                     *spoiled = true;
                 }
+                *last = point;
                 None
             }
-            (None, Some((start, since, spoiled))) => {
-                let tap = (!*spoiled && now_ms.wrapping_sub(*since) <= TAP_MS).then_some(*start);
+            (None, Some((start, since, last, spoiled))) => {
+                let held = now_ms.wrapping_sub(*since);
+                let (dx, dy) = (last.x - start.x, last.y - start.y);
+                let gesture = if !*spoiled && held <= TAP_MS {
+                    Some(Gesture::Tap(*start))
+                } else if held <= SWIPE_MS && dy.abs() >= SWIPE_MIN && dy.abs() >= 2 * dx.abs() {
+                    Some(Gesture::Swipe(if dy < 0 { Direction::Up } else { Direction::Down }))
+                } else {
+                    None
+                };
                 self.down = None;
-                tap
+                gesture
             }
             (None, None) => None,
         }
@@ -132,20 +162,20 @@ mod tests {
 
     #[test]
     fn down_and_up_quickly_is_a_tap_where_it_went_down() {
-        let mut taps = Taps::new();
+        let mut taps = Gestures::new();
         assert_eq!(taps.update(Some(AT), 0), None);
         assert_eq!(taps.update(Some(Point { x: 105, y: 84 }), 60), None);
-        assert_eq!(taps.update(None, 120), Some(AT));
+        assert_eq!(taps.update(None, 120), Some(Gesture::Tap(AT)));
         assert_eq!(taps.update(None, 140), None, "one tap, once");
     }
 
     #[test]
     fn a_slide_or_a_hold_is_not_a_tap() {
-        let mut taps = Taps::new();
+        let mut taps = Gestures::new();
         taps.update(Some(AT), 0);
         taps.update(Some(Point { x: 130, y: 80 }), 40);
         taps.update(Some(AT), 80);
-        assert_eq!(taps.update(None, 100), None, "it strayed, even though it came back");
+        assert_eq!(taps.update(None, 100), None, "it strayed, even though it came back, and went nowhere");
 
         taps.update(Some(AT), 1000);
         taps.update(Some(AT), 1500);
@@ -153,5 +183,34 @@ mod tests {
 
         taps.update(Some(AT), 2000);
         assert_eq!(taps.update(None, 2500), None, "held too long between two samples");
+    }
+
+    #[test]
+    fn a_quick_stroke_up_or_down_is_a_swipe() {
+        let mut gestures = Gestures::new();
+        gestures.update(Some(AT), 0);
+        gestures.update(Some(Point { x: 104, y: 50 }), 100);
+        gestures.update(Some(Point { x: 106, y: 30 }), 200);
+        assert_eq!(gestures.update(None, 220), Some(Gesture::Swipe(Direction::Up)));
+
+        gestures.update(Some(AT), 1000);
+        gestures.update(Some(Point { x: 98, y: 140 }), 1300);
+        assert_eq!(gestures.update(None, 1320), Some(Gesture::Swipe(Direction::Down)));
+    }
+
+    #[test]
+    fn short_slow_or_sideways_strokes_are_nothing() {
+        let mut gestures = Gestures::new();
+        gestures.update(Some(AT), 0);
+        gestures.update(Some(Point { x: 100, y: 55 }), 100);
+        assert_eq!(gestures.update(None, 120), None, "25 px is too short");
+
+        gestures.update(Some(AT), 1000);
+        gestures.update(Some(Point { x: 100, y: 10 }), 1900);
+        assert_eq!(gestures.update(None, 1920), None, "too slow");
+
+        gestures.update(Some(AT), 2000);
+        gestures.update(Some(Point { x: 160, y: 40 }), 2100);
+        assert_eq!(gestures.update(None, 2120), None, "more sideways than up");
     }
 }
