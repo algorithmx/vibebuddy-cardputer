@@ -288,7 +288,8 @@ async fn main() {
             None => resident,
         })
     });
-    state.voice = Arc::new(voice::Voice::new(speech::from_env(), state.resident.clone()).with_synthesizer(synthesis::from_env()));
+    let session = Some(state.account.clone());
+    state.voice = Arc::new(voice::Voice::new(speech::from_env(session.clone()), state.resident.clone()).with_synthesizer(synthesis::from_env(session)));
     if let Some(resident) = state.resident.clone() {
         let wearing = wearing(&state).await;
         tokio::spawn(async move { resident.warm(&wearing).await });
@@ -313,6 +314,7 @@ async fn main() {
     if let Some(resident) = state.resident.clone().filter(|resident| resident.enabled()) {
         follow_resident_readiness(&state, resident);
     }
+    follow_account(&state);
     // On macOS the app reports a lost link; elsewhere there is no app, so the daemon does it.
     if !cfg!(target_os = "macos") {
         tokio::spawn(link_alert::watch(state.clone()));
@@ -469,7 +471,7 @@ async fn wearing(state: &AppState) -> persona::Wearing {
     persona::Wearing::of(id, &*state.written.lock().await)
 }
 
-/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness flipped
+/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness or the account flipped
 /// (the user's Codex installed or gone, logged in or out). Told `false`, a long K0 gives up the Pomodoro phase as it
 /// did before voice. Never over the Relay or the UART bridge, where voice is never offered.
 async fn offer_voice_again(state: &AppState) {
@@ -479,9 +481,21 @@ async fn offer_voice_again(state: &AppState) {
     };
     if booted && !over_relay && !on_bridge {
         let on = state.voice.available();
-        info!(on, "the resident session's readiness changed; telling the box whether voice is on");
+        info!(on, "voice readiness changed; telling the box whether voice is on");
         send_event(state, voice::available_event(on));
     }
+}
+
+/// Signing in or out, here or by the service refusing the session, changes the status and whether voice works.
+fn follow_account(state: &AppState) {
+    let mut changes = state.account.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+            offer_voice_again(&follower).await;
+        }
+    });
 }
 
 /// Checks the resident session's readiness every [`resident::READINESS_TTL`] and tells the box each time it flips.
@@ -2086,7 +2100,7 @@ mod tests {
     struct SilentRecognizer;
 
     impl speech::Recognizer for SilentRecognizer {
-        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, String> {
+        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, speech::RecognitionError> {
             Ok(speech::Transcript::default())
         }
     }

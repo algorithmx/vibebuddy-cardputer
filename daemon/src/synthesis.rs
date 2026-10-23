@@ -2,7 +2,7 @@
 //! service makes it.
 //!
 //! Behind [`Synthesizer`] so the backend can change. There is one: the voice service in `vibebuddy-cloud`,
-//! `POST {base}/v0/voice/speak` with `{"text","voice"}`, answering a chunked `audio/mpeg` stream (MPEG-2 Layer III,
+//! `POST {base}/v1/voice/speak` with `{"text","voice"}` and the account's session (ADR-0018, docs/api.md), answering a chunked `audio/mpeg` stream (MPEG-2 Layer III,
 //! 24 kHz mono, 48 kbps) that starts as soon as there is audio. Builds other than releases use staging; a release
 //! has none until the production service is deployed. `VIBEBUDDY_TTS_BASE_URL` sets the base by hand, or `off`;
 //! speech recognition ([`crate::speech`]) goes to the same service.
@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use tracing::{info, warn};
+
+use crate::account::Account;
 
 /// The voice service's base URL, or `off`. Unset: staging, except in a release.
 pub const BASE_URL_VARIABLE: &str = "VIBEBUDDY_TTS_BASE_URL";
@@ -35,30 +37,36 @@ pub trait Synthesizer: Send + Sync {
 /// The voice service.
 pub struct VoiceService {
     base_url: String,
+    /// The account whose session the call carries; None only in tests.
+    session: Option<Arc<Account>>,
 }
 
 impl VoiceService {
     fn url(&self) -> String {
-        format!("{}/v0/voice/speak", self.base_url.trim_end_matches('/'))
+        format!("{}/v1/voice/speak", self.base_url.trim_end_matches('/'))
     }
 
     fn speak(&self, text: &str, voice: &str, on_audio: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, String> {
         let url = self.url();
         let host = url.split('/').nth(2).unwrap_or_default().to_owned();
         let body = json!({"text": text, "voice": voice}).to_string();
-        // The seam for the account session: its Authorization header goes here once the service asks for one.
+        let token = self.session.as_ref().map(|session| session.token().ok_or("not signed in")).transpose()?;
         // One agent for every reply, so its connection to the service is reused: a fresh TLS handshake cost about
         // half a second a reply.
         static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-        let mut response = AGENT
-            .get_or_init(|| crate::speech::agent(TIMEOUT))
-            .post(&url)
-            .header("Content-Type", "application/json")
+        let mut request = AGENT.get_or_init(|| crate::speech::agent(TIMEOUT)).post(&url).header("Content-Type", "application/json");
+        if let Some(token) = token {
+            request = request.header("Authorization", &format!("Bearer {token}"));
+        }
+        let mut response = request
             .send(body.as_bytes())
             .map_err(|error| format!("calling {host}: {error}"))?;
         let status = response.status().as_u16();
         if status != 200 {
             let answer = response.body_mut().with_config().limit(1024).read_to_string().unwrap_or_default();
+            if let Some(refusal) = crate::speech::refusal(status, &answer, self.session.as_deref()) {
+                return Err(refusal.to_string());
+            }
             return Err(format!("the voice service answered {status}: {}", answer.trim()));
         }
         let mut reader = response.into_body().into_reader();
@@ -171,8 +179,8 @@ pub(crate) fn voice_field<'a>(file: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// The synthesizer the environment configures, if any.
-pub fn from_env() -> Option<Arc<dyn Synthesizer>> {
-    configure(service_base(std::env::var(BASE_URL_VARIABLE).ok(), crate::relay::release()))
+pub fn from_env(session: Option<Arc<Account>>) -> Option<Arc<dyn Synthesizer>> {
+    configure(service_base(std::env::var(BASE_URL_VARIABLE).ok(), crate::relay::release()), session)
 }
 
 /// The voice service's base URL, which speech recognition ([`crate::speech`]) uses too: the variable's, else
@@ -191,10 +199,10 @@ pub fn service_base(base_url: Option<String>, release: bool) -> Option<String> {
     Some(base_url)
 }
 
-fn configure(base_url: Option<String>) -> Option<Arc<dyn Synthesizer>> {
+fn configure(base_url: Option<String>, session: Option<Arc<Account>>) -> Option<Arc<dyn Synthesizer>> {
     let base_url = base_url?;
     info!(%base_url, "speech synthesis: the voice service");
-    Some(Arc::new(VoiceService { base_url }))
+    Some(Arc::new(VoiceService { base_url, session }))
 }
 
 #[cfg(test)]
@@ -233,7 +241,7 @@ mod tests {
 
     #[test]
     fn the_service_is_staging_outside_a_release_and_can_be_set_or_switched_off() {
-        let base = |url: Option<&str>, release| configure(service_base(url.map(str::to_owned), release)).is_some();
+        let base = |url: Option<&str>, release| configure(service_base(url.map(str::to_owned), release), None).is_some();
         assert!(base(None, false));
         assert!(!base(None, true), "no production voice service yet");
         assert!(base(Some("https://api.korekore.ai"), true));
@@ -273,7 +281,7 @@ mod tests {
     }
 
     fn collect(base: String) -> (Result<(), String>, Vec<u8>) {
-        let service = VoiceService { base_url: base };
+        let service = VoiceService { base_url: base, session: None };
         let mut audio = Vec::new();
         let result = service.synthesize("Hello there.", "en-US-JennyNeural", &mut |piece| {
             audio.extend_from_slice(piece);
@@ -289,9 +297,23 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(audio, b"ID3abc\xff\xf3def");
         let request = server.join().unwrap();
-        assert!(request.starts_with("POST /v0/voice/speak HTTP/1.1\r\n"), "{request}");
+        assert!(request.starts_with("POST /v1/voice/speak HTTP/1.1\r\n"), "{request}");
         assert!(request.to_ascii_lowercase().contains("content-type: application/json"));
         assert!(request.ends_with(r#"{"text":"Hello there.","voice":"en-US-JennyNeural"}"#), "{request}");
+    }
+
+    #[test]
+    fn the_session_goes_along_and_a_401_forgets_it() {
+        let dir = std::env::temp_dir().join(format!("vibebuddy-synthesis-{}", std::process::id()));
+        let session = Arc::new(crate::account::signed_in_for_tests(&dir, "tok_xyz"));
+        let (base, server) = serve(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"unauthorized\"}".to_vec());
+        let service = VoiceService { base_url: base, session: Some(session.clone()) };
+        let result = service.synthesize("Hi.", "elevenlabs:x", &mut |_| true);
+        assert!(result.unwrap_err().contains("signed_out"));
+        assert!(server.join().unwrap().to_ascii_lowercase().contains("authorization: bearer tok_xyz"));
+        assert!(session.token().is_none());
+        // Signed out, nothing more is sent.
+        assert_eq!(service.synthesize("Hi.", "elevenlabs:x", &mut |_| true), Err("not signed in".to_owned()));
     }
 
     #[test]
