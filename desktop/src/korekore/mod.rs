@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod controls;
+mod guide;
 mod pages;
 pub mod picture;
 #[cfg(test)]

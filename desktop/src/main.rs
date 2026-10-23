@@ -895,6 +895,9 @@ impl App {
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
         if self.korekore {
+            if let Some(page) = self.guide {
+                return self.kk_guide(page);
+            }
             return self.korekore(korekore::Section::of(self.tab));
         }
         if let Some(page) = self.guide {
@@ -2132,7 +2135,8 @@ fn notify_new_firmware(status: &Status) {
     let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
     let _ = std::fs::write(&marker, &offer.version);
     let title = tr("Box firmware %@ is available", &[&offer.version]);
-    let body = tr("Open Settings → Device to update the box.", &[]);
+    // The korekore UI words it its own way (canvas: "SYSTEM NOTIFICATIONS").
+    let body = if korekore::requested() { tr("Update it from Settings › Device.", &[]) } else { tr("Open Settings → Device to update the box.", &[]) };
     if let Err(error) = launch("notify-send", &["--app-name=VibeBuddy".as_ref(), title.as_ref(), body.as_ref()]) {
         eprintln!("vibebuddy-desktop: {error}");
     }
