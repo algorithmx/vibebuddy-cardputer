@@ -1,3 +1,4 @@
+mod account;
 mod activity;
 mod app_server;
 mod ci;
@@ -111,6 +112,8 @@ struct AppState {
     /// What the App said about the Character pack it last wrote (who lends a custom one, the form of address),
     /// kept in [`persona::RECORD_FILE`] in the state directory.
     written: Arc<Mutex<persona::Written>>,
+    /// The person's VibeBuddy account (ADR-0018); unavailable in tests unless one sets it.
+    account: Arc<account::Account>,
 }
 
 impl AppState {
@@ -148,6 +151,7 @@ impl AppState {
             voice: Arc::new(voice::Voice::new(None, None)),
             noise_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             written: Arc::default(),
+            account: Arc::new(account::Account::new(None, None, 7331)),
         }
     }
 
@@ -174,6 +178,7 @@ impl AppState {
             operation: self.operation.lock().await.clone(),
             config: self.config.lock().await.clone(),
             updates,
+            account: self.account.status(),
         }
     }
 
@@ -263,6 +268,11 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
+    state.account = Arc::new(account::Account::new(
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        config::config_dir().as_deref(),
+        bind_address.port(),
+    ));
     state.state_dir = config::state_dir();
     if let Some(dir) = &state.state_dir {
         state.written = Arc::new(Mutex::new(persona::Written::load(&dir.join(persona::RECORD_FILE))));
@@ -635,6 +645,10 @@ fn app(state: AppState) -> Router {
         .route("/v1/resident/history", get(get_resident_history))
         .route("/v1/resident/brain", axum::routing::put(put_resident_brain))
         .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
+        .route("/v1/account", axum::routing::delete(delete_account))
+        .route("/v1/account/sign-in", post(post_sign_in))
+        .route("/v1/account/callback", get(get_account_callback))
+        .route("/v1/account/sign-out", post(post_sign_out))
         .with_state(state)
 }
 
@@ -1634,6 +1648,76 @@ async fn set_anthropic_key(state: AppState, key: Option<String>) -> axum::respon
     get_resident(State(state)).await.into_response()
 }
 
+#[derive(Serialize)]
+struct SignInResponse {
+    url: String,
+}
+
+/// Starts signing in to the VibeBuddy account (ADR-0018): the App opens the URL in the browser, which comes back to
+/// [`get_account_callback`].
+async fn post_sign_in(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.account.start() {
+        Ok(url) => Json(SignInResponse { url }).into_response(),
+        Err(error) => account_refusal(&error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+}
+
+async fn get_account_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CallbackQuery>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let account = state.account.clone();
+    let result = match (query.code, query.state) {
+        (Some(code), Some(sign_in)) => tokio::task::spawn_blocking(move || account.finish(&code, &sign_in))
+            .await
+            .unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))),
+        _ => Err(account::AccountError::UnknownSignIn),
+    };
+    if let Err(error) = &result {
+        warn!(%error, "signing in to the account failed");
+    }
+    state.notify_status();
+    let (status, page) = account::callback_page(&result);
+    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), axum::response::Html(page))
+}
+
+async fn post_sign_out(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.sign_out()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "signed out".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+async fn delete_account(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.delete()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "account deleted".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+fn account_refusal(error: &account::AccountError) -> (StatusCode, Json<ApiResponse>) {
+    let status = match error {
+        account::AccountError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        account::AccountError::NotSignedIn => StatusCode::CONFLICT,
+        account::AccountError::UnknownSignIn => StatusCode::BAD_REQUEST,
+        account::AccountError::Service(_) => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(ApiResponse { accepted: false, message: error.to_string() }))
+}
+
 fn no_state_directory() -> axum::response::Response {
     use axum::response::IntoResponse;
     (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse { accepted: false, message: "no state directory".to_owned() })).into_response()
@@ -1736,6 +1820,31 @@ mod tests {
             SessionTitles::disabled(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn the_account_routes_answer_without_a_service() {
+        let state = test_state(Arc::new(RecordingTransport::default()));
+        let response = post_sign_in(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = post_sign_out(State(state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!state.snapshot().await.account.available);
+    }
+
+    #[tokio::test]
+    async fn a_callback_this_daemon_did_not_start_shows_a_refusal_page() {
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        let dir = std::env::temp_dir().join(format!("vibebuddy-callback-{}", std::process::id()));
+        state.account = Arc::new(account::Account::new(Some("http://127.0.0.1:9".to_owned()), Some(&dir), 7331));
+        let callback = |code: Option<&str>, sign_in: Option<&str>| {
+            get_account_callback(State(state.clone()), axum::extract::Query(CallbackQuery { code: code.map(Into::into), state: sign_in.map(Into::into) }))
+        };
+        let (status, page) = callback(Some("c"), Some("forged")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.0.contains("Not signed in"));
+        assert_eq!(callback(None, None).await.0, StatusCode::BAD_REQUEST);
+        assert!(!state.snapshot().await.account.signed_in);
     }
 
     #[tokio::test(start_paused = true)]
