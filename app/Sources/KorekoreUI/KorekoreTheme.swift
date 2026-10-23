@@ -2,192 +2,192 @@
 import SwiftUI
 
 /// The korekore design tokens (docs/design/korekore/tokens.json).
-enum KorekoreTheme {
-    enum Colors {
+public enum KorekoreTheme {
+    public enum Colors {
         /// Text, every outline (2-3 px), sticker shadows, selected nav row. Also the box's screen ground.
-        static let ink = Color(korekoreRGB: 0x1C1730)
+        public static let ink = Color(korekoreRGB: 0x1C1730)
         /// App window and brand ground. Text on it: ink, muted, kore-pink-text.
-        static let cream = Color(korekoreRGB: 0xFFF6E8)
+        public static let cream = Color(korekoreRGB: 0xFFF6E8)
         /// Cards, list rows, secondary buttons, inputs on cream.
-        static let paper = Color(korekoreRGB: 0xFFFFFF)
+        public static let paper = Color(korekoreRGB: 0xFFFFFF)
         /// Behind windows in mockups; the toggle track when off.
-        static let backdrop = Color(korekoreRGB: 0xE9E4F2)
+        public static let backdrop = Color(korekoreRGB: 0xE9E4F2)
         /// Dividers between rows inside a card (2 px). Never an outer border.
-        static let line = Color(korekoreRGB: 0xF1E7D6)
+        public static let line = Color(korekoreRGB: 0xF1E7D6)
         /// Secondary text on cream and paper (about 9:1).
-        static let muted = Color(korekoreRGB: 0x4A4360)
+        public static let muted = Color(korekoreRGB: 0x4A4360)
         /// Tertiary pixel text: versions, timestamps, footnotes (about 5:1 on cream).
-        static let muted2 = Color(korekoreRGB: 0x6B6482)
+        public static let muted2 = Color(korekoreRGB: 0x6B6482)
         /// Brand accent as a FILL: selected character border, progress, toggle on, Connect button, Pomodoro screen. Ink text on it (5.3:1). Never small text on cream.
-        static let korePink = Color(korekoreRGB: 0xF0587F)
+        public static let korePink = Color(korekoreRGB: 0xF0587F)
         /// Pink TEXT on cream or paper below 24 px: the small pixel tag, links, IN USE, kicker lines (5.0:1 on cream, 5.4:1 on paper).
-        static let korePinkText = Color(korekoreRGB: 0xC2335B)
+        public static let korePinkText = Color(korekoreRGB: 0xC2335B)
         /// The large bitmap tag (3-5 px dots) on cream or paper. Large-text contrast only.
-        static let korePinkTag = Color(korekoreRGB: 0xE2466F)
+        public static let korePinkTag = Color(korekoreRGB: 0xE2466F)
         /// Needs input: the one loud state. Full-screen takeover on the box; primary action fill in the app (ink text).
-        static let sun = Color(korekoreRGB: 0xFFD23F)
+        public static let sun = Color(korekoreRGB: 0xFFD23F)
         /// Working. Calm, silent. RUN pills, the WORKING word, Kore's ... marks.
-        static let sky = Color(korekoreRGB: 0x7CC8FF)
+        public static let sky = Color(korekoreRGB: 0x7CC8FF)
         /// Done. 3 s full-screen celebration on the box; done pills.
-        static let mint = Color(korekoreRGB: 0x6EE7B7)
+        public static let mint = Color(korekoreRGB: 0x6EE7B7)
         /// Failed. Border and words on Ink, never a full red screen.
-        static let peach = Color(korekoreRGB: 0xFF7A7A)
+        public static let peach = Color(korekoreRGB: 0xFF7A7A)
         /// Ready / idle and the ON DUTY label.
-        static let lavender = Color(korekoreRGB: 0xB9A8FF)
+        public static let lavender = Color(korekoreRGB: 0xB9A8FF)
         /// No link. The whole box screen goes gray; mist is for the big NO LINK word (4.1:1 on box-gray-ground, large text only).
-        static let mist = Color(korekoreRGB: 0x8A85A3)
+        public static let mist = Color(korekoreRGB: 0x8A85A3)
         /// Small text on the no-link screen (6.0:1 on box-gray-ground).
-        static let mistText = Color(korekoreRGB: 0xA8A3BD)
+        public static let mistText = Color(korekoreRGB: 0xA8A3BD)
         /// Done / watching / joined as TEXT on cream or paper (5.0:1 on cream; mint fails as text).
-        static let doneText = Color(korekoreRGB: 0x177A56)
+        public static let doneText = Color(korekoreRGB: 0x177A56)
         /// Needs input / waiting as TEXT on cream or paper (5.3:1 on cream; sun fails as text).
-        static let waitText = Color(korekoreRGB: 0x8A5F00)
+        public static let waitText = Color(korekoreRGB: 0x8A5F00)
         /// Working / busy as TEXT on cream or paper.
-        static let workText = Color(korekoreRGB: 0x2E6FB0)
+        public static let workText = Color(korekoreRGB: 0x2E6FB0)
         /// The box's screen background in calm states.
-        static let boxGround = Color(korekoreRGB: 0x1C1730)
+        public static let boxGround = Color(korekoreRGB: 0x1C1730)
         /// Task tickets and the side panel on the box; agent rows on Ink.
-        static let boxCard = Color(korekoreRGB: 0x2A2345)
+        public static let boxCard = Color(korekoreRGB: 0x2A2345)
         /// Kore's screen-face; empty segments of meters on the box.
-        static let boxFace = Color(korekoreRGB: 0x3B2F63)
+        public static let boxFace = Color(korekoreRGB: 0x3B2F63)
         /// Primary text on the box. Also Kore's shell.
-        static let boxText = Color(korekoreRGB: 0xFFF3DD)
+        public static let boxText = Color(korekoreRGB: 0xFFF3DD)
         /// Project names, times, hints on the box.
-        static let boxTextMuted = Color(korekoreRGB: 0xA9A2C2)
+        public static let boxTextMuted = Color(korekoreRGB: 0xA9A2C2)
         /// Dimmed screen behind the box's MENU card.
-        static let boxDim = Color(korekoreRGB: 0x0F0C1C)
+        public static let boxDim = Color(korekoreRGB: 0x0F0C1C)
         /// The box's ground while there is no link.
-        static let boxGrayGround = Color(korekoreRGB: 0x2A2833)
+        public static let boxGrayGround = Color(korekoreRGB: 0x2A2833)
         /// Kore's outline pixels only (sprite palette).
-        static let koreOutline = Color(korekoreRGB: 0x2B2140)
+        public static let koreOutline = Color(korekoreRGB: 0x2B2140)
         /// Cheeks on Kore and every Character.
-        static let blush = Color(korekoreRGB: 0xFF9EB8)
+        public static let blush = Color(korekoreRGB: 0xFF9EB8)
         /// Kore's mouth pixels.
-        static let koreMouth = Color(korekoreRGB: 0xFFB3C8)
+        public static let koreMouth = Color(korekoreRGB: 0xFFB3C8)
         /// Claude Code tile.
-        static let agentCc = Color(korekoreRGB: 0xF2A27E)
+        public static let agentCc = Color(korekoreRGB: 0xF2A27E)
         /// Codex tile.
-        static let agentCx = Color(korekoreRGB: 0x9DB4FF)
+        public static let agentCx = Color(korekoreRGB: 0x9DB4FF)
         /// GitHub Actions tile; General and Advanced nav tiles.
-        static let agentCi = Color(korekoreRGB: 0xD9D3EA)
+        public static let agentCi = Color(korekoreRGB: 0xD9D3EA)
         /// OpenCode tile.
-        static let agentOc = Color(korekoreRGB: 0x8FE3C4)
+        public static let agentOc = Color(korekoreRGB: 0x8FE3C4)
         /// GitHub Copilot CLI tile.
-        static let agentGh = Color(korekoreRGB: 0xA8D8FF)
+        public static let agentGh = Color(korekoreRGB: 0xA8D8FF)
         /// Pi tile.
-        static let agentPi = Color(korekoreRGB: 0xFFC59E)
+        public static let agentPi = Color(korekoreRGB: 0xFFC59E)
         /// Your own events (POST /v1/events) tile; Conversation nav tile.
-        static let agentApi = Color(korekoreRGB: 0xFFE58A)
+        public static let agentApi = Color(korekoreRGB: 0xFFE58A)
     }
 
     /// The bundled fonts (Resources/fonts) by PostScript name.
-    enum FontName {
-        static let roundedRegular = "RoundedMplus1c-Regular"
-        static let roundedBold = "RoundedMplus1c-Bold"
-        static let roundedExtraBold = "RoundedMplus1c-ExtraBold"
-        static let pixelRegular = "DotGothic16-Regular"
+    public enum FontName {
+        public static let roundedRegular = "RoundedMplus1c-Regular"
+        public static let roundedBold = "RoundedMplus1c-Bold"
+        public static let roundedExtraBold = "RoundedMplus1c-ExtraBold"
+        public static let pixelRegular = "DotGothic16-Regular"
     }
 
-    enum Typography {
+    public enum Typography {
         /// Rounded Mplus 1c 800. The wordmark, large lockups only.
-        static let display = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 104, lineHeight: 93.6, letterSpacing: -3.12)
+        public static let display = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 104, lineHeight: 93.6, letterSpacing: -3.12)
         /// Rounded Mplus 1c 800. Page title in the app's content area.
-        static let title = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 28, lineHeight: 34, letterSpacing: 0)
+        public static let title = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 28, lineHeight: 34, letterSpacing: 0)
         /// Rounded Mplus 1c 800. Onboarding headlines.
-        static let hero = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 42, lineHeight: 47, letterSpacing: 0)
+        public static let hero = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 42, lineHeight: 47, letterSpacing: 0)
         /// Rounded Mplus 1c 800. Card titles, banner lines.
-        static let heading = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 17, lineHeight: 22, letterSpacing: 0)
+        public static let heading = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 17, lineHeight: 22, letterSpacing: 0)
         /// Rounded Mplus 1c 800. Row names, nav items, character names.
-        static let label = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 15, lineHeight: 20, letterSpacing: 0)
+        public static let label = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 15, lineHeight: 20, letterSpacing: 0)
         /// Rounded Mplus 1c 800. Buttons and chips (12 px in dense rows).
-        static let button = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 13, lineHeight: 18, letterSpacing: 0)
+        public static let button = KorekoreTextStyle(font: "RoundedMplus1c-ExtraBold", size: 13, lineHeight: 18, letterSpacing: 0)
         /// Rounded Mplus 1c 400. Paragraphs, chat bubbles.
-        static let body = KorekoreTextStyle(font: "RoundedMplus1c-Regular", size: 14, lineHeight: 21, letterSpacing: 0)
+        public static let body = KorekoreTextStyle(font: "RoundedMplus1c-Regular", size: 14, lineHeight: 21, letterSpacing: 0)
         /// Rounded Mplus 1c 400. Row details, captions.
-        static let small = KorekoreTextStyle(font: "RoundedMplus1c-Regular", size: 12, lineHeight: 17, letterSpacing: 0)
+        public static let small = KorekoreTextStyle(font: "RoundedMplus1c-Regular", size: 12, lineHeight: 17, letterSpacing: 0)
         /// DotGothic16 400. The state word on the box (22-36 px on a takeover).
-        static let boxState = KorekoreTextStyle(font: "DotGothic16-Regular", size: 24, lineHeight: 24, letterSpacing: 0)
+        public static let boxState = KorekoreTextStyle(font: "DotGothic16-Regular", size: 24, lineHeight: 24, letterSpacing: 0)
         /// DotGothic16 400. Ticket titles on the box (9-12 px).
-        static let boxText = KorekoreTextStyle(font: "DotGothic16-Regular", size: 11, lineHeight: 14, letterSpacing: 0)
+        public static let boxText = KorekoreTextStyle(font: "DotGothic16-Regular", size: 11, lineHeight: 14, letterSpacing: 0)
         /// DotGothic16 400. Values, versions, ports in the app.
-        static let pixelValue = KorekoreTextStyle(font: "DotGothic16-Regular", size: 13, lineHeight: 18, letterSpacing: 0)
+        public static let pixelValue = KorekoreTextStyle(font: "DotGothic16-Regular", size: 13, lineHeight: 18, letterSpacing: 0)
         /// DotGothic16 400. State tags in the app: uppercase, state *-text colour, no background.
-        static let pixelTag = KorekoreTextStyle(font: "DotGothic16-Regular", size: 12, lineHeight: 16, letterSpacing: 0)
+        public static let pixelTag = KorekoreTextStyle(font: "DotGothic16-Regular", size: 12, lineHeight: 16, letterSpacing: 0)
     }
 
-    enum Space {
+    public enum Space {
         /// Inside pills, icon-to-text in pixel rows.
-        static let s1: CGFloat = 4
+        public static let s1: CGFloat = 4
         /// Gaps in button rows, between tickets on the box (px x 1.5 there).
-        static let s2: CGFloat = 8
+        public static let s2: CGFloat = 8
         /// Row padding, card grid gaps.
-        static let s3: CGFloat = 12
+        public static let s3: CGFloat = 12
         /// Card padding, content-area gaps.
-        static let s4: CGFloat = 16
+        public static let s4: CGFloat = 16
         /// Window inset, page padding.
-        static let s5: CGFloat = 24
+        public static let s5: CGFloat = 24
         /// Onboarding columns, board margins.
-        static let s6: CGFloat = 40
+        public static let s6: CGFloat = 40
     }
 
-    enum Radius {
+    public enum Radius {
         /// Key chips (K0 K1 K2) and state pills on the box; pixel tags.
-        static let pixel: CGFloat = 4
+        public static let pixel: CGFloat = 4
         /// Inner tiles: sprite stages, inputs, ticket rows on the box (8 px at 1x).
-        static let sm: CGFloat = 10
+        public static let sm: CGFloat = 10
         /// Cards and grouped lists.
-        static let md: CGFloat = 16
+        public static let md: CGFloat = 16
         /// Windows and panels.
-        static let lg: CGFloat = 20
+        public static let lg: CGFloat = 20
         /// Hero panels (onboarding Kore stage).
-        static let xl: CGFloat = 28
+        public static let xl: CGFloat = 28
         /// Buttons, chips, toggles, tabs.
-        static let pill: CGFloat = 999
+        public static let pill: CGFloat = 999
     }
 
-    enum Stroke {
+    public enum Stroke {
         /// Pixel-tag outlines on the box and status squares.
-        static let thin: CGFloat = 1.5
+        public static let thin: CGFloat = 1.5
         /// Cards, buttons, toggles, inputs, chips.
-        static let base: CGFloat = 2
+        public static let base: CGFloat = 2
         /// Windows, the selected character card (kore-pink), primary hero buttons.
-        static let bold: CGFloat = 3
+        public static let bold: CGFloat = 3
     }
 
     /// Solid ink drop shadows: how far down they fall.
-    enum Sticker {
+    public enum Sticker {
         /// Cards, list groups, the sidebar box mirror. Solid ink, no blur: the sticker look.
-        static let sm: CGFloat = 4
+        public static let sm: CGFloat = 4
         /// Hero panels, lockup cards, the menu bar panel.
-        static let md: CGFloat = 6
+        public static let md: CGFloat = 6
         /// App windows.
-        static let lg: CGFloat = 8
+        public static let lg: CGFloat = 8
     }
 
-    enum Pixel {
+    public enum Pixel {
         /// Small bitmap tag (sidebar, title bar), solid, no grain.
-        static let dotSm: CGFloat = 2
+        public static let dotSm: CGFloat = 2
         /// Medium tag on Ink lockups.
-        static let dotMd: CGFloat = 3
+        public static let dotMd: CGFloat = 3
         /// Large tag: 3 px dot + 1 px grain gap, 1 px corner.
-        static let dotLg: CGFloat = 4
+        public static let dotLg: CGFloat = 4
         /// Kore and Characters in app cards: 1 sprite pixel = 4 px.
-        static let spriteScaleApp: Int = 4
+        public static let spriteScaleApp: Int = 4
         /// Kore on the 320x240 box screen in takeovers (4 on duty).
-        static let spriteScaleBox: Int = 5
+        public static let spriteScaleBox: Int = 5
     }
 }
 
 /// A type style: the font file, its size, line height and letter spacing, all in points.
-struct KorekoreTextStyle {
-    let font: String
-    let size: CGFloat
-    let lineHeight: CGFloat
-    let letterSpacing: CGFloat
+public struct KorekoreTextStyle: Sendable {
+    public let font: String
+    public let size: CGFloat
+    public let lineHeight: CGFloat
+    public let letterSpacing: CGFloat
 }
 
 extension Color {
-    init(korekoreRGB rgb: UInt32) {
+    public init(korekoreRGB rgb: UInt32) {
         self.init(.sRGB, red: Double(rgb >> 16 & 0xFF) / 255, green: Double(rgb >> 8 & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255)
     }
 }
