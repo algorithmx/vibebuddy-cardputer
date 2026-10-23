@@ -46,6 +46,35 @@ enum KorekoreSnapshots {
         window.close()
     }
 
+    /// The windows as they are with the running daemon's status, a few seconds after it first answers. The
+    /// Conversation page is left out (it is the user's own), and nothing is sent to the box.
+    static func live(to folder: URL, model: AppModel) {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        Task { @MainActor in
+            for _ in 0..<40 where model.status == nil { try? await Task.sleep(for: .milliseconds(250)) }
+            try? await Task.sleep(for: .seconds(2))
+            for section in KorekoreSection.allCases where section != .conversation {
+                capture(KorekoreSettingsWindow(rootView: KorekoreSettingsRoot(model: model, initial: section)), as: "live-\(section.rawValue)", in: folder)
+            }
+            let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 600), styleMask: [.borderless], backing: .buffered, defer: false)
+            let actions = KorekoreMenuActions(settings: {}, checkForUpdates: {}, reportProblem: {}, quit: {}, restartDaemon: {})
+            let hosting = NSHostingView(rootView: KorekorePanelRoot(model: model, actions: actions).padding(20).background(Color(korekoreRGB: 0xC9C3D8)))
+            panel.setContentSize(hosting.fittingSize)
+            panel.contentView = hosting
+            capture(panel, as: "live-menu-panel", in: folder)
+            let icon = KorekoreMenuIcon.image(for: BoxPicture.derive(status: model.status, daemonAlive: model.daemonAlive))
+            if let tiff = icon.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                try? png.write(to: folder.appendingPathComponent("live-menu-icon.png"))
+            }
+            for step in 0...6 {
+                capture(KorekoreSettingsWindow.onboarding(rootView: KorekoreOnboarding(model: model, finish: {}, step: step, passive: true)),
+                        as: "live-onboarding-\(step)", in: folder)
+            }
+            exit(0)
+        }
+    }
+
     static func write(to folder: URL, model: AppModel) {
         NSApplication.shared.setActivationPolicy(.prohibited)
         KorekoreAssets.registerFonts(in: URL(fileURLWithPath: "fonts/korekore"))

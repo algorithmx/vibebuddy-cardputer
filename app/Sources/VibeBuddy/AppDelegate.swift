@@ -23,6 +23,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             KorekoreSnapshots.write(to: URL(fileURLWithPath: folder), model: model)
             exit(0)
         }
+        // Debug builds only: run against the daemon already running, as a guest, and draw the korekore windows with
+        // what it reports, then quit.
+        if let folder = ProcessInfo.processInfo.environment["VIBEBUDDY_KOREKORE_LIVE_SHOTS"] {
+            model.managesDaemon = false
+            KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts"))
+            model.start()
+            KorekoreSnapshots.live(to: URL(fileURLWithPath: folder), model: model)
+            return
+        }
         #endif
         // A second copy of the app (another path, a dev build) would start a second daemon that fights over
         // the port and the serial port. Hand off to the running one and quit before starting anything.

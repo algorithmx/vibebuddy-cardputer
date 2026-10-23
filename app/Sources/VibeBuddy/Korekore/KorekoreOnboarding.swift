@@ -226,7 +226,10 @@ struct KorekoreOnboarding: View {
                     KNote(String(localized: "Unplug it, then plug in your box. If several devices are plugged in, korekore asks which one is yours."))
                 }
                 // The cable is in and someone is watching: the best moment to bring older factory firmware up to date.
-                if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
+                // Firmware without TRANSFER 1 is flashed over the cable only (ADR-0016), as the Device page says.
+                if model.firmwareUpdateAvailable, device.network == true, device.transfer != true {
+                    KNote(String(localized: "Plug in the cable to update the box's firmware."))
+                } else if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
                     KCard {
                         HStack(spacing: 8) {
                             (Text("Newer firmware is available").bold().foregroundColor(Theme.Colors.ink) + Text(" for this box (\(offer.version)).").foregroundColor(Theme.Colors.muted))
