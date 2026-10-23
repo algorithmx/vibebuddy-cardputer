@@ -20,7 +20,9 @@ Sign-in follows OAuth for native apps (RFC 8252) with PKCE (RFC 7636): the brows
    ```
 
    `redirect_uri` must be `http://127.0.0.1:<port>/…` or `http://[::1]:<port>/…`; the daemon uses `http://127.0.0.1:7331/v1/account/callback`. Anything else gets an error page.
-3. The person enters an email address and then the 6-digit code mailed from `noreply@vibekeys.dev`. A code works for 10 minutes and allows 5 tries; an address gets at most 5 codes an hour. The pending sign-in lasts 15 minutes.
+3. The page offers the ways to sign in that are set up; the pending sign-in lasts 15 minutes.
+   - **GitHub**: the browser goes through GitHub's authorization of the VibeBuddy OAuth App, which asks for no scopes. Only the numeric GitHub user id is kept.
+   - **Email**, once mail is set up (ADR-0018): the person enters an address and then the 6-digit code mailed from `noreply@korekore.ai`. A code works for 10 minutes and allows 5 tries; an address gets at most 5 codes an hour.
 4. The browser is redirected to `<redirect_uri>?code=<code>&state=<state>`. The daemon checks `state` and, within 2 minutes, exchanges the code once:
 
    ```text
@@ -30,7 +32,7 @@ Sign-in follows OAuth for native apps (RFC 8252) with PKCE (RFC 7636): the brows
 
    It answers `{"token":"…"}`, a session token of 43 base64url characters, or 400 `{"error":"invalid_grant"}` (wrong, expired or reused code, wrong verifier or redirect URI) or `{"error":"invalid_request"}`. A code is spent by the first try, whatever its outcome.
 
-Signing in again with the same address finds the same account. Each signed-in computer has its own session.
+Signing in again with the same GitHub user, or the same address, finds the same account; a GitHub account and an email account are never merged. Each signed-in computer has its own session.
 
 ### Sessions
 
