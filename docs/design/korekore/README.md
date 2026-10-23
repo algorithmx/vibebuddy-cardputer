@@ -137,7 +137,7 @@ The current UI (settings window, onboarding, menu bar item, box screens) is fini
 - Generate per-platform tokens from `tokens.json`: a Swift `KorekoreTheme` in `app/Sources/VibeBuddy/Korekore/`, a Rust module `desktop/src/korekore/theme.rs`, and RGB565 constants in a new `firmware-rs/core/src/korekore/` module (RGB565: `((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)`).
 - Turn `pixel/*.json` into code with a small generator in `tools/`: a Swift sprite renderer (CGImage, `.interpolation(.none)`), a Rust one for iced (RGBA `image::Handle`, `FilterMethod::Nearest`), and `static` RGB565 tables for the firmware (flash, not heap).
 - Add the UI switch in both apps (read at launch), defaulting to the current UI.
-- Done: `tools/korekore-codegen.py` writes the theme and sprites for all three (`--check` runs in CI through `tools/test_korekore_codegen.py`); `tools/korekore-fonts.py` writes the subset fonts to `fonts/korekore/`. Both font families are Japanese: about 40% of the Chinese characters the zh-Hans UI uses are not in them and fall back to the system font.
+- Done: `tools/korekore-codegen.py` writes the theme and sprites for all three (`--check` runs in CI through `tools/test_korekore_codegen.py`); `tools/korekore-fonts.py` writes the subset fonts to `fonts/korekore/`. Both font families are Japanese, so the 1,605 Chinese characters M PLUS Rounded 1c lacks are filled in from Resource Han Rounded CN (OFL) at the same weight; DotGothic16 is not filled in, and a Chinese character it lacks falls back to the system font.
 
 ### Phase 2: the korekore apps (Mac and Linux in the same PR)
 
