@@ -20,6 +20,7 @@ struct SettingsView: View {
                 )
                     .tabItem { Label("Conversation", systemImage: "bubble.left.and.bubble.right") }
             }
+            AccountView(model: model).tabItem { Label("Account", systemImage: "person.crop.circle") }
             AdvancedView(model: model).tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
         }
         .padding(20)
@@ -800,6 +801,83 @@ enum FlashConfirm {
         alert.addButton(withTitle: String(localized: "Flash"))
         alert.addButton(withTitle: String(localized: "Cancel"))
         if alert.runModal() == .alertFirstButtonReturn { flash() }
+    }
+}
+
+/// The person's VibeBuddy account (ADR-0018). The daemon keeps the session; the App only opens the browser, and the
+/// status stream says when signing in finished there.
+struct AccountView: View {
+    @ObservedObject var model: AppModel
+    /// The browser is open on the sign-in page; cleared when the status says signed in.
+    @State private var waiting = false
+
+    private var account: AccountStatus? { model.status?.account }
+
+    var body: some View {
+        Form {
+            if model.status == nil {
+                Text("The daemon isn't running. Restart it on the Advanced tab.").foregroundStyle(.secondary)
+            } else if let account, account.available {
+                if account.signedIn {
+                    Text(signedInText)
+                    HStack {
+                        Button("Sign out") { signOut() }
+                        Button("Delete account…") { confirmDelete() }
+                    }
+                } else {
+                    Text("Signing in opens your browser. Voice commands need an account.").foregroundStyle(.secondary)
+                    HStack {
+                        Button("Sign in") { signIn() }
+                        if waiting {
+                            Text("Waiting for the browser…").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } else {
+                Text("Signing in isn't available in this version of VibeBuddy.").foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: account?.signedIn) { waiting = false }
+    }
+
+    private var signedInText: String {
+        if let login = account?.githubLogin { return String(localized: "Signed in with GitHub as \(login)") }
+        if let id = account?.githubID { return String(localized: "Signed in with GitHub (user \(id))") }
+        return String(localized: "Signed in as \(account?.email ?? "")")
+    }
+
+    /// Each click starts a new sign-in; the daemon drops any unfinished one.
+    private func signIn() {
+        Task {
+            do {
+                let url = try await model.client.signIn()
+                NSWorkspace.shared.open(url)
+                waiting = true
+            } catch {
+                waiting = false
+                model.lastError = String(localized: "Couldn't sign in: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func signOut() {
+        Task {
+            do { try await model.client.signOut() } catch { model.lastError = String(localized: "Couldn't sign out: \(error.localizedDescription)") }
+        }
+    }
+
+    private func confirmDelete() {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Delete your VibeBuddy account?")
+        alert.informativeText = String(localized: "This deletes the account and everything kept about it, and signs out on every computer. It can't be undone.")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: String(localized: "Delete account")).hasDestructiveAction = true
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            do { try await model.client.deleteAccount() } catch { model.lastError = String(localized: "Couldn't delete the account: \(error.localizedDescription)") }
+        }
     }
 }
 

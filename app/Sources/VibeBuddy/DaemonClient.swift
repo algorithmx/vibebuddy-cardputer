@@ -131,6 +131,31 @@ struct DaemonClient {
         guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "Update check was rejected (\(code))")) }
     }
 
+    /// Starts signing in to the VibeBuddy account (ADR-0018): the App opens the URL, and the browser comes back to the
+    /// daemon, whose next status says signed in.
+    func signIn() async throws -> URL {
+        let (code, data) = try await post("/v1/account/sign-in")
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+        guard let text = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["url"] as? String, let url = URL(string: text) else {
+            throw DaemonError(message: String(localized: "The daemon answered \(code)"))
+        }
+        return url
+    }
+
+    func signOut() async throws { try await accountCall("/v1/account/sign-out", method: "POST") }
+
+    /// Deletes the account on the service; when the service doesn't, the daemon stays signed in.
+    func deleteAccount() async throws { try await accountCall("/v1/account", method: "DELETE") }
+
+    /// The daemon asks the service, which it gives 20 s, so this waits longer than the usual 10 s.
+    private func accountCall(_ path: String, method: String) async throws {
+        var request = request(path, method: method)
+        request.timeoutInterval = 30
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+    }
+
     func resident() async throws -> ResidentInfo {
         let (data, _) = try await URLSession.shared.data(for: request("/v1/resident"))
         return try StatusCoding.decoder().decode(ResidentInfo.self, from: data)

@@ -303,6 +303,36 @@ pub async fn resident_history(limit: usize) -> Result<Vec<Exchange>, HistoryErro
     Ok(history.exchanges)
 }
 
+/// Starts signing in to the VibeBuddy account: the daemon answers with the page to open in the browser, which comes
+/// back to the daemon, and the status stream then shows the account signed in.
+pub async fn sign_in() -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct SignIn {
+        url: String,
+    }
+    let response = reqwest::Client::new()
+        .post(format!("{BASE}/v1/account/sign-in"))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(body["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the daemon answered {status}")));
+    }
+    serde_json::from_value::<SignIn>(body).map(|sign_in| sign_in.url).map_err(|error| error.to_string())
+}
+
+/// Ends this computer's session only.
+pub async fn sign_out() -> Result<(), String> {
+    post("/v1/account/sign-out", None).await
+}
+
+/// Deletes the account and signs out everywhere; on failure the user stays signed in.
+pub async fn delete_account() -> Result<(), String> {
+    accepted(reqwest::Client::new().delete(format!("{BASE}/v1/account"))).await
+}
+
 async fn post(path: &str, body: Option<serde_json::Value>) -> Result<(), String> {
     let mut request = reqwest::Client::new().post(format!("{BASE}{path}"));
     if let Some(body) = body {
