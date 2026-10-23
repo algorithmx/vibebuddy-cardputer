@@ -41,13 +41,45 @@ The daemon sends the token as `Authorization: Bearer <token>` and keeps it in `c
 - `GET /v1/account` answers
 
   ```json
-  {"id":"…","email":"person@example.com","github_id":null,"created_at":"2026-10-22T08:00:00.000Z","today":{"day":"2026-10-22","commands":0,"replies":0}}
+  {"id":"…","email":null,"github_id":60097,"created_at":"2026-10-23T08:44:49.885Z","today":{"day":"2026-10-23","commands":1,"replies":1},"limits":{"commands":100,"replies":300}}
   ```
 
-  An account has an `email` or a `github_id`, never both. `today` counts voice in the current UTC day.
+  An account has an `email` or a `github_id`, never both. `today` counts voice in the current UTC day, and `limits` is the daily allowance.
 - `POST /v1/sign-out` revokes this session only: 204.
 - `DELETE /v1/account` deletes the account with all its sessions and usage: 204.
 
 ## Voice
 
-`POST /v0/voice/transcribe` and `POST /v0/voice/speak` need no account yet and run on staging only; they move to `/v1/voice/…` with sessions and the daily allowance in vibebuddy-cloud#7. Their bodies and answers are described in vibebuddy-cloud's README until then.
+Both calls need `Authorization: Bearer <session>` and answer 401 without a valid one. Over the Relay the box will use a voice token instead (vibebuddy-cloud#10).
+
+### Recognizing a voice command
+
+```text
+POST /v1/voice/transcribe[?language=zh]
+Content-Type: audio/wav
+
+<one turn as 16-bit mono PCM WAV, at most 2 MB>
+```
+
+It answers `{"text":"What is the weather tomorrow?","language":"English"}`. `language` (ISO 639-1) is optional; unset, the recognizer detects it, and the answer names it as the recognizer does (`English` from Groq, `en` from Workers AI). A body that isn't a WAV, or a malformed language, gets 400; a larger body 413; when every recognizer fails, 502.
+
+### Speaking a reply
+
+```text
+POST /v1/voice/speak
+{"text":"…","voice":"elevenlabs:<voice_id>"}
+```
+
+It streams back `audio/mpeg`: MPEG-2 Layer III, 24 kHz mono, 48 kbps, the only rate the box's speaker runs at; it may begin with an ID3 tag. `text` is 1 to 1000 characters. `voice` names the vendor and its voice: `elevenlabs:<voice_id>` or `volc:<speaker>` (a Doubao 1.0 voice); the daemon maps each Character to one. A bad request gets 400; a synthesis that fails before any audio 502; one that fails midway cuts the stream short.
+
+### The daily allowance
+
+Each recognition counts one command and each spoken reply one reply, against the account's UTC day: 100 commands and 300 replies (ADR-0018). A use is counted once the request is found valid. Past either limit the call gets
+
+```text
+429 {"reason":"allowance"}
+```
+
+until 00:00 UTC. `GET /v1/account` shows where the day stands.
+
+The `/v0/voice/…` calls take the same bodies without a session and run on staging only, until the daemon has moved to v1.
