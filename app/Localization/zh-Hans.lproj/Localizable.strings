@@ -346,3 +346,21 @@
 "Claude Code answers voice commands only with your own Anthropic API key. Add your key above." = "Claude Code 只用你自己的 Anthropic API 密钥回答语音指令。请在上面填入你的密钥。";
 "Or let Claude Code answer, with your own Anthropic API key: add it above." = "也可以让 Claude Code 来回答，用你自己的 Anthropic API 密钥：在上面填入即可。";
 "How to install Claude Code" = "如何安装 Claude Code";
+
+/* Account (ADR-0018) */
+"Account" = "账户";
+"Sign in" = "登录";
+"Signing in opens your browser. Voice commands need an account." = "登录会打开浏览器。语音指令需要登录账户。";
+"Waiting for the browser…" = "正在等浏览器完成登录…";
+"Signing in isn't available in this version of VibeBuddy." = "这个版本的 VibeBuddy 还不能登录。";
+"Signed in with GitHub as %@" = "已用 GitHub 账号 %@ 登录";
+"Signed in with GitHub (user %lld)" = "已用 GitHub 登录（用户 %lld）";
+"Signed in as %@" = "已用 %@ 登录";
+"Sign out" = "退出登录";
+"Delete account…" = "删除账户…";
+"Delete your VibeBuddy account?" = "删除你的 VibeBuddy 账户？";
+"This deletes the account and everything kept about it, and signs out on every computer. It can't be undone." = "这会删除账户和与它相关的所有数据，并在所有电脑上退出登录。删除后无法恢复。";
+"Delete account" = "删除账户";
+"Couldn't sign in: %@" = "登录失败：%@";
+"Couldn't sign out: %@" = "退出登录失败：%@";
+"Couldn't delete the account: %@" = "删除账户失败：%@";
