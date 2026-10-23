@@ -346,6 +346,8 @@ pub struct Status {
     pub operation: Option<Operation>,
     pub config: Config,
     pub updates: crate::updates::UpdateStatus,
+    /// The person's VibeBuddy account (ADR-0018).
+    pub account: crate::account::AccountStatus,
 }
 
 /// What the apps explain for `WIFI FAILED <why>`: `wrong_password` (the network turned the box away, which a

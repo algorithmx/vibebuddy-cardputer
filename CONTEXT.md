@@ -191,6 +191,7 @@ Fixed wording for the App's English UI and English logs. Use these words when wr
 | 触摸屏 / 点按 / 摸摸 | touchscreen / tap / pet | Only some boxes have a touchscreen; on the box's STATUS view the row is TOUCH |
 | 固件 / 刷入 | firmware / flash | |
 | 配对 / 已配对的电脑 | pair / paired computers | On the box's menu the row is COMPUTERS; "this computer" marks the one the App runs on |
+| 账户 / 登录 / 退出登录 | account / sign in / sign out | Never "log in" or "login"; the account belongs to the person, never the box |
 | UART 桥 / 原生 USB | UART bridge / native USB | |
 | 语音指令 | voice command | |
 | 常驻会话 | resident session | Not shown to users so far; in the UI the buddy is the one you talk to |

@@ -87,6 +87,11 @@ do {
     {"connected":true,"bridge":false,"wifi_seen":[{"ssid":"ByteTrade","rssi":-49}]}
     """.utf8))
     check(seen.wifiSeen == [SeenNetwork(ssid: "ByteTrade", rssi: -49)], "scan results decode")
+    check(status.account == nil, "an older daemon: no account")
+    let account = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"email":null,"github_id":583231,"github_login":"octocat"}
+    """.utf8))
+    check(account == AccountStatus(available: true, signedIn: true, githubID: 583231, githubLogin: "octocat"), "account decodes")
 } catch {
     check(false, "status decoding threw: \(error)")
 }

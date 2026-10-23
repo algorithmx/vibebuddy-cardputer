@@ -71,6 +71,7 @@ enum Tab {
     Device,
     /// Only while the daemon runs the resident session (experimental).
     Conversation,
+    Account,
     Advanced,
 }
 
@@ -175,6 +176,14 @@ enum Message {
     OpenLogsFolder,
     ShowDaemonLog,
     ExportDiagnostics,
+    /// Open the browser to sign in to the VibeBuddy account; clicking again starts over.
+    SignIn,
+    SignInUrl(Result<String, String>),
+    SignOut,
+    AskDeleteAccount(bool),
+    DeleteAccount,
+    /// Signing out or deleting the account finished; the account itself comes with the next status.
+    AccountDone(Result<(), String>),
     Done(Result<(), String>),
     Quit,
 }
@@ -252,6 +261,10 @@ struct App {
     anthropic_key_draft: String,
     /// Why the last brain or key change failed.
     resident_setting_error: Option<String>,
+    /// The browser was opened to sign in, until the status shows the account signed in.
+    signing_in: bool,
+    /// Deleting the account waits for a second click, since it can't be undone.
+    confirm_delete_account: bool,
     /// The outcome of the last action, shown at the bottom of the window.
     notice: Option<Result<String, String>>,
     /// The language picked in Settings, and, while it differs from the UI's, the offer to restart.
@@ -313,6 +326,8 @@ impl App {
             resident_info: None,
             anthropic_key_draft: String::new(),
             resident_setting_error: None,
+            signing_in: false,
+            confirm_delete_account: false,
             notice: None,
             language: UiLanguage::saved(),
             restart_offer: None,
@@ -395,6 +410,11 @@ impl App {
                     .then(|| self.pending_voice.take())
                     .flatten();
                 notify_new_firmware(&status);
+                if status.account.signed_in {
+                    self.signing_in = false;
+                } else {
+                    self.confirm_delete_account = false;
+                }
                 // Only the daemon's environment at start decides, so ask once each time it comes up.
                 let resident = if self.status.is_none() {
                     Task::perform(client::resident_enabled(), Message::Resident)
@@ -843,6 +863,33 @@ impl App {
                 let config = self.status.as_ref().map(|status| status.config.clone());
                 return Task::perform(export_diagnostics(summary, config), Message::Notice);
             }
+            Message::SignIn => return Task::perform(client::sign_in(), Message::SignInUrl),
+            Message::SignInUrl(result) => {
+                match result.and_then(|url| launch("xdg-open", &[std::ffi::OsStr::new(&url)])) {
+                    Ok(()) => self.signing_in = true,
+                    Err(error) => {
+                        self.signing_in = false;
+                        self.notice = Some(Err(tr("Couldn't sign in: %@", &[&error])));
+                    }
+                }
+            }
+            Message::SignOut => {
+                return Task::perform(client::sign_out(), |result| {
+                    Message::AccountDone(result.map_err(|error| tr("Couldn't sign out: %@", &[&error])))
+                });
+            }
+            Message::AskDeleteAccount(asking) => self.confirm_delete_account = asking,
+            Message::DeleteAccount => {
+                self.confirm_delete_account = false;
+                return Task::perform(client::delete_account(), |result| {
+                    Message::AccountDone(result.map_err(|error| tr("Couldn't delete the account: %@", &[&error])))
+                });
+            }
+            Message::AccountDone(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(Err(error));
+                }
+            }
             Message::Done(result) => {
                 // The box answers a volume change through the status stream; drop the dragged value then.
                 self.volume = None;
@@ -884,6 +931,7 @@ impl App {
             (Tab::Agents, tr("Agents", &[])),
             (Tab::Device, tr("Device", &[])),
             (Tab::Conversation, tr("Conversation", &[])),
+            (Tab::Account, tr("Account", &[])),
             (Tab::Advanced, tr("Advanced", &[])),
         ];
         // Voice commands are experimental (VIBEBUDDY_RESIDENT_SESSION=1): no tab while the daemon has them off.
@@ -899,6 +947,7 @@ impl App {
             Tab::Agents => self.agents(),
             Tab::Device => self.device(),
             Tab::Conversation => self.conversation(),
+            Tab::Account => self.account(),
             Tab::Advanced => self.advanced(),
         };
         let notice = self.notice.as_ref().map(|notice| match notice {
@@ -1851,6 +1900,49 @@ impl App {
             setting = setting.push(text(error.clone()).size(12).style(text::danger));
         }
         setting.into()
+    }
+
+    /// The VibeBuddy account (ADR-0018): the daemon keeps the session; this only opens the browser to sign in.
+    fn account(&self) -> Element<'_, Message> {
+        let Some(status) = &self.status else {
+            return text(tr("The daemon isn't running. Restart it on the Advanced tab.", &[])).size(13).into();
+        };
+        let account = &status.account;
+        if !account.available {
+            return text(tr("Signing in isn't available in this version of VibeBuddy.", &[])).size(13).into();
+        }
+        if !account.signed_in {
+            let waiting = self.signing_in.then(|| text(tr("Waiting for the browser…", &[])).size(13).style(text::secondary));
+            return column![
+                text(tr("Signing in opens your browser. Voice commands need an account.", &[])).size(13),
+                button(text(tr("Sign in", &[]))).on_press(Message::SignIn),
+            ]
+            .push(waiting)
+            .spacing(12)
+            .into();
+        }
+        let who = match (&account.github_login, account.github_id) {
+            (Some(login), _) => tr("Signed in with GitHub as %@", &[login]),
+            (None, Some(id)) => tr("Signed in with GitHub (user %lld)", &[&id]),
+            (None, None) => tr("Signed in as %@", &[&account.email.as_deref().unwrap_or("—")]),
+        };
+        let actions: Element<'_, Message> = if self.confirm_delete_account {
+            confirm_flash(
+                tr("Delete your VibeBuddy account?", &[]),
+                tr("This deletes the account and everything kept about it, and signs out on every computer. It can't be undone.", &[]),
+                tr("Delete account", &[]),
+                Some(Message::DeleteAccount),
+                Message::AskDeleteAccount(false),
+            )
+        } else {
+            row![
+                button(text(tr("Sign out", &[]))).on_press(Message::SignOut),
+                button(text(tr("Delete account…", &[]))).style(button::secondary).on_press(Message::AskDeleteAccount(true)),
+            ]
+            .spacing(8)
+            .into()
+        };
+        column![text(who), actions].spacing(12).into()
     }
 
     fn advanced(&self) -> Element<'_, Message> {

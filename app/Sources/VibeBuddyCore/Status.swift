@@ -10,8 +10,10 @@ public struct Status: Codable, Equatable {
     public var config: DaemonConfig
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     public var updates: UpdateStatus?
+    /// The person's VibeBuddy account (ADR-0018); absent from older daemons, which can't sign in.
+    public var account: AccountStatus?
 
-    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil) {
+    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil, account: AccountStatus? = nil) {
         self.daemon = daemon
         self.device = device
         self.today = today
@@ -19,6 +21,22 @@ public struct Status: Codable, Equatable {
         self.operation = operation
         self.config = config
         self.updates = updates
+        self.account = account
+    }
+}
+
+/// An account has an email or a GitHub user, never both.
+public struct AccountStatus: Codable, Equatable {
+    /// This build has a service to sign in to.
+    public var available: Bool
+    public var signedIn: Bool
+    public var email: String?
+    public var githubID: Int?
+    /// Looked up on GitHub when signing in; nil if that lookup failed.
+    public var githubLogin: String?
+    enum CodingKeys: String, CodingKey { case available, signedIn = "signed_in", email, githubID = "github_id", githubLogin = "github_login" }
+    public init(available: Bool, signedIn: Bool, email: String? = nil, githubID: Int? = nil, githubLogin: String? = nil) {
+        self.available = available; self.signedIn = signedIn; self.email = email; self.githubID = githubID; self.githubLogin = githubLogin
     }
 }
 
