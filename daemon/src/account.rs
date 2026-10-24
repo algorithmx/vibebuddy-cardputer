@@ -553,7 +553,7 @@ mod tests {
         let account_answer = format!(r#"{{"id":"a","github_id":1,"today":{{"day":"{day}","commands":7,"replies":9}},"limits":{{"commands":100,"replies":300}}}}"#);
         let (service, _) = serve(vec![(200, Box::leak(account_answer.into_boxed_str()))]);
         let account = signed_in(&service, dir.as_path());
-        let mut changes = account.watch_usage();
+        let changes = account.watch_usage();
         assert_eq!(account.status().today, None);
         account.refresh_usage().unwrap();
         assert_eq!(account.status().today, Some(Usage { day: day.clone(), commands: 7, commands_limit: 100 }));
