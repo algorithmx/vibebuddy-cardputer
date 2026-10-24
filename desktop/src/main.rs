@@ -58,7 +58,14 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription);
-    if theme::stamp().is_some() {
+    if korekore::requested() {
+        // The korekore UI's fonts, there before any window opens (ADR-0021); its own face is the default. The
+        // current UI keeps the system's, or Omarchy's.
+        for font in korekore::FONTS {
+            app = app.font(font);
+        }
+        app = app.default_font(korekore::DEFAULT_FONT);
+    } else if theme::stamp().is_some() {
         app = app.default_font(Font::with_name(OMARCHY_FONT));
     }
     app.run()
@@ -370,8 +377,6 @@ impl App {
         }
         let open = first || restarted || !cfg!(target_os = "linux");
         let task = if open { Task::done(Message::OpenSettings) } else { Task::none() };
-        // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
-        let task = if korekore::requested() { Task::batch([task, korekore::load_fonts()]) } else { task };
         (app, task)
     }
 
