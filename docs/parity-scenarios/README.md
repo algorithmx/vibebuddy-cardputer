@@ -102,7 +102,7 @@ When the Mac app changes, update the note in the same change.
 | [DEV-03](DEV-03-several-devices.md) | Several devices are plugged in: say which is the box |
 | [DEV-04](DEV-04-pin-and-not-found-help.md) | The box isn't found: the pin notice and the help |
 | [DEV-05](DEV-05-firmware-update.md) | Update the box's firmware over the cable |
-| [DEV-06](DEV-06-firmware-needs-cable.md) | Firmware actions need the cable |
+| [DEV-06](DEV-06-firmware-needs-cable.md) | Firmware actions need the cable, unless the firmware updates over the link |
 | [DEV-07](DEV-07-flash-fails.md) | A firmware flash fails |
 | [DEV-08](DEV-08-flash-needs-replug.md) | Firmware written, but the box didn't start it |
 | [DEV-09](DEV-09-foreign-firmware.md) | The box runs other firmware: flash VibeBuddy |
@@ -115,6 +115,23 @@ When the Mac app changes, update the note in the same change.
 | [DEV-16](DEV-16-wifi-change-forget.md) | Change or forget the box's network |
 | [DEV-17](DEV-17-paired-computers.md) | See and remove the computers paired with the box |
 | [DEV-18](DEV-18-box-screen.md) | See and save what the box's screen shows |
+
+### Conversation tab
+
+| Scenario | Title |
+|---|---|
+| [CONV-01](CONV-01-conversation-tab-shown.md) | The Conversation tab appears only while the daemon runs the resident session |
+| [CONV-02](CONV-02-conversation-history.md) | Read and follow the voice commands and the buddy's replies |
+| [CONV-03](CONV-03-conversation-agent-and-key.md) | Choose the Agent that answers, and store an Anthropic API key |
+| [CONV-04](CONV-04-conversation-not-ready.md) | Voice commands aren't ready: say what's missing |
+
+### Account tab
+
+| Scenario | Title |
+|---|---|
+| [ACCT-01](ACCT-01-sign-in.md) | Sign in to the VibeBuddy account through the browser |
+| [ACCT-02](ACCT-02-sign-out-and-delete.md) | Sign out, or delete the account |
+| [ACCT-03](ACCT-03-account-unavailable.md) | The Account tab when the daemon is down or can't sign in |
 
 ### Advanced tab
 
@@ -141,4 +158,4 @@ When the Mac app changes, update the note in the same change.
 |---|---|
 | [ERR-01](ERR-01-rejected-action-alert.md) | An action the daemon rejects shows an alert |
 
-70 scenarios, read from the Mac app's code on branch `linux-parity`.
+77 scenarios, read from the Mac app's code on branch `linux-parity` after merging upstream `main` at `569f892`.

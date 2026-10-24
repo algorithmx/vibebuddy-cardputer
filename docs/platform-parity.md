@@ -30,7 +30,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 
 | Area | Mac | Linux | Status |
 |---|---|---|---|
-| Tabs: General, Character, Agents, Device, Advanced | yes | yes | same |
+| Tabs: General, Character, Agents, Device, Account, Advanced, and Conversation while the daemon runs the resident session (`VIBEBUDDY_RESIDENT_SESSION=1`) | yes (`SettingsView.swift`) | yes (`main.rs`, `Tab`) | same |
 | Language override: System, English, Chinese | `AppLanguage.swift` | `i18n.rs` (`UiLanguage::ALL`) | same |
 | Launch at login | `SMAppService` (`LoginItem.swift`) | the toggle writes or hides the user's XDG autostart entry; the pacman package ships a system-wide one (`main.rs`, `set_launch_at_login`) | differs, by design |
 | Relay toggle; check for updates toggle; Check now; Report a Problem | yes | yes (Report a Problem opens the same issue URL with the diagnostics summary) | same |

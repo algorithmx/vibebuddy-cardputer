@@ -30,6 +30,10 @@ Settings → Device → Wi-Fi.
 
 - The box is on the network; a paired computer on it can drive the box without the cable.
 
+## Variations
+
+- Joining again, or a join that fails, on the network the box was last joined to: the daemon drops the old address meanwhile, so the status reads "Joining…" or the error, never the stale "Joined".
+
 ## Check on Linux
 
 - [ ] Same scan, picker, limits, password handling and status texts?

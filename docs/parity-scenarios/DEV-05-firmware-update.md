@@ -12,7 +12,7 @@ Daemon API: `POST /v1/device/firmware {"bootloader", "partition_table", "app"} (
 
 ## Initial state (input)
 
-- The box is on the cable (connected, not over the network) and runs our firmware.
+- The box runs our firmware and can be flashed: on the cable, or linked any way when its firmware takes updates over the link (`device.transfer`, ADR-0016; DEV-06).
 - `updates.firmware` is newer than the box and downloaded (`directory` set).
 
 ## Trigger
@@ -22,7 +22,7 @@ Daemon API: `POST /v1/device/firmware {"bootloader", "partition_table", "app"} (
 ## Workflow (Mac app)
 
 1. An alert "Update the box firmware to {version}?" shows the release notes in the UI language (English otherwise), then "The box restarts once; its voice pack and today's stats are kept. Over the UART bridge this takes a few minutes." Buttons Update and Cancel.
-2. Update posts the three image paths from the download folder (`bootloader.bin`, `partition-table.bin`, `vibebuddy-fw.bin`).
+2. Update posts the three image paths from the download folder (`bootloader.bin`, `partition-table.bin`, `vibebuddy-fw.bin`). The daemon sends them over the cable, or over whatever carries the link for firmware that takes updates that way.
 3. The row shows "Flashing firmware… {n}%"; the button is disabled while it runs.
 4. Done: "Firmware flashed, the box has restarted"; the Box firmware line shows the new version.
 

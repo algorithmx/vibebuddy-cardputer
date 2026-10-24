@@ -12,7 +12,7 @@ Daemon API: `POST /v1/device/firmware`
 
 ## Initial state (input)
 
-- The box is on the cable; no operation runs.
+- The box can be flashed (DEV-06); no operation runs.
 
 ## Trigger
 

@@ -24,7 +24,7 @@ Daemon API: `POST /v1/device/voice-pack`
 2. Not one to four readable images: "Pick one to four PNG or JPEG images." No figure found: "No figure found: use a plain white or transparent background."
 3. The cut-out frames are previewed; a picker "Voice and lines from" chooses which bundled Character lends its voice and lines.
 4. "Use" builds the pack with the look, the lender's lines (addressed, CHAR-07) and the id `custom`; a lender that can't lend shows "That character can't lend its voice; pick another."
-5. The look is saved to `custom-look.bin` and the lender to the app's defaults, then the pack is written as in CHAR-04.
+5. The look is saved to `custom-look.bin` and the lender to the app's defaults, then the pack is written as in CHAR-04, with `lender` and `address` query parameters: the daemon keeps them, since the pack doesn't carry who lent the voice, persona and lines.
 6. "Copy a prompt" puts a ready-made image-generator prompt on the clipboard.
 7. After a restart the card shows the last custom Character written.
 

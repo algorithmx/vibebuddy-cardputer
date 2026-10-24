@@ -19,16 +19,16 @@ The flash fails.
 ## Workflow (Mac app)
 
 1. The row shows "Failed: {daemon message}".
-2. Below it: "Before retrying, hold K0 on the box and replug the cable to put it in download mode." and Retry, enabled only on the cable.
-3. Retry flashes the offered firmware again (DEV-05).
+2. For firmware that doesn't take updates over the link: "Before retrying, hold K0 on the box and replug the cable to put it in download mode." Firmware that does carries on from where it got to, so the hint is left out.
+3. Retry, enabled when the box can be flashed (DEV-06), flashes the offered firmware again (DEV-05).
 
 ## Final state (output)
 
-- The user can put the box in download mode and retry.
+- The user can retry: from where the transfer stopped, or after putting the box in download mode.
 
 ## Check on Linux
 
-- [ ] Same failure text, K0 hint and Retry? (platform-parity.md: "retry with the K0 hint".)
+- [ ] Same failure text, the K0 hint only for firmware without `transfer`, and Retry under the same rule?
 
 ## Linux result
 
