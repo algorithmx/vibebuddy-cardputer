@@ -350,10 +350,24 @@ impl App {
         app.custom_look = custom::custom_look_file()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|look| character::look_frames(&look).map(|frames| (look, frames.iter().map(|frame| handle(frame, 2)).collect())));
+        // Debug builds only: open the korekore UI on a given section or first-run step, for checking it on a desktop
+        // without a pointer (VIBEBUDDY_KOREKORE_SECTION=device, VIBEBUDDY_KOREKORE_GUIDE=1).
+        #[cfg(debug_assertions)]
+        if app.korekore {
+            if let Ok(name) = std::env::var("VIBEBUDDY_KOREKORE_SECTION") {
+                if let Some(section) = korekore::Section::ALL.into_iter().find(|section| format!("{section:?}").eq_ignore_ascii_case(&name)) {
+                    app.tab = section.tab();
+                }
+            }
+        }
         let restarted = std::env::args().any(|arg| arg == RESTARTED || arg == SETTINGS);
         let first = first_launch();
         // The install script connected the agents and set up the start at login; the guide is for what it couldn't.
         app.guide = (first && cfg!(target_os = "linux")).then_some(0);
+        #[cfg(debug_assertions)]
+        if app.korekore {
+            app.guide = std::env::var("VIBEBUDDY_KOREKORE_GUIDE").ok().and_then(|page| page.parse().ok()).or(app.guide);
+        }
         let open = first || restarted || !cfg!(target_os = "linux");
         let task = if open { Task::done(Message::OpenSettings) } else { Task::none() };
         // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
