@@ -86,9 +86,10 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Disconnect, new PTY, device reset | Offline/reconnect status; settings and pairing key restored from the same simulated flash. |
 | Second computer paired then unpaired; self-unpair request | Pair list changes; host refuses to remove its own pairing. |
 | Wi-Fi set/scan/forget commands; synthetic scan/failure/join/address/disconnect lines | Commands reach firmware; host deduplicates/sorts scan results and clears failure/address state appropriately. No radio is simulated. |
-| Legacy voice pack and current Character pack | Stop-and-wait receipts, completed operation, saved Character selection and device storage. |
-| Corrupted pack payload; pack larger than the voices partition | Device refusal becomes failed operation; rejected data does not change the saved selection. |
-| Dropped/delayed/duplicate receipt, wrong sequence, injected `voice.error`, lost link | No next chunk before its receipt; delayed receipt resumes the write; one operation at a time; failure propagated; missing receipt times out and permits retry. |
+| Legacy voice pack and current Character pack, sent as `xfer.*` chunks (the firmware core reports `TRANSFER 1`, ADR-0016) | Completed operation, saved Character selection and device storage, kept across a box restart. |
+| A pack larger than the voices partition; an `xfer.error` partway; a second write while one runs | The box's `too_big` at `xfer.begin` fails the write before any chunk; a refusal partway fails it with the box's code and leaves the saved selection alone; the second write gets 409; a retry succeeds. |
+| Acknowledgements dropped, stale or repeated | At most 16 chunks go unacknowledged; after 20 s without an answer the daemon asks again with `xfer.begin` and the box answers with its offset, so nothing is sent twice; the furthest acknowledgement counts. |
+| An unplug partway that restarts the box | **Known gap, pinned as it is:** the restarted box answers the chunks still in flight with `sequence`, and the daemon fails the write instead of starting over. Until those stop, a retry fails the same way. Reported on #153. |
 | HTTP/SSE device updates; snapshots consumed by Linux app probe | Live status changes; real app decoder and online/offline/daemon-down tray model. |
 | Split/coalesced CRLF lines, malformed JSON/version, oversized diagnostic | Recovery to valid status without launching a source. |
 | Screenshot from the simulator; synthetic incomplete frame and malformed run | A 320×240 PNG; incomplete and malformed pixels become HTTP errors. |
@@ -143,8 +144,9 @@ flashing are separate acceptance tasks.
 
 ## Validation
 
-On the branch that brought this suite in, from `574b700`, after the review fixes: the full runner passed 61 scenarios (29
-device and host, 13 daemon outage, 12 Sway, 7 X11). Breaking each new rule on purpose (every socket counted as live, the
-agent's own processes ignored, the outage policy blind to the supervisor) failed the scenarios meant to catch it.
-`cargo test --workspace` passed, as did Clippy, with the four warnings that `574b700` already had. The localization
-check passed. No box, graphical desktop or Mac was used.
+On the branch that brought this suite in, after merging upstream `main` at `569f892`: the full runner passed 61
+scenarios (29 device and host, 13 daemon outage, 12 Sway, 7 X11). The pack-write scenarios follow the `xfer.*` protocol
+that upstream brought in; one pins the known gap above. Breaking each rule the review fixes added (every socket counted
+as live, the agent's own processes ignored, the outage policy blind to the supervisor) failed the scenarios meant to
+catch it. `cargo test --workspace` passed, as did Clippy, with the warnings `574b700` already had and one in upstream's
+`daemon/src/resident.rs`. The localization check passed. No box, graphical desktop or Mac was used.

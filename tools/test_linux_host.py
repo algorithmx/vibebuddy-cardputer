@@ -238,61 +238,89 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(snapshot["config"]["voice"], "test-character")
         self.host.wait_device(lambda device: device["voice"] == "test-character", "Character installed")
 
+    # Firmware that reports TRANSFER 1, as the firmware core does, takes packs as xfer.* chunks (ADR-0016,
+    # docs/protocol.md "Firmware and Character packs over the link").
+    def big_pack(self):
+        """A pack of 19 chunks of 3072 bytes, just past the daemon's window of 16, so a transfer can stop partway. The
+        PTY counts as a UART bridge, whose pacing makes each chunk take about half a second."""
+        return build_voice_pack("test-voice", [bytes([index, 0, index, 0]) * 2816 for index in range(5)])
+
+    def ack(self, offset):
+        return f'{{"version":1,"event":"xfer.ack","offset":{offset}}}\n'
+
     def test_pack_larger_than_the_voice_partition_is_refused(self):
         self.post("/v1/device/voice-pack", self.pack() + bytes(0x200000))
         snapshot = self.host.wait_operation("failed")
-        self.assertIn("device refused", snapshot["operation"]["message"])
-        self.assertNotIn('"event":"voice.chunk"', self.host.lines("host"))
+        self.assertIn("the box refused the image: too_big", snapshot["operation"]["message"])
+        self.assertNotIn('"event":"xfer.chunk"', self.host.lines("host"))
 
-    def test_device_crc_failure_becomes_failed_operation(self):
-        pack = bytearray(self.pack())
-        pack[-1] ^= 1
-        self.post("/v1/device/voice-pack", bytes(pack))
-        snapshot = self.host.wait_operation("failed")
-        self.assertIn("device refused", snapshot["operation"]["message"])
-        self.assertIsNone(snapshot["config"]["voice"])
-        self.post("/v1/device/voice-pack", self.pack())
-        self.host.wait_operation("done")
-
-    def test_missing_or_wrong_ack_stops_next_chunk_and_serializes_operations(self):
-        self.host.filter(drop=('{"version":1,"event":"voice.ack"',))
-        self.post("/v1/device/voice-pack", self.pack())
-        self.host.wait_line('"event":"voice.ack"')
-        self.host.emit('{"version":1,"event":"voice.ack","seq":999}\nVOLUME 55\n')
-        self.host.wait_device(lambda device: device["volume"] == 55, "wrong ack processed")
+    def test_a_refusal_partway_fails_the_write_one_at_a_time_and_a_retry_succeeds(self):
+        self.host.filter(drop=('{"version":1,"event":"xfer.ack"',))
+        self.post("/v1/device/voice-pack", self.big_pack())
+        self.host.wait_line('"event":"xfer.ack"', timeout=30)  # the box acknowledged; the daemon didn't hear it
         self.post("/v1/device/voice-pack", self.pack(), expected=409)
-        self.assertNotIn('"seq":1', self.host.lines("host"))
-        self.host.emit('{"version":1,"event":"voice.error","message":"injected write failure"}\n')
+        self.host.emit('{"version":1,"event":"xfer.error","code":"crc"}\n')
         snapshot = self.host.wait_operation("failed")
-        self.assertIn("injected write failure", snapshot["operation"]["message"])
-
-    def test_lost_receipt_times_out_and_allows_retry(self):
-        self.host.filter(drop=('{"version":1,"event":"voice.ready"',))
-        self.post("/v1/device/voice-pack", self.pack())
-        snapshot = self.host.wait_operation("failed", timeout=24)
-        self.assertIn("timed out waiting for voice.ready", snapshot["operation"]["message"])
+        self.assertIn("the box refused the image: crc", snapshot["operation"]["message"])
+        self.assertIsNone(snapshot["config"]["voice"])
         self.host.filter()
         self.post("/v1/device/voice-pack", self.pack())
-        self.host.wait_operation("done")
+        self.assertEqual(self.host.wait_operation("done")["config"]["voice"], "test-voice")
 
-    def test_delayed_duplicate_receipt_resumes_the_write(self):
-        self.host.filter(drop=('{"version":1,"event":"voice.ack"',))
-        self.post("/v1/device/voice-pack", self.pack())
-        self.host.wait_line('"event":"voice.ack"')
-        self.assertNotIn('"seq":1', self.host.lines("host"))
+    def test_the_daemon_keeps_at_most_a_window_of_chunks_unacknowledged(self):
+        self.host.filter(drop=('{"version":1,"event":"xfer.ack"',))
+        pack = self.big_pack()
+        self.post("/v1/device/voice-pack", pack)
+        wait_for(lambda: self.host.lines("host").count('"event":"xfer.chunk"') >= 16, "a window of chunks", timeout=30)
+        time.sleep(1)  # 40 chunks a second: had the daemon not stopped, more would have gone by now
+        self.assertEqual(self.host.lines("host").count('"event":"xfer.chunk"'), 16)
         self.host.filter()
-        receipt = '{"version":1,"event":"voice.ack","seq":0}\n'
-        self.host.emit(receipt + receipt)
+        self.host.emit(self.ack(16 * 3072))
+        self.assertEqual(self.host.wait_operation("done", timeout=30)["config"]["voice"], "test-voice")
+
+    def test_a_lost_acknowledgement_asks_the_box_where_it_got_to(self):
+        self.host.filter(drop=('{"version":1,"event":"xfer.ack"',))
+        self.post("/v1/device/voice-pack", self.pack())
+        self.host.wait_line('"event":"xfer.ack"')
+        self.host.filter()
+        # 20 s without an acknowledgement: the daemon sends xfer.begin again, and the box answers with its offset.
+        wait_for(lambda: self.host.lines("host").count('"event":"xfer.begin"') >= 2, "the daemon asks again", timeout=30)
+        snapshot = self.host.wait_operation("done", timeout=30)
+        self.assertEqual(snapshot["config"]["voice"], "test-voice")
+        self.assertEqual(self.host.lines("host").count('"event":"xfer.chunk"'), 1, "the chunk the box had isn't sent again")
+
+    def test_stale_and_repeated_acknowledgements_change_nothing(self):
+        self.host.filter(drop=('{"version":1,"event":"xfer.ack"',))
+        pack = self.pack()
+        self.post("/v1/device/voice-pack", pack)
+        self.host.wait_line('"event":"xfer.ack"')
+        self.host.filter()
+        # Older offsets, repeated, before the one that completes it: the daemon keeps the furthest.
+        self.host.emit(self.ack(0) + self.ack(0) + self.ack(len(pack)))
         snapshot = self.host.wait_operation("done")
         self.assertEqual(snapshot["config"]["voice"], "test-voice")
+        self.assertEqual(self.host.lines("host").count('"event":"xfer.end"'), 1)
 
-    def test_unplug_aborts_an_in_progress_write(self):
-        self.host.filter(drop=('{"version":1,"event":"voice.ready"',))
-        self.post("/v1/device/voice-pack", self.pack())
-        self.host.wait_line('"event":"voice.ready"')
+    def test_an_unplug_that_restarts_the_box_partway_fails_the_write_and_a_retry_succeeds(self):
+        # What the daemon does today, not what ADR-0016 promises. The cable powers the box, so it restarts before the
+        # replug and forgets the transfer. The daemon then sends the chunks it had in flight, the box answers
+        # `xfer.error` `sequence`, and the daemon gives up instead of starting over with `xfer.begin`. The rest of the
+        # queued chunks keep drawing `sequence`, and the daemon takes any `xfer.error` as the answer to its current
+        # transfer, so a retry started before they stop fails too. Suspected bug in daemon/src/transfer.rs, reported on
+        # #153: when it resumes, assert "done" here instead and drop the wait.
+        self.post("/v1/device/voice-pack", self.big_pack())
+        wait_for(lambda: self.host.lines("host").count('"event":"xfer.chunk"') >= 4, "the write under way", timeout=30)
         self.host.disconnect()
-        snapshot = self.host.wait_operation("failed")
-        self.assertEqual(snapshot["operation"]["message"], "link lost")
+        self.host.wait_device(lambda device: not device["connected"], "unplug")
+        self.assertEqual(self.host.status()["operation"]["state"], "running", "the write waits for the box")
+        self.host.control("reboot")
+        self.host.connect()
+        snapshot = self.host.wait_operation("failed", timeout=60)
+        self.assertIn("the box refused the image: sequence", snapshot["operation"]["message"])
+        errors = lambda: self.host.lines("device").count('"event":"xfer.error"')
+        wait_for(lambda: (before := errors()) and (time.sleep(2) or errors() == before), "the stale chunks to stop", timeout=30)
+        self.post("/v1/device/voice-pack", self.pack())
+        self.assertEqual(self.host.wait_operation("done", timeout=30)["config"]["voice"], "test-voice")
 
     def test_sse_delivers_device_changes_and_config(self):
         request = self.host.opener.open(self.host.base + "/v1/status/stream", timeout=5)
