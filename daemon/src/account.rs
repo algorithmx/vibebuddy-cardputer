@@ -10,6 +10,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// In the config directory, beside `identity`; mode 0600.
@@ -77,6 +78,8 @@ pub struct Account {
     github_api: String,
     saved: Mutex<Option<Saved>>,
     pending: Mutex<Option<Pending>>,
+    /// Whether signed in, for whoever must follow it: the status stream and the box's offer of voice.
+    signed_in: watch::Sender<bool>,
 }
 
 impl Account {
@@ -84,6 +87,7 @@ impl Account {
     pub fn new(base: Option<String>, config_dir: Option<&Path>, port: u16) -> Self {
         let file = config_dir.map(|dir| dir.join(ACCOUNT_FILE));
         let saved = file.as_deref().and_then(load);
+        let (signed_in, _) = watch::channel(saved.is_some());
         Self {
             base,
             file,
@@ -91,7 +95,13 @@ impl Account {
             github_api: "https://api.github.com".to_owned(),
             saved: Mutex::new(saved),
             pending: Mutex::new(None),
+            signed_in,
         }
+    }
+
+    /// Changes each time the account is signed in or out, from here or by the service refusing the session.
+    pub fn watch(&self) -> watch::Receiver<bool> {
+        self.signed_in.subscribe()
     }
 
     #[cfg(test)]
@@ -111,8 +121,7 @@ impl Account {
         }
     }
 
-    /// The session for calls to the service (#161), when signed in.
-    #[allow(dead_code)]
+    /// The session for calls to the service, when signed in.
     pub fn token(&self) -> Option<String> {
         self.saved.lock().unwrap().as_ref().map(|saved| saved.token.clone())
     }
@@ -207,9 +216,9 @@ impl Account {
         self.keep(None)
     }
 
-    /// The service no longer takes the session (a 401): signed out (#161).
-    #[allow(dead_code)]
+    /// The service no longer takes the session (a 401): signed out.
     pub fn forget(&self) {
+        warn!("the service no longer takes the session; signed out");
         if let Err(error) = self.keep(None) {
             warn!(%error, "couldn't remove the account file");
         }
@@ -225,7 +234,9 @@ impl Account {
             },
         };
         written.map_err(|error| AccountError::Service(format!("couldn't write {}: {error}", file.display())))?;
+        let signed_in = saved.is_some();
         *self.saved.lock().unwrap() = saved;
+        self.signed_in.send_if_modified(|was| std::mem::replace(was, signed_in) != signed_in);
         Ok(())
     }
 
@@ -237,6 +248,14 @@ impl Account {
         }
         serde_json::from_str::<serde_json::Value>(&text).ok()?["login"].as_str().map(str::to_owned)
     }
+}
+
+/// An account signed in with `token`, its file in `dir`, for other modules' tests.
+#[cfg(test)]
+pub fn signed_in_for_tests(dir: &Path, token: &str) -> Account {
+    std::fs::create_dir_all(dir).unwrap();
+    crate::resident_claude::write_private(&dir.join(ACCOUNT_FILE), &serde_json::json!({"token": token, "github_id": 1}).to_string()).unwrap();
+    Account::new(Some("http://127.0.0.1:9".to_owned()), Some(dir), 7331)
 }
 
 fn load(path: &Path) -> Option<Saved> {
