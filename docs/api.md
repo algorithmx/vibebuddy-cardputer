@@ -72,6 +72,15 @@ POST /v1/voice/speak
 
 It streams back `audio/mpeg`: MPEG-2 Layer III, 24 kHz mono, 48 kbps, the only rate the box's speaker runs at; it may begin with an ID3 tag. `text` is 1 to 1000 characters. `voice` names the vendor and its voice: `elevenlabs:<voice_id>` or `volc:<speaker>` (a Doubao 1.0 voice); the daemon maps each Character to one. A bad request gets 400; a synthesis that fails before any audio 502; one that fails midway cuts the stream short.
 
+### Speaking a Character's line
+
+```text
+POST /v1/voice/speak
+{"text":"…","voice":"elevenlabs:<voice_id>","for":"character"}
+```
+
+A line for a Character the user is making (ADR-0020). It streams back `audio/pcm;rate=16000`: 16 kHz mono 16-bit little-endian PCM, which the daemon trims, normalizes and packs as ADPCM. Only the Paid plan gets it; on Free the call gets `403 {"reason":"plan"}`. It counts its characters only against the monthly allowance, never the daily replies; past it the call gets `429 {"reason":"monthly"}` until the next period. A synthesis failure is 502: lines never come in another voice.
+
 ### The daily allowance
 
 Each recognition counts one command and each spoken reply one reply, against the account's UTC day. On Free that is 20 commands and 20 replies; on the Paid plan, 100 commands, and spoken replies count their characters against the monthly allowance first (ADR-0020). The reply that crosses the monthly allowance still passes; after it, replies count against Free's daily replies until the period ends. The service sets the numbers. A use is counted once the request is found valid. Past either limit the call gets
