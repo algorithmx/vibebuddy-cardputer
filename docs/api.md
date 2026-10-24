@@ -41,10 +41,10 @@ The daemon sends the token as `Authorization: Bearer <token>` and keeps it in `c
 - `GET /v1/account` answers
 
   ```json
-  {"id":"…","email":null,"github_id":60097,"created_at":"2026-10-23T08:44:49.885Z","today":{"day":"2026-10-23","commands":1,"replies":1},"limits":{"commands":100,"replies":300}}
+  {"id":"…","email":null,"github_id":60097,"created_at":"2026-10-23T08:44:49.885Z","plan":{"name":"free"},"today":{"day":"2026-10-23","commands":1,"replies":1},"limits":{"commands":20,"replies":20}}
   ```
 
-  An account has an `email` or a `github_id`, never both. `today` counts voice in the current UTC day, and `limits` is the daily allowance.
+  An account has an `email` or a `github_id`, never both. `plan` is `{"name":"free"}` or `{"name":"paid","period_end":"…"}` (ADR-0020). `today` counts voice in the current UTC day, and `limits` is the daily allowance of the account's plan.
 - `POST /v1/sign-out` revokes this session only: 204.
 - `DELETE /v1/account` deletes the account with all its sessions and usage: 204.
 
@@ -74,7 +74,7 @@ It streams back `audio/mpeg`: MPEG-2 Layer III, 24 kHz mono, 48 kbps, the only r
 
 ### The daily allowance
 
-Each recognition counts one command and each spoken reply one reply, against the account's UTC day: 100 commands and 300 replies (ADR-0018). A use is counted once the request is found valid. Past either limit the call gets
+Each recognition counts one command and each spoken reply one reply, against the account's UTC day. On Free that is 20 commands and 20 replies; on the Paid plan, 100 commands and, until the monthly allowance, Free's replies (ADR-0020). The service sets the numbers. A use is counted once the request is found valid. Past either limit the call gets
 
 ```text
 429 {"reason":"allowance"}
