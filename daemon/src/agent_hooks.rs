@@ -70,7 +70,7 @@ pub fn apply(tracker: &mut ActivityTracker, hook: AgentHook) -> Option<Event> {
             None,
         ),
     };
-    let event = match hook.event.as_str() {
+    let mut event = match hook.event.as_str() {
         "working" => {
             // A new turn replaces the previous one; repeats within the turn only keep it alive.
             if !tracker.has_activity(&id) {
@@ -87,6 +87,9 @@ pub fn apply(tracker: &mut ActivityTracker, hook: AgentHook) -> Option<Event> {
         _ => None,
     };
     tracker.associate_source(&id, source);
+    if let Some(event) = event.as_mut() {
+        tracker.refresh_cards(event);
+    }
     event
 }
 

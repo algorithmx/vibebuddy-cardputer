@@ -343,6 +343,12 @@ enum Mode {
 
 /// Lines held while a session comes up; past this the oldest go, as on a full cable.
 const HELD_LINES: usize = 64;
+/// A box known to speak Noise that hasn't opened a session this long after a link gets a handshake from this side:
+/// its `link.noise` may never come (it missed `linked` while it restarted, or the line was lost). IK lets the
+/// computer start, since it knows the box's key.
+const FIRST_HANDSHAKE_AFTER: Duration = Duration::from_secs(3);
+/// And again this often while no session comes up.
+const HANDSHAKE_AGAIN_AFTER: Duration = Duration::from_secs(10);
 
 /// Runs the linked socket behind a byte stream: lines written to the stream go out as `data`, `data`
 /// from the box comes back as lines, sealed once the box opens a session. The stream ends when the box
@@ -372,6 +378,10 @@ where
     let mut held: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let hello = serde_json::to_string(&vibebuddy_protocol::Event::named("device.hello")).unwrap_or_default();
     let data = |line: &str| Message::text(json!({"t": "data", "line": line}).to_string());
+    // When this side last started a handshake, or the link (re)started; and whether it has started one since.
+    let mut attempt = (tokio::time::Instant::now(), false);
+    let mut nudge = tokio::time::interval(Duration::from_secs(1));
+    nudge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             message = source.next() => {
@@ -387,6 +397,7 @@ where
                                 if noise_link::opener_key(line) == Some(noise.box_key) {
                                     match noise_link::start(&noise.identity, &noise.box_key, b"{}") {
                                         Ok((handshake, first)) => {
+                                            attempt = (tokio::time::Instant::now(), true);
                                             mode = Mode::Handshaking(Box::new(handshake));
                                             if sink.send(data(&first)).await.is_err() {
                                                 break;
@@ -406,9 +417,12 @@ where
                                     }
                                     Mode::Waiting => continue,
                                     Mode::Handshaking(handshake) => {
+                                        // Not the answer to this handshake: one of a session the box is ending, or the
+                                        // answer to an earlier handshake when both sides started at once. The box
+                                        // answers a handshake it can't take with link.noise, so wait for that.
                                         let Ok(mut session) = handshake.finish(line) else {
-                                            warn!("the box didn't prove its key through the Relay");
-                                            break;
+                                            debug!("a line that doesn't finish the handshake, waiting for the box to start over");
+                                            continue;
                                         };
                                         if let Some(memory) = &noise.memory {
                                             memory.learned(&noise.box_key);
@@ -462,6 +476,7 @@ where
                                     }
                                 } else {
                                     mode = Mode::Waiting;
+                                    attempt = (tokio::time::Instant::now(), false);
                                 }
                             }
                             Some("unlinked") => {
@@ -527,8 +542,29 @@ where
                     warn!("the Relay went quiet, reconnecting");
                     break;
                 }
-                if sink.send(Message::Ping(Vec::new().into())).await.is_err() {
+                // The Relay can't see ping frames; while lines are held for a session, nothing else shows it this
+                // computer is there, and after 75 s it would drop the link as silent.
+                if sink.send(Message::Ping(Vec::new().into())).await.is_err() || sink.send(Message::text(PING)).await.is_err() {
                     break;
+                }
+            }
+            _ = nudge.tick() => {
+                let due = if attempt.1 { HANDSHAKE_AGAIN_AFTER } else { FIRST_HANDSHAKE_AFTER };
+                if matches!(mode, Mode::Waiting | Mode::Handshaking(_)) && box_here && knows_noise() && attempt.0.elapsed() >= due {
+                    debug!("no session yet, starting the handshake from this side");
+                    match noise_link::start(&noise.identity, &noise.box_key, b"{}") {
+                        Ok((handshake, first)) => {
+                            attempt = (tokio::time::Instant::now(), true);
+                            mode = Mode::Handshaking(Box::new(handshake));
+                            if sink.send(data(&first)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "couldn't start a session with the box");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -754,6 +790,11 @@ mod tests {
     /// when linked, then answers every sealed line with the line in upper case, sealed. What it saw in the clear
     /// goes to `clear`.
     async fn noise_relay(computer: [u8; 32], clear: Arc<std::sync::Mutex<Vec<String>>>) -> (String, [u8; 32]) {
+        noise_relay_opening(computer, clear, true).await
+    }
+
+    /// [`noise_relay`], with `opens` false for a box that never says link.noise, as one that missed `linked`.
+    async fn noise_relay_opening(computer: [u8; 32], clear: Arc<std::sync::Mutex<Vec<String>>>, opens: bool) -> (String, [u8; 32]) {
         use vibebuddy_firmware_core::link::Link;
         use vibebuddy_firmware_core::noise;
         let mut link = Link::new([1; 32]);
@@ -770,7 +811,9 @@ mod tests {
             socket.send(say(json!({"t": "welcome"}))).await.unwrap();
             let _link = socket.next().await;
             socket.send(say(json!({"t": "linked"}))).await.unwrap();
-            socket.send(say(json!({"t": "data", "line": noise::opener(&link.public_key())}))).await.unwrap();
+            if opens {
+                socket.send(say(json!({"t": "data", "line": noise::opener(&link.public_key())}))).await.unwrap();
+            }
             let mut session = None;
             while let Some(Ok(message)) = socket.next().await {
                 let Message::Text(text) = message else { continue };
@@ -825,6 +868,26 @@ mod tests {
         stream.read_to_string(&mut received).await.unwrap();
         assert_eq!(received, "{\"VERSION\":1,\"EVENT\":\"DEVICE.HELLO\"}\n{\"VERSION\":1,\"EVENT\":\"BYE\"}\n");
         assert!(clear.lock().unwrap().is_empty(), "nothing went in the clear: {:?}", clear.lock().unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_box_that_never_opens_gets_a_handshake_from_this_side() {
+        let identity = Arc::new(identity());
+        let (url, box_key) = noise_relay_opening(computer_key(&identity), Arc::new(std::sync::Mutex::new(Vec::new())), false).await;
+        let config = RelayConfig::new(identity, Some(url), false);
+        let dir = std::env::temp_dir().join(format!("vibebuddy-relay-nudge-{}", std::process::id()));
+        let memory = Memory::new(&dir);
+        memory.learned(&box_key);
+        let takeover = AtomicBool::new(false);
+        let mut busy = |_: String, _: String| {};
+        let wait = Wait { takeover: &takeover, busy: &mut busy, give_up: &|| false, presence: Arc::new(|_| {}), memory: Some(memory) };
+        let stream = link(&config, &box_key, wait).await.unwrap();
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        let started = tokio::time::Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(10), lines.next_line()).await.expect("a session within seconds");
+        assert_eq!(first.unwrap().unwrap(), "{\"VERSION\":1,\"EVENT\":\"DEVICE.HELLO\"}");
+        assert!(started.elapsed() >= FIRST_HANDSHAKE_AFTER - Duration::from_millis(500), "it gives the box a moment first");
         let _ = std::fs::remove_dir_all(dir);
     }
 

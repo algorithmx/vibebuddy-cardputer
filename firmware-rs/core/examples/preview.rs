@@ -58,7 +58,7 @@ impl Preview {
     }
 
     fn show(&mut self, state: State, title: Option<&[u8]>, tasks: &[TaskInput]) {
-        let _ = self.display.show_tasks(&mut self.screen, &scene!(self), state, title, tasks);
+        let _ = self.display.show_tasks(&mut self.screen, &scene!(self), state, title, tasks, tasks.len());
     }
 }
 
@@ -124,12 +124,13 @@ fn main() {
     preview.snapshot("pomodoro_idle");
 
     let tasks = [
-        TaskInput { title: Some(b"CC:POMODORO TIMER FEATURE"), state: State::Working, elapsed_s: 75, project: Some(b"AGENT-BEACON") },
+        TaskInput { title: Some(b"CC:POMODORO TIMER FEATURE"), state: State::Working, elapsed_s: 75, project: Some(b"AGENT-BEACON"), id: None, icon: None },
         TaskInput {
             title: Some(b"CX:EROS-TRAINING-INFRA"),
             state: State::InputRequired,
             elapsed_s: 900,
             project: Some(b"EROS-TRAINING-INFRA"),
+            id: None, icon: None,
         },
     ];
     preview.show(State::InputRequired, Some(b"CC:AGENT-BEACON"), &tasks);
@@ -187,9 +188,9 @@ fn main() {
     // Three cards: the state label keeps clear of the last one.
     preview.display.set_muted(&mut preview.screen, &scene!(preview), false);
     let three = [
-        TaskInput { title: Some(b"CC:UPDATE README"), state: State::Working, elapsed_s: 20, project: Some(b"VIBEBUDDY") },
-        TaskInput { title: Some(b"CX:BUILD FIRMWARE"), state: State::Working, elapsed_s: 60, project: Some(b"VIBEBUDDY") },
-        TaskInput { title: Some(b"CI:APP TESTS"), state: State::Working, elapsed_s: 120, project: Some(b"VIBEBUDDY") },
+        TaskInput { title: Some(b"CC:UPDATE README"), state: State::Working, elapsed_s: 20, project: Some(b"VIBEBUDDY"), id: None, icon: None },
+        TaskInput { title: Some(b"CX:BUILD FIRMWARE"), state: State::Working, elapsed_s: 60, project: Some(b"VIBEBUDDY"), id: None, icon: None },
+        TaskInput { title: Some(b"CI:APP TESTS"), state: State::Working, elapsed_s: 120, project: Some(b"VIBEBUDDY"), id: None, icon: None },
     ];
     preview.show(State::Working, None, &three);
     preview.snapshot("pet_three_tasks");

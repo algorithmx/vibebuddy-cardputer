@@ -357,6 +357,17 @@ impl Voices {
     pub fn writing(&self) -> bool {
         self.session.is_some()
     }
+
+    /// The partition is about to be rewritten by a transfer ([`crate::transfer`]): no pack until [`Self::reload`], so
+    /// announcements use the built-in voice and the robot stands in for the look.
+    pub fn set_aside(&mut self) {
+        self.pack = None;
+    }
+
+    /// Reads and checks the partition again, after a transfer wrote it or gave up; false leaves the built-in voice.
+    pub fn reload(&mut self, flash: &mut dyn Flash) -> bool {
+        self.validate(flash)
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,22 @@ pub struct Status {
     pub config: Config,
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     pub updates: Option<Updates>,
+    /// The VibeBuddy account this computer is signed in to (ADR-0018); older daemons don't say, which reads as not
+    /// available.
+    pub account: Account,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Account {
+    /// This build of the daemon has a service to sign in to.
+    pub available: bool,
+    pub signed_in: bool,
+    /// An account has an email or a GitHub user, never both.
+    pub email: Option<String>,
+    pub github_id: Option<u64>,
+    /// Looked up on GitHub when signing in; the service keeps only the id.
+    pub github_login: Option<String>,
 }
 
 /// The daemon's view of updates; which firmware to offer is its call, as on the Mac.
@@ -167,6 +183,8 @@ pub struct Device {
     pub candidates: Vec<Candidate>,
     /// The box's key (ADR-0012); none for firmware that can't pair, or from an older daemon.
     pub box_key: Option<String>,
+    /// The firmware takes updates over any link (ADR-0016): no cable, no download mode.
+    pub transfer: bool,
     /// This computer's key, to tell it apart in `paired_computers`.
     pub computer_key: Option<String>,
     pub paired_computers: Vec<PairedComputer>,
@@ -434,6 +452,19 @@ mod tests {
         same.firmware.as_mut().unwrap().newer_than_box = false;
         assert!(!same.firmware_update_available());
         assert!(!Updates::default().firmware_update_available());
+    }
+
+    #[test]
+    fn the_account_reads_as_not_available_from_an_older_daemon() {
+        let status: Status = serde_json::from_str(LIVE).expect("status");
+        assert_eq!(status.account, Account::default());
+        assert!(!status.account.available);
+        let account: Account = serde_json::from_str(
+            r#"{"available": true, "signed_in": true, "email": null, "github_id": 60097, "github_login": "octocat"}"#,
+        )
+        .expect("account");
+        assert!(account.available && account.signed_in);
+        assert_eq!((account.github_id, account.github_login.as_deref(), account.email), (Some(60097), Some("octocat"), None));
     }
 
     #[test]

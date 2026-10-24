@@ -1,4 +1,6 @@
+mod account;
 mod activity;
+mod app_server;
 mod ci;
 mod agent_hooks;
 mod claude_hooks;
@@ -8,15 +10,22 @@ mod identity;
 mod lan;
 mod noise_link;
 mod relay;
+mod resident;
+mod resident_claude;
 mod link_alert;
 mod occasions;
+mod persona;
 mod rom_flasher;
 mod screenshot;
 mod serial_transport;
 mod session_titles;
 mod source_opener;
+mod speech;
 mod status;
+mod transfer;
+mod synthesis;
 mod updates;
+mod voice;
 mod voice_writer;
 mod window_focus;
 
@@ -96,8 +105,18 @@ struct AppState {
     updates: Arc<Mutex<Updates>>,
     /// "Check for updates" pressed: checks now instead of waiting for the daily one.
     check_updates: Arc<Notify>,
+    /// The resident session voice commands go to (ADR-0017); None without a state directory, and in tests
+    /// unless one sets it. Present even when switched off, so its hook events are still recognised.
+    resident: Option<Arc<resident::Resident>>,
+    /// Voice commands from the box (ADR-0017): its recording, and the turn being answered.
+    voice: Arc<voice::Voice>,
     /// The box on the cable said `LINK NOISE` since its last `BOX KEY` (ADR-0015).
     noise_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// What the App said about the Character pack it last wrote (who lends a custom one, the form of address),
+    /// kept in [`persona::RECORD_FILE`] in the state directory.
+    written: Arc<Mutex<persona::Written>>,
+    /// The person's VibeBuddy account (ADR-0018); unavailable in tests unless one sets it.
+    account: Arc<account::Account>,
 }
 
 impl AppState {
@@ -132,7 +151,11 @@ impl AppState {
             state_dir: None,
             updates: Arc::new(Mutex::new(Updates::new(None, None))),
             check_updates: Arc::new(Notify::new()),
+            resident: None,
+            voice: Arc::new(voice::Voice::new(None, None)),
             noise_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            written: Arc::default(),
+            account: Arc::new(account::Account::new(None, None, 7331)),
         }
     }
 
@@ -160,6 +183,7 @@ impl AppState {
             operation: self.operation.lock().await.clone(),
             config: self.config.lock().await.clone(),
             updates,
+            account: self.account.status(),
         }
     }
 
@@ -249,7 +273,32 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
+    state.account = Arc::new(account::Account::new(
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        config::config_dir().as_deref(),
+        bind_address.port(),
+    ));
     state.state_dir = config::state_dir();
+    if let Some(dir) = &state.state_dir {
+        state.written = Arc::new(Mutex::new(persona::Written::load(&dir.join(persona::RECORD_FILE))));
+    }
+    state.resident =state.state_dir.as_deref().map(|dir| {
+        let enabled = resident::enabled_by_env();
+        if enabled {
+            warn!("the experimental resident session is on");
+        }
+        let resident = resident::Resident::new(enabled, dir, resident::Launcher::Codex, state.activities.clone());
+        Arc::new(match config::config_dir() {
+            Some(config) => resident.with_settings_file(config.join(resident::SETTINGS_FILE)),
+            None => resident,
+        })
+    });
+    let session = Some(state.account.clone());
+    state.voice = Arc::new(voice::Voice::new(speech::from_env(session.clone()), state.resident.clone()).with_synthesizer(synthesis::from_env(session)));
+    if let Some(resident) = state.resident.clone() {
+        let wearing = wearing(&state).await;
+        tokio::spawn(async move { resident.warm(&wearing).await });
+    }
     state.device.lock().await.pin = pin;
     state.updates = Arc::new(Mutex::new(Updates::new(
         updates::Source::configured(),
@@ -267,6 +316,10 @@ async fn main() {
     tokio::spawn(poll_ci(state.clone()));
     tokio::spawn(handle_device_events(state.clone(), device_events));
     tokio::spawn(check_for_updates(state.clone()));
+    if let Some(resident) = state.resident.clone().filter(|resident| resident.enabled()) {
+        follow_resident_readiness(&state, resident);
+    }
+    follow_account(&state);
     // On macOS the app reports a lost link; elsewhere there is no app, so the daemon does it.
     if !cfg!(target_os = "macos") {
         tokio::spawn(link_alert::watch(state.clone()));
@@ -364,6 +417,9 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     {
         lan::remember(&lan::box_address_file(dir), address.trim());
     }
+    if let DeviceMessage::Line(line) = &message {
+        handle_voice_line(state, line).await;
+    }
     let _ = state.device_bus.send(message.clone());
     // Ask right after connecting; the device reports its mode, firmware build and voice again.
     if matches!(message, DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. } | DeviceMessage::ConnectedRelay { .. }) {
@@ -374,9 +430,94 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
     };
     if is_k2_press(&event) {
         open_k2_source(state).await;
+    } else if let Some(card) = tapped_card(&event) {
+        open_card_source(state, card).await;
     } else if !event.event.starts_with("voice.") && event.event != "echo" {
         info!(event = %event.event, "ignoring unbound device event");
     }
+}
+
+/// Voice commands (docs/protocol.md, "Voice commands"): offered on every report of the box's build, which follows
+/// hello on each new link and every reboot, and taken over native USB or the local network. The box sends no audio
+/// over the UART bridge, which is too slow for it, and over the Relay it will talk to the voice service itself, so
+/// voice isn't offered on either, and voice lines over the Relay are ignored.
+async fn handle_voice_line(state: &AppState, line: &str) -> Option<tokio::task::JoinHandle<()>> {
+    let (over_relay, on_bridge) = {
+        let device = state.device.lock().await;
+        (device.relay, device.bridge)
+    };
+    if line.contains(serial_transport::BUILD_MARKER) && state.voice.available() {
+        if over_relay {
+            info!("voice commands not offered: the box is reached through the Relay");
+        } else if on_bridge {
+            info!("voice commands not offered: the box is on the UART bridge, which can't carry its audio; use its native USB port");
+        } else {
+            send_event(state, voice::available_event(true));
+        }
+    }
+    if !line.starts_with("VOICE ") {
+        return None;
+    }
+    if over_relay {
+        tracing::debug!("ignoring a voice line over the Relay");
+        return None;
+    }
+    state.voice.handle_line(line, &state.transport, &wearing(state).await)
+}
+
+/// What the buddy wears for spoken replies: the Character the box reported wearing, before it has the one last
+/// written to it, with what the App said when it wrote it (a custom Character's lender, the form of address).
+async fn wearing(state: &AppState) -> persona::Wearing {
+    let reported = state.device.lock().await.voice.clone();
+    let id = match reported {
+        Some(id) => Some(id),
+        None => state.config.lock().await.voice.clone(),
+    };
+    persona::Wearing::of(id, &*state.written.lock().await)
+}
+
+/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness or the account flipped
+/// (the user's Codex installed or gone, logged in or out). Told `false`, a long K0 gives up the Pomodoro phase as it
+/// did before voice. Never over the Relay or the UART bridge, where voice is never offered.
+async fn offer_voice_again(state: &AppState) {
+    let (booted, over_relay, on_bridge) = {
+        let device = state.device.lock().await;
+        (device.connected && device.firmware_build.is_some(), device.relay, device.bridge)
+    };
+    if booted && !over_relay && !on_bridge {
+        let on = state.voice.available();
+        info!(on, "voice readiness changed; telling the box whether voice is on");
+        send_event(state, voice::available_event(on));
+    }
+}
+
+/// Signing in or out, here or by the service refusing the session, changes the status and whether voice works.
+fn follow_account(state: &AppState) {
+    let mut changes = state.account.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+            offer_voice_again(&follower).await;
+        }
+    });
+}
+
+/// Checks the resident session's readiness every [`resident::READINESS_TTL`] and tells the box each time it flips.
+fn follow_resident_readiness(state: &AppState, resident: Arc<resident::Resident>) {
+    let mut flips = resident.watch_ready();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while flips.changed().await.is_ok() {
+            offer_voice_again(&follower).await;
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            resident.check_readiness().await;
+            tokio::time::sleep(resident::READINESS_TTL).await;
+        }
+    });
 }
 
 async fn open_k2_source(state: &AppState) {
@@ -403,6 +544,24 @@ async fn open_k2_source(state: &AppState) {
                 Err(error) => warn!(%error, "K2 failed to open source, trying the next candidate"),
             }
         }
+    }
+}
+
+/// A tap on a task card on a box with a touchscreen (ADR-0019): the card's id.
+fn tapped_card(event: &Event) -> Option<&str> {
+    (event.event == "focus").then(|| event.extra.get("task").and_then(|value| value.as_str())).flatten()
+}
+
+/// Opens the agent behind a tapped card. If it has ended since, or has nothing to open, nothing happens: opening
+/// something other than what was tapped would be more confusing than nothing.
+async fn open_card_source(state: &AppState, card: &str) {
+    let Some(source) = state.activities.lock().await.card_source(card) else {
+        info!(%card, "a tapped card's activity is gone or has no source");
+        return;
+    };
+    match source_opener::open(source).await {
+        Ok(link) => info!(%link, "opened a tapped card's source"),
+        Err(error) => warn!(%error, "failed to open a tapped card's source"),
     }
 }
 
@@ -500,6 +659,15 @@ fn app(state: AppState) -> Router {
         .route("/v1/device/firmware", post(post_firmware))
         .route("/v1/daemon/restart", post(post_restart))
         .route("/v1/updates/check", post(post_check_updates))
+        .route("/v1/resident", get(get_resident))
+        .route("/v1/resident/say", post(post_resident_say))
+        .route("/v1/resident/history", get(get_resident_history))
+        .route("/v1/resident/brain", axum::routing::put(put_resident_brain))
+        .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
+        .route("/v1/account", axum::routing::delete(delete_account))
+        .route("/v1/account/sign-in", post(post_sign_in))
+        .route("/v1/account/callback", get(get_account_callback))
+        .route("/v1/account/sign-out", post(post_sign_out))
         .with_state(state)
 }
 
@@ -667,6 +835,20 @@ fn report_progress(state: &AppState, fraction: f32, message: Option<String>) {
             if let Some(message) = message {
                 operation.message = message;
             }
+        }
+        state.notify_status();
+    });
+}
+
+/// Changes only what a running operation says, as when an update waits for the link.
+fn report_message(state: &AppState, message: &str) {
+    let state = state.clone();
+    let message = message.to_owned();
+    tokio::spawn(async move {
+        if let Some(operation) = state.operation.lock().await.as_mut()
+            && operation.state == OperationState::Running
+        {
+            operation.message = message;
         }
         state.notify_status();
     });
@@ -848,9 +1030,18 @@ async fn post_choice(
     (StatusCode::ACCEPTED, Json(ApiResponse { accepted: true, message: "remembered".to_owned() }))
 }
 
+/// What the App may say about a Character pack it writes, which the pack itself doesn't carry: the preset lending a
+/// custom Character its voice, persona and lines, and the form of address its lines were made with.
+#[derive(Default, serde::Deserialize)]
+struct PackQuery {
+    lender: Option<String>,
+    address: Option<String>,
+}
+
 /// Write a voice pack: the request body is the pack itself. The write runs in the background with progress in the status stream.
 async fn post_voice_pack(
     State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<PackQuery>,
     body: Bytes,
 ) -> (StatusCode, Json<ApiResponse>) {
     let Some(voice) = voice_writer::voice_id_of(&body) else {
@@ -867,14 +1058,37 @@ async fn post_voice_pack(
     let task_state = state.clone();
     tokio::spawn(async move {
         let progress_state = task_state.clone();
-        let result = voice_writer::write_pack(task_state.transport.clone(), bus, pack, move |fraction| {
-            report_progress(&progress_state, fraction, None);
-        })
-        .await;
+        // Firmware that takes transfers gets the pack that way: windowed, resumable, over any link (ADR-0016).
+        let over_the_link = task_state.device.lock().await.transfer;
+        let result = if over_the_link {
+            let resuming_state = task_state.clone();
+            transfer::send_image(
+                task_state.transport.clone(),
+                bus,
+                "character",
+                pack,
+                move |fraction| report_progress(&progress_state, fraction, None),
+                move || report_message(&resuming_state, "waiting for the link to come back"),
+            )
+            .await
+            .and_then(|done| done.extra.get("voice").and_then(|voice| voice.as_str()).map(str::to_owned).ok_or_else(|| "the box didn't say which Character it has".to_owned()))
+        } else {
+            voice_writer::write_pack(task_state.transport.clone(), bus, pack, move |fraction| {
+                report_progress(&progress_state, fraction, None);
+            })
+            .await
+        };
         match result {
             Ok(written) => {
                 info!(voice = %written, "voice pack written to device");
                 task_state.save_config(|config| config.voice = Some(written.clone())).await;
+                let record = persona::Written { id: Some(written.clone()), lender: query.lender, address: query.address };
+                if let Some(dir) = &task_state.state_dir
+                    && let Err(error) = record.save(&dir.join(persona::RECORD_FILE))
+                {
+                    warn!(%error, "failed to save what the App said about the Character");
+                }
+                *task_state.written.lock().await = record;
                 task_state
                     .set_operation(Some(Operation {
                         kind: OperationKind::VoicePack,
@@ -937,6 +1151,12 @@ async fn post_firmware(
     let (port, bridge) = {
         let device = state.device.lock().await;
         match &device.port {
+            // Firmware that takes images over the link gets one that way, over whichever it is: it can roll back,
+            // and it needs no cable (ADR-0016). The bootloader and partition table never change after the OTA layout.
+            Some(_) if device.connected && device.transfer => {
+                drop(device);
+                return update_over_the_link(state, segments).await;
+            }
             Some(_) if device.connected && device.network => {
                 return (
                     StatusCode::CONFLICT,
@@ -999,6 +1219,67 @@ async fn post_firmware(
 /// plugging in) stays there until it loses power, with a dark screen. Only the firmware's own `DISPLAY READY` proves it
 /// booted; until then the flash isn't done, and if it never comes the user has to replug the box. The replug wait has no
 /// deadline: a stale `replug` would keep the app's onboarding from ever showing the box as found, however late it boots.
+/// How long a box updated over the link may take to come back: restart, Wi-Fi, and the daemon finding it again.
+const OTA_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
+/// Long enough for an image that fails before confirming itself to restart and be rolled back (seen on a box: about 2 s).
+const OTA_SETTLE: Duration = Duration::from_secs(8);
+
+/// Sends the app image over the link (ADR-0016), then waits for the box to come back on it. Success is the box
+/// reporting its build again without `FIRMWARE ROLLED BACK`.
+async fn update_over_the_link(state: AppState, segments: Vec<rom_flasher::Segment>) -> (StatusCode, Json<ApiResponse>) {
+    let Some(image) = segments.into_iter().find(|segment| segment.address == 0x10000).map(|segment| segment.data) else {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { accepted: false, message: "no app image".to_owned() }));
+    };
+    if let Some(refused) = begin_operation(&state, OperationKind::Firmware, "sending the firmware to the box".to_owned()).await {
+        return refused;
+    }
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        let bus = task_state.device_bus.subscribe();
+        let progress_state = task_state.clone();
+        let resuming_state = task_state.clone();
+        let result = transfer::send_image(
+            task_state.transport.clone(),
+            bus,
+            "firmware",
+            image,
+            move |fraction| report_progress(&progress_state, fraction * 0.95, Some("sending the firmware to the box".to_owned())),
+            move || report_message(&resuming_state, "waiting for the link to come back"),
+        )
+        .await;
+        let firmware = |state, progress, message: &str| Some(Operation { kind: OperationKind::Firmware, state, progress, message: message.to_owned() });
+        if let Err(error) = result {
+            warn!(%error, "firmware update over the link failed");
+            task_state.set_operation(firmware(OperationState::Failed, 0.0, &error)).await;
+            return;
+        }
+        info!("firmware sent over the link, waiting for the box to restart");
+        // Forget the old build, so only what the box reports after its restart counts.
+        task_state.device.lock().await.firmware_build = None;
+        task_state.set_operation(firmware(OperationState::Running, 0.95, "waiting for the box to restart")).await;
+        if !wait_for_firmware_build(&task_state, OTA_BOOT_TIMEOUT).await {
+            task_state.set_operation(firmware(OperationState::Failed, 0.0, "the box didn't come back after the update")).await;
+            return;
+        }
+        // On the cable the new image reports its build before it confirms itself; one that fails in between restarts
+        // at once, and the bootloader goes back. Over the network the box is reached only after it confirmed. So the
+        // answer that counts is the one after a short wait, and the rollback comes right after its build.
+        tokio::time::sleep(OTA_SETTLE).await;
+        if !wait_for_firmware_build(&task_state, OTA_BOOT_TIMEOUT).await {
+            task_state.set_operation(firmware(OperationState::Failed, 0.0, "the box didn't come back after the update")).await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if task_state.device.lock().await.rolled_back {
+            warn!("the new firmware didn't confirm itself; the box went back");
+            task_state.set_operation(firmware(OperationState::Failed, 0.0, "the update didn't take; the box went back to its previous firmware")).await;
+        } else {
+            task_state.set_operation(firmware(OperationState::Done, 1.0, "updated, box restarted")).await;
+        }
+    });
+    (StatusCode::ACCEPTED, Json(ApiResponse { accepted: true, message: "sending the firmware to the box".to_owned() }))
+}
+
 async fn await_first_boot(state: &AppState, boot_timeout: Duration) {
     let firmware = |state, message: &str| Some(Operation { kind: OperationKind::Firmware, state, progress: 1.0, message: message.to_owned() });
     state.set_operation(firmware(OperationState::Running, "waiting for the box to restart")).await;
@@ -1198,6 +1479,16 @@ async fn post_codex_hook(
     State(state): State<AppState>,
     Json(hook): Json<CodexHook>,
 ) -> (StatusCode, Json<ApiResponse>) {
+    // The resident session is an Agent, but never an Activity: no card, announcement or stats (ADR-0017).
+    if let Some(resident) = &state.resident
+        && resident.owns_hook(&hook.session_id, hook.thread_id.as_deref(), hook.cwd.as_deref())
+    {
+        tracing::debug!(event = %hook.hook_event_name, "ignoring a hook from the resident session");
+        return (
+            StatusCode::ACCEPTED,
+            Json(ApiResponse { accepted: true, message: "resident session, ignored".to_owned() }),
+        );
+    }
     state.hooks_seen.lock().await.codex = Some(chrono::Local::now());
     state.notify_status();
     let event = {
@@ -1215,6 +1506,16 @@ async fn post_claude_hook(
     State(state): State<AppState>,
     Json(hook): Json<ClaudeHook>,
 ) -> (StatusCode, Json<ApiResponse>) {
+    // The resident session on Claude Code is never an Activity either (ADR-0017).
+    if let Some(resident) = &state.resident
+        && resident.owns_claude_hook(&hook.session_id, hook.cwd.as_deref())
+    {
+        tracing::debug!(event = %hook.hook_event_name, "ignoring a Claude Code hook from the resident session");
+        return (
+            StatusCode::ACCEPTED,
+            Json(ApiResponse { accepted: true, message: "resident session, ignored".to_owned() }),
+        );
+    }
     state.hooks_seen.lock().await.claude = Some(chrono::Local::now());
     state.notify_status();
     let event = {
@@ -1270,6 +1571,244 @@ async fn forward(state: AppState, event: Option<Event>) -> (StatusCode, Json<Api
     post_event(State(state), Json(event)).await
 }
 
+#[derive(serde::Deserialize)]
+struct SayRequest {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct ResidentInfo {
+    enabled: bool,
+    thread_id: Option<String>,
+    /// Goes up when a voice command's turn ends or the thread changes; the Conversation tab polls it.
+    revision: u64,
+    /// On, and the user's Codex was last found installed and logged in: voice commands can be taken.
+    ready: bool,
+    /// What is missing when it is on but not ready: `codex_missing`, `codex_logged_out`, `claude_missing` or
+    /// `anthropic_key_missing`.
+    problem: Option<resident::Problem>,
+    /// The brain voice commands go to while ready: `codex` or `claude`.
+    brain: Option<resident::Brain>,
+    /// The user's setting: `auto`, `codex` or `claude`.
+    brain_setting: resident::BrainChoice,
+    /// Whether an Anthropic API key is stored; the key itself is never sent back.
+    anthropic_key_set: bool,
+}
+
+/// Asking checks the resident session's readiness again when the last check is older than
+/// [`resident::READINESS_TTL`]; it never starts the app-server or Claude Code.
+async fn get_resident(State(state): State<AppState>) -> Json<ResidentInfo> {
+    let Some(resident) = state.resident.as_ref() else {
+        return Json(ResidentInfo {
+            enabled: false,
+            thread_id: None,
+            revision: 0,
+            ready: false,
+            problem: None,
+            brain: None,
+            brain_setting: resident::BrainChoice::default(),
+            anthropic_key_set: false,
+        });
+    };
+    let readiness = resident.check_readiness().await;
+    let on = resident.enabled();
+    Json(ResidentInfo {
+        enabled: on,
+        thread_id: resident.thread_id(),
+        revision: resident.revision(),
+        ready: resident.ready(),
+        problem: if on { readiness.problem } else { None },
+        brain: if resident.ready() { readiness.brain } else { None },
+        brain_setting: resident.brain_setting(),
+        anthropic_key_set: resident.anthropic_key_set(),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct BrainRequest {
+    brain: resident::BrainChoice,
+}
+
+/// Sets which brain the resident session runs on. Its own endpoint, kept out of `PUT /v1/config`.
+async fn put_resident_brain(State(state): State<AppState>, Json(request): Json<BrainRequest>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(resident) = state.resident.clone() else {
+        return no_state_directory();
+    };
+    if let Err(error) = resident.set_brain(request.brain).await {
+        warn!(%error, "failed to save the resident session's brain setting");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response();
+    }
+    get_resident(State(state)).await.into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AnthropicKeyRequest {
+    api_key: String,
+}
+
+/// Stores the user's Anthropic API key for Claude Code (mode 0600, in its own file); it is never sent back or
+/// logged. Its own endpoint, so an App that doesn't know it can't wipe it.
+async fn put_anthropic_key(State(state): State<AppState>, Json(request): Json<AnthropicKeyRequest>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if request.api_key.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { accepted: false, message: "api_key is empty".to_owned() })).into_response();
+    }
+    set_anthropic_key(state, Some(request.api_key)).await
+}
+
+async fn delete_anthropic_key(State(state): State<AppState>) -> axum::response::Response {
+    set_anthropic_key(state, None).await
+}
+
+async fn set_anthropic_key(state: AppState, key: Option<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(resident) = state.resident.clone() else {
+        return no_state_directory();
+    };
+    if let Err(error) = resident.set_anthropic_key(key).await {
+        warn!(%error, "failed to save the Anthropic API key");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response();
+    }
+    get_resident(State(state)).await.into_response()
+}
+
+#[derive(Serialize)]
+struct SignInResponse {
+    url: String,
+}
+
+/// Starts signing in to the VibeBuddy account (ADR-0018): the App opens the URL in the browser, which comes back to
+/// [`get_account_callback`].
+async fn post_sign_in(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.account.start() {
+        Ok(url) => Json(SignInResponse { url }).into_response(),
+        Err(error) => account_refusal(&error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+}
+
+async fn get_account_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CallbackQuery>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let account = state.account.clone();
+    let result = match (query.code, query.state) {
+        (Some(code), Some(sign_in)) => tokio::task::spawn_blocking(move || account.finish(&code, &sign_in))
+            .await
+            .unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))),
+        _ => Err(account::AccountError::UnknownSignIn),
+    };
+    if let Err(error) = &result {
+        warn!(%error, "signing in to the account failed");
+    }
+    state.notify_status();
+    let (status, page) = account::callback_page(&result);
+    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), axum::response::Html(page))
+}
+
+async fn post_sign_out(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.sign_out()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "signed out".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+async fn delete_account(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.delete()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "account deleted".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+fn account_refusal(error: &account::AccountError) -> (StatusCode, Json<ApiResponse>) {
+    let status = match error {
+        account::AccountError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        account::AccountError::NotSignedIn => StatusCode::CONFLICT,
+        account::AccountError::UnknownSignIn => StatusCode::BAD_REQUEST,
+        account::AccountError::Service(_) => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(ApiResponse { accepted: false, message: error.to_string() }))
+}
+
+fn no_state_directory() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse { accepted: false, message: "no state directory".to_owned() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+/// The last voice commands and their spoken replies, read from the resident thread (default 5, at most 50).
+async fn get_resident_history(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<HistoryQuery>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(resident) = state.resident.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse { accepted: false, message: "no state directory".to_owned() }))
+            .into_response();
+    };
+    match resident.history(query.limit.unwrap_or(5).clamp(1, 50)).await {
+        Ok(exchanges) => Json(serde_json::json!({"thread_id": resident.thread_id(), "exchanges": exchanges})).into_response(),
+        Err(error) => {
+            let status = match error {
+                resident::ResidentError::Disabled => StatusCode::NOT_FOUND,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response()
+        }
+    }
+}
+
+/// One voice command, typed for now: waits for the resident session's spoken replies.
+async fn post_resident_say(State(state): State<AppState>, Json(request): Json<SayRequest>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(resident) = state.resident.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse { accepted: false, message: "no state directory".to_owned() }))
+            .into_response();
+    };
+    let text = request.text.trim();
+    if text.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse { accepted: false, message: "text is empty".to_owned() })).into_response();
+    }
+    let started = std::time::Instant::now();
+    match resident.say(text, &wearing(&state).await).await {
+        Ok(answer) => {
+            info!(elapsed_ms = started.elapsed().as_millis() as u64, replies = answer.replies.len(), "voice command answered");
+            Json(serde_json::json!({
+                "thread_id": answer.thread_id,
+                "replies": answer.replies,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            warn!(%error, "voice command failed");
+            let status = match error {
+                resident::ResidentError::Disabled => StatusCode::NOT_FOUND,
+                resident::ResidentError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1306,6 +1845,31 @@ mod tests {
             SessionTitles::disabled(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn the_account_routes_answer_without_a_service() {
+        let state = test_state(Arc::new(RecordingTransport::default()));
+        let response = post_sign_in(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = post_sign_out(State(state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!state.snapshot().await.account.available);
+    }
+
+    #[tokio::test]
+    async fn a_callback_this_daemon_did_not_start_shows_a_refusal_page() {
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        let dir = std::env::temp_dir().join(format!("vibebuddy-callback-{}", std::process::id()));
+        state.account = Arc::new(account::Account::new(Some("http://127.0.0.1:9".to_owned()), Some(&dir), 7331));
+        let callback = |code: Option<&str>, sign_in: Option<&str>| {
+            get_account_callback(State(state.clone()), axum::extract::Query(CallbackQuery { code: code.map(Into::into), state: sign_in.map(Into::into) }))
+        };
+        let (status, page) = callback(Some("c"), Some("forged")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.0.contains("Not signed in"));
+        assert_eq!(callback(None, None).await.0, StatusCode::BAD_REQUEST);
+        assert!(!state.snapshot().await.account.signed_in);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1445,6 +2009,95 @@ mod tests {
         panic!("event {index} never showed up");
     }
 
+    #[tokio::test]
+    async fn the_resident_sessions_own_hooks_make_no_card_announcement_or_stats() {
+        let dir = std::env::temp_dir().join(format!("vibebuddy-main-resident-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = test_state(transport.clone());
+        state.resident = Some(Arc::new(resident::Resident::new(
+            false,
+            &dir,
+            resident::Launcher::Codex,
+            state.activities.clone(),
+        )));
+        let resident_cwd = dir.join("resident").display().to_string();
+        for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
+            let hook: CodexHook = serde_json::from_value(serde_json::json!({
+                "session_id": "resident-thread",
+                "turn_id": "t1",
+                "hook_event_name": event,
+                "cwd": resident_cwd,
+            }))
+            .unwrap();
+            let _ = post_codex_hook(State(state.clone()), Json(hook)).await;
+        }
+        assert!(transport.events().is_empty());
+        assert!(state.activities.lock().await.summaries().is_empty());
+        assert_eq!(state.activities.lock().await.today().done, 0);
+
+        // Any other Codex session still counts.
+        let hook: CodexHook = serde_json::from_value(serde_json::json!({
+            "session_id": "work",
+            "turn_id": "t1",
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": "/work/vibe-buddy",
+        }))
+        .unwrap();
+        let _ = post_codex_hook(State(state.clone()), Json(hook)).await;
+        assert_eq!(state.activities.lock().await.summaries().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_resident_claude_sessions_hooks_make_no_card_and_the_key_is_never_sent_back() {
+        let dir = resident::tests::temp_dir("main-claude");
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = test_state(transport.clone());
+        let claude = resident_claude::tests::script();
+        state.resident = Some(Arc::new(
+            resident::tests::resident(&dir, &resident::tests::logged_in(), state.activities.clone())
+                .with_claude(resident_claude::tests::brain(&dir, &claude, state.activities.clone())),
+        ));
+
+        let request = AnthropicKeyRequest { api_key: " ".to_owned() };
+        assert_eq!(put_anthropic_key(State(state.clone()), Json(request)).await.status(), StatusCode::BAD_REQUEST);
+        let request = AnthropicKeyRequest { api_key: "sk-ant-secret".to_owned() };
+        let response = put_anthropic_key(State(state.clone()), Json(request)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["anthropic_key_set"], true);
+        assert!(!String::from_utf8_lossy(&body).contains("sk-ant-secret"));
+        let request = BrainRequest { brain: resident::BrainChoice::Claude };
+        let response = put_resident_brain(State(state.clone()), Json(request)).await;
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((info["brain_setting"].as_str(), info["brain"].as_str(), info["ready"].as_bool()), (Some("claude"), Some("claude"), Some(true)));
+
+        let resident = state.resident.clone().unwrap();
+        resident.say("hi", &persona::Wearing::default()).await.unwrap();
+        let session = resident.thread_id().unwrap();
+        for event in ["UserPromptSubmit", "Stop"] {
+            let hook: ClaudeHook = serde_json::from_value(serde_json::json!({
+                "session_id": session,
+                "prompt_id": "p1",
+                "hook_event_name": event,
+                "cwd": dir.join("resident").display().to_string(),
+            }))
+            .unwrap();
+            let _ = post_claude_hook(State(state.clone()), Json(hook)).await;
+        }
+        assert!(transport.events().is_empty());
+        assert!(state.activities.lock().await.summaries().is_empty());
+
+        let response = delete_anthropic_key(State(state.clone())).await;
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((info["anthropic_key_set"].as_bool(), info["problem"].as_str()), (Some(false), Some("anthropic_key_missing")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn the_app_version_leads_the_build_identity() {
         assert_eq!(
@@ -1452,6 +2105,118 @@ mod tests {
             "0.3.0 abc1234 2026-09-16 10:50"
         );
         assert_eq!(build_identity_from(None, "abc1234", ""), "abc1234");
+    }
+
+    /// A recognizer that is never called: these tests only look at whether voice is offered.
+    struct SilentRecognizer;
+
+    impl speech::Recognizer for SilentRecognizer {
+        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, speech::RecognitionError> {
+            Ok(speech::Transcript::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_is_offered_after_each_build_report_but_never_over_the_relay_or_the_uart_bridge() {
+        let dir = std::env::temp_dir().join(format!("vibebuddy-voice-offer-{}", std::process::id()));
+        let offers = |transport: &RecordingTransport| {
+            transport.events().iter().filter(|event| event.event == "voice.available").map(|event| event.extra["on"].clone()).collect::<Vec<_>>()
+        };
+        let build = || DeviceMessage::Line("DISPLAY READY BUILD v9 2026-10-01".to_owned());
+        for enabled in [true, false] {
+            let transport = Arc::new(RecordingTransport::default());
+            let mut state = test_state(transport.clone());
+            let resident = Arc::new(resident::Resident::new(enabled, &dir, resident::Launcher::Codex, Arc::default()));
+            resident.note(None);
+            state.voice = Arc::new(voice::Voice::new(Some(Arc::new(SilentRecognizer)), Some(resident)));
+
+            publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
+            assert!(offers(&transport).is_empty(), "a new link starts with voice off");
+            publish_device_message(&state, build()).await;
+            // The box rebooting on the same link reports its build again, and forgets.
+            publish_device_message(&state, build()).await;
+            publish_device_message(&state, DeviceMessage::ConnectedNetwork { address: "192.168.1.23:7340".to_owned() }).await;
+            publish_device_message(&state, build()).await;
+            let expected = if enabled { vec![serde_json::json!(true); 3] } else { Vec::new() };
+            assert_eq!(offers(&transport), expected);
+
+            publish_device_message(&state, DeviceMessage::ConnectedRelay { url: "wss://relay.example".to_owned() }).await;
+            publish_device_message(&state, build()).await;
+            assert_eq!(offers(&transport), expected, "not over the Relay");
+            // The box sends no audio over the UART bridge.
+            publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.wchusbserial1".to_owned(), bridge: true, usb_serial: None }).await;
+            publish_device_message(&state, build()).await;
+            assert_eq!(offers(&transport), expected, "not over the UART bridge");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_box_is_told_each_time_the_resident_session_becomes_ready_or_stops_being() {
+        let dir = resident::tests::temp_dir("main-readiness-offer");
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = test_state(transport.clone());
+        let resident = Arc::new(resident::tests::resident(&dir, &resident::tests::logged_in(), Arc::default()));
+        state.resident = Some(resident.clone());
+        state.voice = Arc::new(voice::Voice::new(Some(Arc::new(SilentRecognizer)), Some(resident.clone())));
+        let offers = || {
+            transport.events().iter().filter(|event| event.event == "voice.available").map(|event| event.extra["on"].clone()).collect::<Vec<_>>()
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(50));
+        let build = || DeviceMessage::Line("DISPLAY READY BUILD v9 2026-10-01".to_owned());
+
+        publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
+        publish_device_message(&state, build()).await;
+        assert!(offers().is_empty(), "not offered before the session is found ready");
+
+        // The first check finds Codex installed and logged in.
+        follow_resident_readiness(&state, resident.clone());
+        settle().await;
+        assert_eq!(offers(), [serde_json::json!(true)]);
+        resident.note(Some(resident::Problem::CodexLoggedOut));
+        settle().await;
+        assert_eq!(offers(), [serde_json::json!(true), serde_json::json!(false)], "withdrawn when the user logs out");
+        resident.note(Some(resident::Problem::CodexMissing));
+        settle().await;
+        assert_eq!(offers().len(), 2, "still not ready: nothing new to tell");
+
+        // Never over the UART bridge, where voice isn't offered at all.
+        publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.wchusbserial1".to_owned(), bridge: true, usb_serial: None }).await;
+        publish_device_message(&state, build()).await;
+        resident.note(None);
+        settle().await;
+        assert_eq!(offers().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_resident_info_carries_a_revision_without_starting_the_app_server() {
+        let dir = resident::tests::temp_dir("main-revision");
+        let script = resident::tests::logged_in();
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.resident = Some(Arc::new(resident::tests::resident(&dir, &script, Arc::default())));
+
+        let Json(info) = get_resident(State(state.clone())).await;
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "thread_id": null,
+                "revision": 0,
+                "ready": true,
+                "problem": null,
+                "brain": "codex",
+                "brain_setting": "auto",
+                "anthropic_key_set": false,
+            })
+        );
+        assert_eq!(script.lock().unwrap().starts, 0, "asking never starts the app-server");
+
+        state.resident.as_ref().unwrap().say("hi", &persona::Wearing::default()).await.unwrap();
+        let Json(info) = get_resident(State(state.clone())).await;
+        assert_eq!(info.thread_id.as_deref(), Some("new-thread"));
+        assert_eq!(info.revision, 2, "a new thread and one turn");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -1572,6 +2337,10 @@ mod tests {
         assert!(transport.events().is_empty());
     }
 
+    fn no_query() -> axum::extract::Query<PackQuery> {
+        axum::extract::Query(PackQuery::default())
+    }
+
     fn sample_pack(voice: &str, payload_len: usize) -> Vec<u8> {
         let mut pack = vec![0_u8; 256 + payload_len];
         pack[0..4].copy_from_slice(b"VBVP");
@@ -1586,9 +2355,10 @@ mod tests {
     async fn writing_a_voice_pack_waits_for_each_acknowledgement() {
         let transport = Arc::new(RecordingTransport::default());
         let state = test_state(transport.clone());
-        let pack = sample_pack("hsiaoyu", 1000); // 1256 bytes → two chunks
+        let pack = sample_pack("custom", 1000); // 1256 bytes → two chunks
 
-        let (status, _) = post_voice_pack(State(state.clone()), Bytes::from(pack.clone())).await;
+        let query = PackQuery { lender: Some("ada".to_owned()), address: Some("boss".to_owned()) };
+        let (status, _) = post_voice_pack(State(state.clone()), axum::extract::Query(query), Bytes::from(pack.clone())).await;
         assert_eq!(status, StatusCode::ACCEPTED);
 
         let begin = nth_event(&transport, 0).await;
@@ -1613,7 +2383,7 @@ mod tests {
         let end = nth_event(&transport, 3).await;
         assert_eq!(end.event, "voice.end");
 
-        publish_device_message(&state, device_event(r#"{"version":1,"event":"voice.written","voice":"hsiaoyu"}"#)).await;
+        publish_device_message(&state, device_event(r#"{"version":1,"event":"voice.written","voice":"custom"}"#)).await;
         for _ in 0..200 {
             if state.operation.lock().await.as_ref().map(|op| op.state) == Some(OperationState::Done) {
                 break;
@@ -1622,7 +2392,12 @@ mod tests {
         }
         let operation = state.operation.lock().await.clone().expect("an operation should be recorded");
         assert_eq!(operation.state, OperationState::Done);
-        assert_eq!(state.config.lock().await.voice.as_deref(), Some("hsiaoyu"));
+        assert_eq!(state.config.lock().await.voice.as_deref(), Some("custom"));
+        // What the App said about it is kept: the custom Character speaks with Ada's persona and calls the user boss.
+        assert_eq!(
+            wearing(&state).await,
+            persona::Wearing { character: Some("ada".to_owned()), address: Some("boss".to_owned()) }
+        );
     }
 
     #[tokio::test]
@@ -1630,7 +2405,7 @@ mod tests {
         let transport = Arc::new(RecordingTransport::default());
         let state = test_state(transport.clone());
         let pack = sample_pack("hsiaoyu", 100);
-        let _ = post_voice_pack(State(state.clone()), Bytes::from(pack)).await;
+        let _ = post_voice_pack(State(state.clone()), no_query(), Bytes::from(pack)).await;
         nth_event(&transport, 0).await;
         publish_device_message(
             &state,
@@ -1653,10 +2428,10 @@ mod tests {
     async fn a_second_write_is_refused_while_one_is_running_and_garbage_is_rejected() {
         let transport = Arc::new(RecordingTransport::default());
         let state = test_state(transport.clone());
-        let (status, _) = post_voice_pack(State(state.clone()), Bytes::from_static(b"not a pack")).await;
+        let (status, _) = post_voice_pack(State(state.clone()), no_query(), Bytes::from_static(b"not a pack")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        let _ = post_voice_pack(State(state.clone()), Bytes::from(sample_pack("a", 10))).await;
-        let (status, _) = post_voice_pack(State(state.clone()), Bytes::from(sample_pack("b", 10))).await;
+        let _ = post_voice_pack(State(state.clone()), no_query(), Bytes::from(sample_pack("a", 10))).await;
+        let (status, _) = post_voice_pack(State(state.clone()), no_query(), Bytes::from(sample_pack("b", 10))).await;
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
@@ -1695,6 +2470,14 @@ mod tests {
         use chrono::TimeZone;
         let now = chrono::Local.with_ymd_and_hms(2026, 9, 15, 23, 59, 0).unwrap();
         assert_eq!(local_day(&now), 20260915);
+    }
+
+    #[test]
+    fn a_focus_event_names_the_tapped_card() {
+        let event: Event = serde_json::from_str(r#"{"version":1,"event":"focus","task":"0d4e77c3"}"#).expect("focus event should parse");
+        assert_eq!(tapped_card(&event), Some("0d4e77c3"));
+        let button: Event = serde_json::from_str(r#"{"version":1,"event":"button","button":"K2","action":"press"}"#).expect("button event should parse");
+        assert_eq!(tapped_card(&button), None);
     }
 
     #[test]

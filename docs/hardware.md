@@ -65,9 +65,19 @@ A probe firmware, flashed to the app slot only, scanned I2C0 (SDA GPIO48, SCL GP
 
 - **Some boxes have a capacitive touchscreen, some don't.** On `30:ED:A0:A4:0D:08` the chip at `0x2E` answers the CHSC5432 protocol from ALIENTEK's BOX3 touch notes: write a 32-bit big-endian register address, then read. Touch events are at `0x2000002C`, read as 28 bytes; the chip ID is at `0x20000080`. While the user touched and swiped, byte 1 was the number of points (`01` down, `00` up), bytes 2–3 the low bytes of the coordinates, which moved with the finger, and byte 6 the event (`00` down, `80` moving, `40` up). It worked straight after power-on, with no reset pulse; where its RST and INT lines go on this board is still unknown. A plain read without a register address returns all `0xFF`.
 - On `FC:01:2C:CF:C8:DC` nothing answers at `0x2E`, nor at the other common touch addresses (`0x14`, `0x15`, `0x38`, `0x5D`), and the ID read fails. Either its screen has no touch layer or the touch flex isn't connected.
-- **So touch can't be assumed.** Firmware that uses it must probe `0x2E` at boot and fall back to the buttons when nothing answers.
+- **So touch can't be assumed.** The firmware probes `0x2E` at boot (a read of the ID register), reports `TOUCH CHSC5432` or `TOUCH NONE`, and reads the touch report every 20 ms on a box that has one (ADR-0019, [`device-menu.md`](device-menu.md#touch)). The report's point count is byte 1; each point's low coordinate bytes are bytes 2 and 3 and their high nibbles byte 5, as ALIENTEK's driver reads them.
 - `0x1E`, `0x50` and `0x6A` were only seen answering; their identities above are guesses from common parts at those addresses, not read from the chips.
 - Dragon's daily box (`98:88:E0:06:8B:CC`) hasn't been probed.
+
+### Microphone (2026-10-13)
+
+`device.mic.record` ([`firmware-bringup.md`](firmware-bringup.md#microphone)) recorded 5 s on box `30:ED:A0:A4:0D:08` (the one with the touchscreen): `MIC CAPTURED 5175 MS 480000 BYTES`, CRC correct.
+
+- The microphone is on the **ES8311's own ADC**. The ES8311 answers at 0x18 with chip ID `8311` (registers 0xFD, 0xFE); nothing answers at 0x40–0x43, so there is **no ES7210** on this box.
+- Samples come in on **GPIO47** (I2S DIN), clocked by the speaker's BCLK GPIO21 and WS GPIO13 (24 kHz, 16-bit, two slots), with the ES8311 set up as esp_codec_dev does (register 0x44 = 0x58).
+- The **left slot** is the microphone: dragon spoke close to the box and confirmed by ear that the recording is that voice. The right slot is the DAC reference and stays silent while the box doesn't speak (peak 908 raw, about -133 dBFS once the DC offset is removed).
+- Levels at the default 30 dB gain, per 250 ms on the left: -31 to -35 dBFS while speaking close, -43 dBFS in a pause. That is quiet; real use needs more gain (up to 42 dB in the ES8311's PGA).
+- Other boxes, including dragon's daily box, haven't been recorded.
 
 ## Corroboration from the currently running firmware
 
@@ -81,5 +91,5 @@ The hardware runs `xiaozhi` 1.9.4. The source at that pinned version contains an
 - Vendor schematic, BSP, and examples matching the exact PCB revision.
 - Touch controller wiring (RST, INT) on boxes that have one; whether a box has one is decided by probing `0x2E` (see above).
 - The chips at `0x1E`, `0x50` and `0x6A`.
-- Microphone input chain.
+- The microphone on other boxes (verified on `30:ED:A0:A4:0D:08` only, see above).
 - Buzzer GPIO and active level.

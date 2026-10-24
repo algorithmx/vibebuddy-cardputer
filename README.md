@@ -34,9 +34,11 @@ Screen captures from a real box running the Rust firmware. Status scenes use exa
 
 It has three modes:
 
-- **On duty** (the default): watches your agents and calls you when something happens.
+- **On duty** (the default): watches your agents and calls you when something happens. Each running task gets a card with its agent's icon, three to a page; with more, the pages turn by themselves.
 - **Pomodoro**: a focus timer, 25 minutes of focus and 5 of break. K0 starts, pauses and resumes, and a long press gives up; K1 switches between On duty and Pomodoro, and a long press opens the box's menu (volume, mute, status); K2 still takes you to the agent's window, and a long press mutes. Each phase ends with a chime and a spoken line, and the next one waits for you to press K0. Today's finished sessions and focus time are kept on the box, reset daily, and survive a restart.
 - **Leisure**: after On duty has been idle long enough, the buddy goes off to play. After five minutes it starts little skits (patrolling, kicking a ball, reading, counting stars, hide-and-seek, startling itself awake, talking in its sleep); after half an hour it gets sleepy and dims; at night, after 90 minutes of sleep, it turns the backlight off. Any agent activity or button press brings it straight back on duty.
+
+Some boxes have a touchscreen. On one, tap a task card to go to that agent's window (K2 goes to the most pressing one), swipe up or down to see more cards, tap a row of the box's menu to pick it, tap a key hint at the bottom of the menu to press that key or outside the menu to close it, and tap the buddy to pet it. Everything else stays on the keys, which work the same on every box.
 
 Pomodoro runs entirely on the box: its timer and today's tally keep going without the Mac. Leisure's state also lives in the firmware, but it needs a live link to the daemon: if the box hears nothing from the Mac for 15 seconds it counts the link as lost, and Leisure returns to On duty until the link is back. Design notes: [`docs/pomodoro.md`](docs/pomodoro.md) and [`docs/leisure.md`](docs/leisure.md).
 
@@ -255,6 +257,8 @@ cargo run -p vibebuddyd
 ```
 
 By default it only listens on `127.0.0.1:7331` and finds the box by its Espressif USB Serial/JTAG ID, `VID:PID 303A:1001`. `VIBEBUDDY_BIND` changes the listen address, `VIBEBUDDY_SERIAL_PORT` names a serial port explicitly, and `VIBEBUDDY_USB_SERIAL` picks one box among several identical ones; without it, the daemon connects to the box that has reported VibeBuddy firmware to it before, and when none of several devices is that box, the app asks which one is. Either variable shows up in the app's Device tab, so a pin left set can't pass for a missing box. A box running other firmware, such as Muse, is written nothing. HTTP `202 Accepted` means the event entered the bounded send queue; whether the box actually received it is what the daemon logs from the box's reply.
+
+Voice commands are experimental and off by default: `VIBEBUDDY_RESIDENT_SESSION=1` turns on the resident session, and with a speech recognizer configured the box gets push-to-talk on a long K0. Your own Codex answers, or, if you'd rather, your own Claude Code with your own Anthropic API key (a Claude subscription can't be used). While it is on, Settings has a Conversation tab, on the Mac and on Linux, with your last voice commands and the buddy's spoken replies, which Agent answers, and the API key. See [`docs/resident-session.md`](docs/resident-session.md).
 
 The app normally supervises the daemon. On a development machine without the app you can install it as a LaunchAgent with [`packaging/com.vibebuddy.vibebuddyd.plist`](packaging/com.vibebuddy.vibebuddyd.plist), but don't run both: they'd fight over the serial port. For the app, the daemon also serves `GET /v1/status`, SSE `/v1/status/stream`, `/v1/config`, `/v1/device/{identify,volume,choice,screenshot,voice-pack,firmware}` and `/v1/daemon/restart`.
 

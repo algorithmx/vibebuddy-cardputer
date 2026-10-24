@@ -34,9 +34,11 @@ VibeBuddy 是给 AI 编程 Agent 配的桌面宠物。它住在键盘旁一个�
 
 它有三个模式：
 
-- **值班**（默认）：盯着 Agent，有事叫你。
+- **值班**（默认）：盯着 Agent，有事叫你。每个进行中的任务一张卡，带着它所属 Agent 的图标，一页三张；多于三张时自动翻页。
 - **番茄钟**：给你计时，专注 25 分钟、休息 5 分钟。K0 开始、暂停、继续，长按放弃；K1 在值班与番茄钟之间切换，长按打开盒子上的菜单（音量、静音、状态）；K2 照旧带你回到 Agent 所在的窗口，长按静音。阶段结束响铃并播报，下一阶段等你按 K0 再开始。今天完成了几次、专注了多久记在盒子上，按日清零，重启不丢。
 - **休闲**：值班空闲够久之后它自己去玩。五分钟后开始演小剧目（巡逻、踢球、看书、数星星、躲猫猫、被自己吓醒、梦话），半小时后困了转暗睡觉，夜里睡够 90 分钟关背光。Agent 一有动静或按任何键，立刻回来值班。
+
+部分盒子带触摸屏。在这样的盒子上，点一张任务卡就回到那个 Agent 的窗口（K2 去的是最要紧的那个），上下滑动可以看更多任务卡，点盒子菜单里的一行就选中它，点菜单底部的按键提示就等于按那个键，点菜单外面就关掉菜单，点小助手就是摸摸它。其余操作仍然用按键，每台盒子都一样。
 
 番茄钟完全在盒子上运行，计时和当日次数不依赖 Mac 端。休闲的状态同样在固件里，但它需要与 daemon 的链路在线：盒子 15 秒收不到 Mac 的消息就判定链路断开，休闲随即回到值班，链路恢复前不会再进入。设计见 [`docs/pomodoro.md`](docs/pomodoro.md) 与 [`docs/leisure.md`](docs/leisure.md)。
 
@@ -255,6 +257,8 @@ cargo run -p vibebuddyd
 ```
 
 默认只监听 `127.0.0.1:7331`，并按 Espressif USB Serial/JTAG 的 `VID:PID 303A:1001` 自动发现设备。可用 `VIBEBUDDY_BIND` 修改监听地址、`VIBEBUDDY_SERIAL_PORT` 显式指定串口，或用 `VIBEBUDDY_USB_SERIAL` 在多块相同设备中选择目标；不指定时，daemon 连之前报出过 VibeBuddy 固件的那块；插着好几块、又都不是那块时，App 会问哪一块是盒子。这两个变量设了都会显示在 App 的设备页上，免得忘了撤的固定被当成找不到盒子。运行其他固件（比如 Muse）的盒子，daemon 不会往里写任何东西。HTTP `202 Accepted` 表示事件进入有界发送队列；设备实际接收结果以 daemon 记录的设备响应为准。
+
+语音指令还在实验阶段，默认关闭：`VIBEBUDDY_RESIDENT_SESSION=1` 打开常驻会话，再配好语音识别，盒子长按 K0 就成了按住说话。由你自己的 Codex 来回答；也可以换成你自己的 Claude Code，配你自己的 Anthropic API 密钥（不能用 Claude 订阅）。打开期间，Mac 和 Linux 的设置里都会多出“对话”页，列出你最近的语音指令和氛围小助手的口头回复，也在这里选由谁回答、填 API 密钥。详见 [`docs/resident-session.md`](docs/resident-session.md)。
 
 daemon 平时由 App 看管。没有 App 的开发机可以用 [`packaging/com.vibebuddy.vibebuddyd.plist`](packaging/com.vibebuddy.vibebuddyd.plist) 装成 LaunchAgent，但两者不能同时跑，会抢串口。daemon 还为 App 提供 `GET /v1/status`、SSE `/v1/status/stream`、`/v1/config`、`/v1/device/{identify,volume,choice,screenshot,voice-pack,firmware}` 与 `/v1/daemon/restart`。
 

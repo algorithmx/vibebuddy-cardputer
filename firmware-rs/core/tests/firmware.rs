@@ -10,7 +10,9 @@ use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
 use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
 use vibebuddy_firmware_core::noise::Sealer;
+use vibebuddy_firmware_core::spoken_reply::{ReplyAudio, ReplyPlayer};
 use vibebuddy_firmware_core::storage::{Flash, FlashError};
+use vibebuddy_firmware_core::touch;
 use vibebuddy_firmware_core::voice_pack;
 
 struct MemoryFlash {
@@ -89,6 +91,22 @@ struct FakeBoard {
     peer_full: bool,
     /// Restarts asked for.
     restarts: usize,
+    /// Registers of the chips on I2C, by (address, register), and what was written.
+    i2c: std::collections::BTreeMap<(u8, u8), u8>,
+    i2c_writes: Vec<(u8, u8, u8)>,
+    /// The board has I2S input; and the size of the capture asked for, until it is taken.
+    mic_input: bool,
+    mic_capture: Option<usize>,
+    /// The voice command microphone is running; samples waiting to be taken; `VOICE DATA` lines written.
+    voice_running: bool,
+    voice_samples: Vec<i16>,
+    stream: Vec<String>,
+    /// What the spoken reply player was handed, and whether it says a reply is sounding.
+    reply_audio: Vec<ReplyAudio>,
+    speaking: bool,
+    /// The box has a touchscreen, and where a finger is on it.
+    touchscreen: bool,
+    finger: Option<(i32, i32)>,
 }
 
 impl FakeBoard {
@@ -114,6 +132,17 @@ impl FakeBoard {
             relay_peer: false,
             peer_full: false,
             restarts: 0,
+            i2c: [((0x18, 0xFD), 0x83), ((0x18, 0xFE), 0x11), ((0x18, 0x16), 0x24)].into(),
+            i2c_writes: Vec::new(),
+            mic_input: true,
+            mic_capture: None,
+            voice_running: false,
+            voice_samples: Vec::new(),
+            stream: Vec::new(),
+            reply_audio: Vec::new(),
+            speaking: false,
+            touchscreen: false,
+            finger: None,
         }
     }
 
@@ -193,6 +222,22 @@ impl Board for FakeBoard {
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>) {
         (self.k0, Some((self.k1, self.k2)))
     }
+    fn init_touch(&mut self) -> Option<&'static str> {
+        self.touchscreen.then_some("CHSC5432")
+    }
+    /// The report the chip would send, the inverse of `touch::parse_report`.
+    fn read_touch(&mut self) -> Option<[u8; touch::REPORT_BYTES]> {
+        let mut report = [0; touch::REPORT_BYTES];
+        if let Some((x, y)) = self.finger {
+            let short = (239 - y) as u16;
+            let long = x as u16;
+            report[1] = 1;
+            report[2] = short as u8;
+            report[3] = long as u8;
+            report[5] = ((long >> 8) as u8) << 4 | (short >> 8) as u8;
+        }
+        Some(report)
+    }
     fn play(&mut self, sound: Sound) -> Result<(), ()> {
         self.played.push(sound);
         Ok(())
@@ -206,6 +251,46 @@ impl Board for FakeBoard {
     fn set_volume(&mut self, level: u32) -> Result<(), VolumeError> {
         self.codec_volume = Some(level);
         Ok(())
+    }
+    fn i2c_read(&mut self, address: u8, register: u8) -> Option<u8> {
+        self.i2c.get(&(address, register)).copied()
+    }
+    fn i2c_write(&mut self, address: u8, register: u8, value: u8) -> Result<(), ()> {
+        self.i2c.keys().any(|&(chip, _)| chip == address).then_some(()).ok_or(())?;
+        self.i2c.insert((address, register), value);
+        self.i2c_writes.push((address, register, value));
+        Ok(())
+    }
+    fn mic_start(&mut self, bytes: usize) -> Result<(), ()> {
+        self.mic_input.then_some(()).ok_or(())?;
+        self.mic_capture = Some(bytes);
+        Ok(())
+    }
+    fn voice_start(&mut self) -> Result<(), ()> {
+        self.mic_input.then_some(()).ok_or(())?;
+        self.voice_running = true;
+        Ok(())
+    }
+    fn voice_take(&mut self, samples: &mut Vec<i16>) {
+        samples.append(&mut self.voice_samples);
+    }
+    fn voice_stop(&mut self) {
+        self.voice_running = false;
+        self.voice_samples.clear();
+    }
+    fn write_stream(&mut self, line: &[u8]) {
+        self.stream.push(String::from_utf8(line.to_vec()).unwrap());
+    }
+    fn reply_audio(&mut self, audio: ReplyAudio) {
+        self.reply_audio.push(audio);
+    }
+    fn reply_speaking(&self) -> bool {
+        self.speaking
+    }
+    /// The left slot counts up, the right slot is silent.
+    fn mic_take(&mut self) -> Option<Result<Vec<u8>, &'static str>> {
+        let bytes = self.mic_capture.take()?;
+        Some(Ok((0..bytes / 4).flat_map(|frame| [(frame % 256) as u8, 0, 0, 0]).collect()))
     }
 }
 
@@ -237,6 +322,7 @@ fn boot_reports_like_the_c_firmware() {
             "TALLY LOADED 0 0S DAY 0",
             "DISPLAY READY BUILD abc1234 2026-09-26 10:00",
             "FIRMWARE VERSION 1.2.3",
+            "TRANSFER 1",
             "LINK NOISE",
             BOX_KEY,
             RELAY_URL,
@@ -245,6 +331,7 @@ fn boot_reports_like_the_c_firmware() {
             "AUDIO CODEC ES8311",
             "VOLUME 65",
             "BUTTONS READY",
+            "TOUCH NONE",
             "READY vibebuddy-fw 1.2.3",
         ]
     );
@@ -349,7 +436,7 @@ fn bad_lines_are_reported() {
     assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":""}"#), ["ERROR invalid_message"]);
     assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":"x","title":3}"#), ["ERROR invalid_message"]);
     assert_eq!(send(&mut firmware, &mut board, r#"{"version":2,"event":"x"}"#), ["ERROR unsupported_version"]);
-    let long = format!(r#"{{"version":1,"event":"x","title":"{}"}}"#, "a".repeat(1100));
+    let long = format!(r#"{{"version":1,"event":"x","title":"{}"}}"#, "a".repeat(4700));
     assert_eq!(send(&mut firmware, &mut board, &long), ["ERROR input_too_large"]);
     // A line ending in CRLF is accepted too.
     firmware.receive(&mut board, b"{\"version\":1,\"event\":\"device.identify\"}\r\n");
@@ -490,7 +577,7 @@ fn echo_reports_length_and_crc() {
 fn hello_repeats_the_static_state() {
     let (mut firmware, mut board, _) = booted(blank_flash());
     let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
-    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", "LINK NOISE", BOX_KEY, RELAY_URL, "MODE DUTY", "VOICES builtin", "VOLUME 65"]);
+    assert_eq!(lines, ["DISPLAY READY BUILD abc1234 2026-09-26 10:00", "FIRMWARE VERSION 1.2.3", "TRANSFER 1", "LINK NOISE", BOX_KEY, RELAY_URL, "MODE DUTY", "VOICES builtin", "VOLUME 65", "TOUCH NONE"]);
 }
 
 #[test]
@@ -1239,5 +1326,942 @@ mod relay {
         let (_, first) = Initiator::start([2; 32], &box_key, [6; 32], b"{}").unwrap();
         assert!(relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": first})).is_empty());
         assert!(!relay.has_peer());
+    }
+
+    #[test]
+    fn a_box_that_missed_linked_takes_a_handshake_from_a_paired_computer() {
+        // The computer linked while the box was restarting, and the box never heard `linked`: the computer starts
+        // the handshake itself (daemon/src/relay.rs).
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"device.pair","key":"{}","name":"b"}}"#, computer_key()));
+        board.advance(USB_QUIET_MS);
+        let mut relay = RelayBox::new();
+        relay.message(&mut firmware, &mut board, &json!({"t": "welcome"}));
+        let box_key = firmware.link().unwrap().public_key();
+        let (initiator, first) = Initiator::start([2; 32], &box_key, [6; 32], b"{}").unwrap();
+        let reply = relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": first}));
+        let (mut sealer, _) = initiator.finish(parse(&reply[0])["line"].as_str().unwrap().as_bytes()).unwrap();
+        assert!(relay.has_peer() && board.relay_peer);
+        assert_eq!(firmware.link_mark(board.now_ms()).0, Some(vibebuddy_firmware_core::display::LinkPath::Relay), "linked through the Relay now");
+        board.take_lines();
+        say(&mut relay, &mut firmware, &mut board, &mut sealer, r#"{"version":1,"event":"device.hello"}"#);
+        assert!(board.take_lines().contains(&"MODE DUTY".to_owned()));
+
+        // A second handshake while the session is up doesn't open as a line: the box starts over and says so.
+        let (_, again) = Initiator::start([2; 32], &box_key, [7; 32], b"{}").unwrap();
+        let answer = relay.message(&mut firmware, &mut board, &json!({"t": "data", "line": again}));
+        assert_eq!(parse(parse(&answer[0])["line"].as_str().unwrap())["event"], "link.noise");
+        assert!(!relay.has_peer());
+    }
+}
+
+mod transfer {
+    use super::*;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use vibebuddy_firmware_core::transfer::CHUNK_BYTES;
+    use vibebuddy_firmware_core::voice_pack::crc32;
+
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let bits = chunk.iter().enumerate().fold(0u32, |acc, (index, &byte)| acc | u32::from(byte) << (16 - 8 * index));
+            for index in 0..4 {
+                out.push(if index <= chunk.len() { ALPHABET[(bits >> (18 - 6 * index) & 63) as usize] as char } else { '=' });
+            }
+        }
+        out
+    }
+
+    fn reply(lines: &[String]) -> Value {
+        serde_json::from_str(lines.last().unwrap()).unwrap()
+    }
+
+    /// Sends xfer.begin and runs the main loop until the box answers: it erases the slot first.
+    fn begin_transfer(firmware: &mut Firmware, board: &mut FakeBoard, line: &str) -> Value {
+        let mut lines = send(firmware, board, line);
+        let mut passes = 0;
+        while !lines.iter().any(|line| line.contains("xfer.")) {
+            firmware.poll(board);
+            lines = board.take_lines();
+            passes += 1;
+            assert!(passes < 100, "no answer to xfer.begin");
+        }
+        reply(&lines)
+    }
+
+    #[test]
+    fn a_firmware_image_comes_over_the_link_and_the_box_restarts_into_it() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image: Vec<u8> = (0..10_000).map(|index| (index * 13 + 1) as u8).collect();
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len());
+        assert_eq!(begin_transfer(&mut firmware, &mut board, &begin), serde_json::json!({"version": 1, "event": "xfer.ready", "offset": 0}));
+        for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
+            let line = format!(
+                r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#,
+                index * CHUNK_BYTES,
+                crc32(0, piece),
+                base64(piece)
+            );
+            assert!(line.len() < 4608 || piece.len() < CHUNK_BYTES, "a full chunk fits a line");
+            let ack = reply(&send(&mut firmware, &mut board, &line));
+            assert_eq!(ack["offset"], (index * CHUNK_BYTES + piece.len()) as u64);
+        }
+        // Asked again, the same image resumes at its end.
+        assert_eq!(reply(&send(&mut firmware, &mut board, &begin))["offset"], image.len() as u64);
+        assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["event"], "xfer.done");
+        assert_eq!(board.restarts, 1);
+        assert_eq!(&board.flash.bytes[0x610000..0x610000 + image.len()], &image[..]);
+    }
+
+    #[test]
+    fn a_chunk_of_a_full_size_survives_the_line_limit() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; CHUNK_BYTES * 2];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
+        begin_transfer(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len()));
+        let piece = &image[..CHUNK_BYTES];
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, piece), base64(piece));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line))["offset"], CHUNK_BYTES as u64);
+    }
+
+    /// Sends a whole image of `kind` over xfer.*; returns what the box said to xfer.end.
+    fn send_over_xfer(firmware: &mut Firmware, board: &mut FakeBoard, kind: &str, image: &[u8], sha: &str) -> Vec<String> {
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"{kind}","size":{},"sha256":"{sha}"}}"#, image.len());
+        assert_eq!(begin_transfer(firmware, board, &begin)["event"], "xfer.ready");
+        for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
+            let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#, index * CHUNK_BYTES, crc32(0, piece), base64(piece));
+            assert_eq!(reply(&send(firmware, board, &line))["event"], "xfer.ack");
+        }
+        send(firmware, board, r#"{"version":1,"event":"xfer.end"}"#)
+    }
+
+    fn hex_sha(image: &[u8]) -> String {
+        Sha256::digest(image).iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn a_character_pack_comes_over_the_link_and_speaks_at_once() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let lines = send_over_xfer(&mut firmware, &mut board, "character", SAMPLE_PACK, &hex_sha(SAMPLE_PACK));
+        assert_eq!(lines, [r#"{"version":1,"event":"xfer.done","voice":"sample"}"#, "VOICES sample", "AUDIO QUEUED DONE"]);
+        assert_eq!(adpcm_samples(board.played.last()), Some(3), "the done line of the new Character");
+        assert_eq!(board.restarts, 0, "a pack needs no restart");
+    }
+
+    #[test]
+    fn while_a_pack_comes_in_the_built_in_voice_speaks_and_a_failed_one_leaves_it() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        send_over_xfer(&mut firmware, &mut board, "character", SAMPLE_PACK, &hex_sha(SAMPLE_PACK));
+        // Another pack, with a hash that won't match: set aside while it comes, and gone after.
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"task.done","title":"A"}"#);
+        assert_eq!(board.played.last(), Some(&Sound::Builtin(Prompt::Done)), "the partition is being rewritten");
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, SAMPLE_PACK), base64(SAMPLE_PACK));
+        send(&mut firmware, &mut board, &line);
+        assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sha256");
+        let hello = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+        assert!(hello.contains(&"VOICES builtin".to_owned()), "the old pack was erased, nothing new took its place: {hello:?}");
+    }
+
+    #[test]
+    fn something_else_is_not_a_pack() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let junk = vec![0x42u8; 2000];
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, junk.len(), hex_sha(&junk));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &junk), base64(&junk));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line))["code"], "bad_image");
+    }
+
+    #[test]
+    fn the_screen_shows_the_update_and_only_a_long_k2_counts() {
+        use vibebuddy_firmware_core::display::PanelKind;
+        let mut board = FakeBoard::new(blank_flash());
+        board.touchscreen = true;
+        let mut firmware = Firmware::new(1, board.now_ms(), b"abc1234 2026-09-26 10:00", "1.2.3");
+        firmware.boot(&mut board);
+        board.take_lines();
+        let image = vec![0xA5u8; CHUNK_BYTES * 4];
+        let mut image = image;
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{}"}}"#, image.len(), hex_sha(&image));
+        send(&mut firmware, &mut board, &begin);
+        let panel = firmware.overlay().expect("a panel while erasing");
+        assert_eq!((panel.title.as_slice(), panel.kind), (&b"UPDATING"[..], PanelKind::Progress(0)));
+        assert_eq!(panel.lines[0].0, b"GETTING READY");
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let piece = &image[..CHUNK_BYTES];
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, piece), base64(piece)));
+        let panel = firmware.overlay().unwrap();
+        assert_eq!((panel.kind, panel.lines[0].0.as_slice()), (PanelKind::Progress(25), &b"25%"[..]));
+        // The panel draws a hint's first 12 characters (seen cut on a box as "HOLD TO CANC").
+        assert!(panel.hints.iter().all(|(_, action)| action.len() <= 12));
+
+        // Announcements wait for the restart; K0 and K1 and a short K2 do nothing; a long K2 cancels.
+        let played = board.played.len();
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"task.done","title":"A"}"#).contains(&"AUDIO UPDATING DONE".to_owned()));
+        assert_eq!(board.played.len(), played, "silent");
+        for key in [Key::K0, Key::K1, Key::K2] {
+            assert!(!press(&mut firmware, &mut board, key, 100).iter().any(|line| line.contains("MODE") || line.contains("button")));
+        }
+        assert!(press(&mut firmware, &mut board, Key::K1, 1500).iter().all(|line| !line.contains("MENU OPEN")), "not even the menu");
+        // Nor does a tap.
+        board.finger = Some((5, 5));
+        for _ in 0..4 {
+            firmware.poll(&mut board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(&mut board);
+        assert!(firmware.overlay().is_some_and(|panel| panel.title == b"UPDATING"));
+        let lines = press(&mut firmware, &mut board, Key::K2, 1500);
+        assert!(lines.contains(&r#"{"version":1,"event":"xfer.error","code":"cancelled"}"#.to_owned()), "{lines:?}");
+        assert!(firmware.overlay().is_none(), "the screen comes back");
+        assert!(press(&mut firmware, &mut board, Key::K1, 100).iter().any(|line| line.starts_with("MODE")), "and the keys");
+    }
+
+    #[test]
+    fn a_pack_shows_as_a_new_character() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), hex_sha(SAMPLE_PACK));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        assert_eq!(firmware.overlay().unwrap().title, b"NEW CHARACTER");
+        send(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, SAMPLE_PACK), base64(SAMPLE_PACK)));
+        send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#);
+        assert!(firmware.overlay().is_none());
+    }
+
+    #[test]
+    fn a_transfer_its_computer_left_is_given_up() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"character","size":{},"sha256":"{}"}}"#, SAMPLE_PACK.len(), hex_sha(SAMPLE_PACK));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        board.advance(4 * 60_000);
+        firmware.poll(&mut board);
+        assert!(firmware.overlay().is_some(), "four minutes is still a link coming back");
+        board.advance(60_000);
+        firmware.poll(&mut board);
+        assert!(board.take_lines().contains(&"XFER ABANDONED".to_owned()));
+        assert!(firmware.overlay().is_none());
+    }
+
+    #[test]
+    fn a_bad_chunk_ends_the_transfer_with_its_reason() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&[0xE9; 100]));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "crc"}));
+        assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sequence");
+        assert_eq!(board.restarts, 0);
+    }
+}
+/// Polls until `MIC END` and returns every line.
+fn poll_mic(firmware: &mut Firmware, board: &mut FakeBoard) -> Vec<String> {
+    let mut lines = Vec::new();
+    for _ in 0..2_000 {
+        board.advance(10);
+        firmware.poll(board);
+        lines.extend(board.take_lines());
+        if lines.last().is_some_and(|line| line.starts_with("MIC END")) {
+            return lines;
+        }
+    }
+    panic!("no MIC END; got {} lines", lines.len());
+}
+
+#[test]
+fn a_mic_recording_reports_probes_levels_and_the_samples() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record","ms":200}"#);
+    assert_eq!(
+        lines,
+        [
+            "MIC PROBE 0x18 ID 8311",
+            "MIC PROBE 0x40 NONE",
+            "MIC PROBE 0x41 NONE",
+            "MIC PROBE 0x42 NONE",
+            "MIC PROBE 0x43 NONE",
+            "MIC GAIN 30 DB",
+            "MIC RECORDING 200 MS",
+        ]
+    );
+    // es8311_set_mic_gain(30 dB) writes 5 to register 0x16.
+    assert_eq!(board.i2c_writes, [(0x18, 0x16, 5)]);
+    assert_eq!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record"}"#), ["MIC BUSY"]);
+
+    let lines = poll_mic(&mut firmware, &mut board);
+    assert_eq!(lines[0], "MIC CAPTURED 10 MS 19200 BYTES");
+    assert_eq!(&lines[1..3], ["MIC LEVEL 0 L 144 255 R 0 0", "MIC LEVEL 100 L 147 255 R 0 0"]);
+    assert_eq!(lines[3], "MIC BEGIN 24000 2 16 19200");
+    let data: Vec<&String> = lines.iter().filter(|line| line.starts_with("MIC DATA ")).collect();
+    assert_eq!(data.len(), 19200usize.div_ceil(576));
+    let mut samples = Vec::new();
+    for (seq, line) in data.iter().enumerate() {
+        assert!(line.len() < 800, "a data line stays well under the 1 KB line limit");
+        let mut parts = line.splitn(4, ' ').skip(2);
+        assert_eq!(parts.next().unwrap(), seq.to_string());
+        let mut out = vec![0u8; 576];
+        let length = voice_pack::decode_base64(parts.next().unwrap().as_bytes(), &mut out).unwrap();
+        samples.extend_from_slice(&out[..length]);
+    }
+    let expected: Vec<u8> = (0..4800).flat_map(|frame| [(frame % 256) as u8, 0, 0, 0]).collect();
+    assert_eq!(samples, expected);
+    assert_eq!(lines.last().unwrap(), &format!("MIC END 19200 {}", voice_pack::crc32(0, &expected)));
+
+    // Done: another recording may start.
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record","ms":100}"#);
+    assert_eq!(lines.last().map(String::as_str), Some("MIC RECORDING 100 MS"));
+}
+
+#[test]
+fn a_mic_recording_is_clamped_and_reports_what_is_missing() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    board.i2c.clear();
+    board.i2c.insert((0x41, 0x3D), 0x72);
+    board.i2c.insert((0x41, 0x3E), 0x10);
+    board.mic_input = false;
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record","ms":60000,"gain_db":99}"#);
+    assert_eq!(
+        lines,
+        [
+            "MIC PROBE 0x18 NONE",
+            "MIC PROBE 0x40 NONE",
+            "MIC PROBE 0x41 ID 7210",
+            "MIC PROBE 0x42 NONE",
+            "MIC PROBE 0x43 NONE",
+            "MIC UNAVAILABLE",
+        ]
+    );
+    // No ES8311: no gain write.
+    assert!(board.i2c_writes.is_empty());
+
+    board.mic_input = true;
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record","ms":60000}"#);
+    assert_eq!(lines.last().map(String::as_str), Some("MIC RECORDING 5000 MS"));
+    assert_eq!(board.mic_capture, Some(480_000));
+}
+
+const VOICE_ON: &str = r#"{"version":1,"event":"voice.available","on":true}"#;
+
+/// Holds K0 for `hold_ms`, with the microphone delivering 24 samples a millisecond while it runs; returns
+/// the lines printed (the `VOICE DATA` lines are in `board.stream`).
+fn hold_k0_talking(firmware: &mut Firmware, board: &mut FakeBoard, hold_ms: u32) -> Vec<String> {
+    board.advance(100);
+    board.k0 = true;
+    firmware.poll(board);
+    let mut held = 0;
+    while held < hold_ms {
+        board.advance(10);
+        held += 10;
+        if board.voice_running {
+            board.voice_samples.extend((0..240).map(|index| if index % 2 == 0 { 4000 } else { -4000 }));
+        }
+        firmware.poll(board);
+    }
+    board.k0 = false;
+    firmware.poll(board);
+    board.take_lines()
+}
+
+#[test]
+fn without_voice_a_long_k0_still_gives_up_the_phase() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO FOCUS START", "MODE POMODORO"]);
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+    assert!(!board.voice_running);
+    // Offered and then withdrawn, it's the same.
+    send(&mut firmware, &mut board, VOICE_ON);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false}"#);
+    press(&mut firmware, &mut board, Key::K0, 50);
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+}
+
+#[test]
+fn with_voice_a_long_k0_records_a_turn_and_the_phase_keeps_running() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO FOCUS START", "MODE POMODORO"]);
+    assert!(send(&mut firmware, &mut board, VOICE_ON).is_empty());
+    let lines = hold_k0_talking(&mut firmware, &mut board, 2000);
+    // Recording starts when the long press fires, a second in, and runs until K0 comes up.
+    assert_eq!(lines.first().map(String::as_str), Some("VOICE START 1"));
+    assert!(!lines.iter().any(|line| line.starts_with("POMODORO")), "{lines:?}");
+    let end = lines.iter().find(|line| line.starts_with("VOICE END 1 ")).expect("VOICE END");
+    let samples: usize = end.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!((22_000..=24_500).contains(&samples), "about a second at 24 kHz: {samples}");
+    assert!(!board.voice_running, "the microphone stops with the recording");
+    // Every data line went to the stream, numbered without gaps, the last one shorter.
+    assert_eq!(board.stream.len(), samples.div_ceil(1152));
+    for (seq, line) in board.stream.iter().enumerate() {
+        assert!(line.starts_with(&format!("VOICE DATA 1 {seq} ")) && line.ends_with('\n') && line.len() < 1024, "{line}");
+    }
+    // The microphone ran at voice gain: 42 dB is register 0x16 = 7.
+    assert!(board.i2c_writes.contains(&(0x18, 0x16, 7)));
+    // The overlay counts as the user being there.
+    assert_eq!(press(&mut firmware, &mut board, Key::K2, 50), Vec::<String>::new(), "K2 closes the overlay");
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO PAUSED"], "the phase was never given up");
+}
+
+#[test]
+fn a_tap_past_the_long_press_is_cancelled() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    let lines = hold_k0_talking(&mut firmware, &mut board, 1300);
+    assert_eq!(lines, ["VOICE START 1", "VOICE CANCEL 1"]);
+    assert!(!board.voice_running);
+}
+
+#[test]
+fn the_computers_answers_fill_the_overlay_and_k2_closes_it() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    hold_k0_talking(&mut firmware, &mut board, 1800);
+    let before = board.presents;
+    assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.heard","turn":1,"text":"what is codex doing"}"#).is_empty());
+    assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.reply","turn":1,"text":"Writing tests."}"#).is_empty());
+    assert!(board.presents >= before + 2, "each answer redraws the overlay");
+    // Another turn's answers change nothing.
+    let before = board.presents;
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.reply","turn":9,"text":"nope"}"#);
+    assert_eq!(board.presents, before);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.done","turn":1}"#);
+    // K2 closes it rather than asking the computer to open a source; the next K2 does that again.
+    assert!(press(&mut firmware, &mut board, Key::K2, 50).is_empty());
+    assert_eq!(press(&mut firmware, &mut board, Key::K2, 50), [r#"{"version":1,"event":"button","button":"K2","action":"press"}"#]);
+}
+
+#[test]
+fn a_needs_input_event_waits_for_a_voice_command_and_is_said_after_it() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    board.advance(100);
+    board.k0 = true;
+    firmware.poll(&mut board);
+    board.advance(1100);
+    firmware.poll(&mut board);
+    assert_eq!(board.take_lines(), ["VOICE START 1"]);
+    board.played.clear();
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"agent.input_required","title":"CC:ASK"}"#);
+    assert!(!lines.iter().any(|line| line.starts_with("VOICE CANCEL")), "the recording goes on: {lines:?}");
+    assert!(lines.contains(&"AUDIO HELD INPUT_REQUIRED".to_owned()), "{lines:?}");
+    assert!(board.voice_running);
+    assert!(board.played.is_empty(), "nothing is said over the conversation");
+    // The same Agent asking again is still one thing held.
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"agent.input_required","title":"CC:ASK"}"#);
+    board.advance(500);
+    board.k0 = false;
+    firmware.poll(&mut board);
+    assert!(board.take_lines().iter().any(|line| line.starts_with("VOICE END 1")));
+    assert!(board.played.is_empty());
+    // K2 closes the overlay, and the held news is said once.
+    let lines = press(&mut firmware, &mut board, Key::K2, 50);
+    assert!(lines.contains(&"AUDIO QUEUED INPUT_REQUIRED".to_owned()), "{lines:?}");
+    assert_eq!(board.played.len(), 1, "{:?}", board.played);
+}
+
+#[test]
+fn a_new_link_starts_with_voice_off() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+    press(&mut firmware, &mut board, Key::K0, 50);
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+    // A link that goes quiet takes voice with it too.
+    send(&mut firmware, &mut board, VOICE_ON);
+    board.advance(16_000);
+    firmware.poll(&mut board);
+    board.take_lines();
+    assert!(hold_k0_talking(&mut firmware, &mut board, 1500).iter().all(|line| !line.starts_with("VOICE")));
+}
+
+#[test]
+fn a_box_that_cannot_record_says_so_and_sends_nothing() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    board.mic_input = false;
+    send(&mut firmware, &mut board, VOICE_ON);
+    let before = board.presents;
+    let lines = hold_k0_talking(&mut firmware, &mut board, 1500);
+    assert!(lines.iter().all(|line| !line.starts_with("VOICE") && !line.starts_with("POMODORO")), "{lines:?}");
+    assert!(board.presents > before, "the overlay says there's no microphone");
+}
+
+#[test]
+fn the_diagnostic_and_a_voice_command_share_the_microphone() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    board.advance(100);
+    board.k0 = true;
+    firmware.poll(&mut board);
+    board.advance(1100);
+    firmware.poll(&mut board);
+    board.take_lines();
+    let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.mic.record"}"#);
+    assert_eq!(lines, ["MIC BUSY"]);
+}
+
+const REPLY_MP3: &[u8] = include_bytes!("../src/fixtures/spoken_reply.mp3");
+const K2_PRESS: &str = r#"{"version":1,"event":"button","button":"K2","action":"press"}"#;
+
+/// A turn recorded and answered with a reply's text: the box is waiting on turn 1's audio.
+fn answered_turn(firmware: &mut Firmware, board: &mut FakeBoard) {
+    send(firmware, board, VOICE_ON);
+    hold_k0_talking(firmware, board, 1800);
+    send(firmware, board, r#"{"version":1,"event":"voice.reply","turn":1,"text":"Writing tests."}"#);
+    board.reply_audio.clear();
+}
+
+/// A reply's MP3 as the computer sends it: 576 bytes (768 base64 characters) a line, then the end.
+fn audio_lines(turn: u32, reply: u32, mp3: &[u8], end: &str) -> Vec<String> {
+    let mut lines: Vec<String> = mp3
+        .chunks(576)
+        .enumerate()
+        .map(|(seq, piece)| format!(r#"{{"version":1,"event":"voice.audio","turn":{turn},"reply":{reply},"seq":{seq},"data":"{}"}}"#, encode_base64(piece)))
+        .collect();
+    lines.push(format!(r#"{{"version":1,"event":"voice.audio","turn":{turn},"reply":{reply},"seq":{},"end":true{end}}}"#, mp3.len().div_ceil(576)));
+    lines
+}
+
+/// What a player makes of what the board was handed.
+fn pcm_of(audio: &[ReplyAudio]) -> Vec<u8> {
+    let mut player = ReplyPlayer::new();
+    for audio in audio {
+        player.apply(audio.clone());
+    }
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 1000];
+    loop {
+        let count = player.fill(&mut buffer);
+        if count == 0 {
+            return out;
+        }
+        out.extend_from_slice(&buffer[..count]);
+    }
+}
+
+#[test]
+fn a_spoken_replys_audio_reaches_the_player_whole() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    for line in audio_lines(1, 0, REPLY_MP3, "") {
+        assert!(line.len() < 1024);
+        assert!(send(&mut firmware, &mut board, &line).is_empty(), "{line}");
+    }
+    let chunks = REPLY_MP3.len().div_ceil(576);
+    assert_eq!(board.reply_audio.len(), chunks + 1);
+    assert_eq!(board.reply_audio.last(), Some(&ReplyAudio::End { reply: 0, seq: chunks as u32 }));
+    let received: Vec<u8> = board
+        .reply_audio
+        .iter()
+        .flat_map(|audio| match audio {
+            ReplyAudio::Chunk { data, .. } => data.clone(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(received == REPLY_MP3, "the bytes arrive intact");
+    assert!(pcm_of(&board.reply_audio).len() > 24_000 * 4 * 3, "seconds of speech");
+    // Another turn's audio, or audio without a turn, goes nowhere.
+    board.reply_audio.clear();
+    send(&mut firmware, &mut board, &audio_lines(7, 0, &REPLY_MP3[..576], "")[0]);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.audio","reply":0,"seq":0,"data":"AAAA"}"#);
+    assert!(board.reply_audio.is_empty());
+}
+
+#[test]
+fn a_reply_cut_short_by_synthesis_plays_what_came_and_says_so() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    let mut printed = Vec::new();
+    for line in audio_lines(1, 0, &REPLY_MP3[..576 * 5], r#","error":"synthesis""#) {
+        printed.extend(send(&mut firmware, &mut board, &line));
+    }
+    assert_eq!(printed, ["VOICE AUDIO CUT SHORT 1 0"]);
+    assert_eq!(board.reply_audio.last(), Some(&ReplyAudio::End { reply: 0, seq: 5 }));
+    assert!(!pcm_of(&board.reply_audio).is_empty(), "what came still plays");
+    // The text stays up to be read.
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.done","turn":1}"#);
+    assert!(press(&mut firmware, &mut board, Key::K2, 50).is_empty(), "K2 closes the overlay");
+}
+
+#[test]
+fn while_muted_replies_are_shown_and_not_played() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    let lines = audio_lines(1, 0, &REPLY_MP3[..576 * 4], "");
+    send(&mut firmware, &mut board, &lines[0]);
+    assert_eq!(board.reply_audio.len(), 1);
+    // Muting mid-reply (K2 long): the reply stops at once, and the rest of the turn stays silent.
+    board.reply_audio.clear();
+    assert_eq!(press(&mut firmware, &mut board, Key::K2, 1100), ["MUTE ON"]);
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop]);
+    for line in &lines[1..] {
+        send(&mut firmware, &mut board, line);
+    }
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop], "nothing more reaches the player");
+
+    // Muted before the turn: nothing reaches the player at all, and the text still shows.
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    assert_eq!(press(&mut firmware, &mut board, Key::K2, 1100), ["MUTE ON"]);
+    answered_turn(&mut firmware, &mut board);
+    for line in audio_lines(1, 0, &REPLY_MP3[..576 * 4], r#","error":"synthesis""#) {
+        send(&mut firmware, &mut board, &line);
+    }
+    assert!(board.reply_audio.is_empty());
+    assert!(press(&mut firmware, &mut board, Key::K2, 50).is_empty(), "the overlay is up");
+}
+
+#[test]
+fn an_agents_news_during_a_reply_waits_and_the_reply_plays_on() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    let lines = audio_lines(1, 0, &REPLY_MP3[..576 * 6], "");
+    for line in &lines[..3] {
+        send(&mut firmware, &mut board, line);
+    }
+    board.reply_audio.clear();
+    board.played.clear();
+    let out = send(
+        &mut firmware,
+        &mut board,
+        r#"{"version":1,"event":"task.done","title":"CC:VIBE","tasks":[{"title":"CC:VIBE","status":"done","elapsed_s":3}]}"#,
+    );
+    assert!(out.contains(&"AUDIO HELD DONE".to_owned()), "{out:?}");
+    assert!(!board.reply_audio.contains(&ReplyAudio::Stop), "the reply isn't cut off");
+    assert!(board.played.is_empty(), "nothing is said over the reply");
+    for line in &lines[3..] {
+        send(&mut firmware, &mut board, line);
+    }
+    assert!(board.reply_audio.iter().any(|audio| matches!(audio, ReplyAudio::Chunk { .. })), "the reply's audio still plays");
+    // Once the overlay closes, the news is said.
+    press(&mut firmware, &mut board, Key::K2, 50);
+    assert_eq!(board.played, [Sound::Builtin(Prompt::Done)]);
+}
+
+#[test]
+fn the_pomodoro_chime_stops_a_reply_too() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    press(&mut firmware, &mut board, Key::K0, 50);
+    answered_turn(&mut firmware, &mut board);
+    send(&mut firmware, &mut board, &audio_lines(1, 0, &REPLY_MP3[..576], "")[0]);
+    board.reply_audio.clear();
+    board.advance(25 * 60 * 1000);
+    firmware.poll(&mut board);
+    assert!(board.take_lines().contains(&"POMODORO FOCUS END".to_owned()));
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop]);
+}
+
+#[test]
+fn a_new_push_to_talk_stops_the_reply_and_plays_the_new_turns() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    send(&mut firmware, &mut board, &audio_lines(1, 0, &REPLY_MP3[..576], "")[0]);
+    board.reply_audio.clear();
+    board.advance(100);
+    board.k0 = true;
+    firmware.poll(&mut board);
+    board.advance(1100);
+    firmware.poll(&mut board);
+    assert!(board.voice_running);
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop], "the reply stops before the box listens");
+    board.advance(1000);
+    board.k0 = false;
+    firmware.poll(&mut board);
+    board.take_lines();
+    send(&mut firmware, &mut board, &audio_lines(1, 1, &REPLY_MP3[..576], "")[0]);
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop], "the old turn's audio is ignored");
+    send(&mut firmware, &mut board, &audio_lines(2, 0, &REPLY_MP3[..576], "")[0]);
+    assert_eq!(board.reply_audio.len(), 2, "the new turn's plays");
+}
+
+#[test]
+fn the_text_stays_up_while_a_reply_is_spoken_and_k2_stops_it() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    send(&mut firmware, &mut board, &audio_lines(1, 0, &REPLY_MP3[..576], "")[0]);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.done","turn":1}"#);
+    board.speaking = true;
+    // The link stays up past the 15 s read time.
+    board.advance(10_000);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"device.heartbeat"}"#);
+    board.advance(6_000);
+    firmware.poll(&mut board);
+    assert_eq!(board.reply_audio.last(), Some(&ReplyAudio::Chunk { reply: 0, seq: 0, data: REPLY_MP3[..576].to_vec() }), "past the read time, still speaking");
+    board.speaking = false;
+    board.advance(10);
+    firmware.poll(&mut board);
+    assert_eq!(board.reply_audio.last(), Some(&ReplyAudio::Stop), "the overlay closes, and what was left to say goes with it");
+    assert_eq!(press(&mut firmware, &mut board, Key::K2, 50), [K2_PRESS]);
+
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    answered_turn(&mut firmware, &mut board);
+    send(&mut firmware, &mut board, &audio_lines(1, 0, &REPLY_MP3[..576], "")[0]);
+    board.reply_audio.clear();
+    assert!(press(&mut firmware, &mut board, Key::K2, 50).is_empty());
+    assert_eq!(board.reply_audio, [ReplyAudio::Stop]);
+}
+
+mod touchscreen {
+    use super::*;
+
+    fn touch_box() -> (Firmware, FakeBoard, Vec<String>) {
+        let mut board = FakeBoard::new(blank_flash());
+        board.touchscreen = true;
+        let mut firmware = Firmware::new(7, board.now_ms(), b"abc1234 2026-09-26 10:00", "1.2.3");
+        firmware.boot(&mut board);
+        let lines = board.take_lines();
+        (firmware, board, lines)
+    }
+
+    /// A finger down at (x, y) for about 80 ms, polling along the way; returns what was printed.
+    fn tap(firmware: &mut Firmware, board: &mut FakeBoard, x: i32, y: i32) -> Vec<String> {
+        board.advance(100);
+        board.finger = Some((x, y));
+        for _ in 0..4 {
+            firmware.poll(board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(board);
+        board.take_lines()
+    }
+
+    fn pixel(board: &FakeBoard, x: usize, y: usize) -> u16 {
+        let at = (y * 320 + x) * 2;
+        u16::from_be_bytes([board.frame[at], board.frame[at + 1]])
+    }
+
+    /// The middle of the menu list's row `index`.
+    fn row(index: i32) -> (i32, i32) {
+        (160, 61 + index * 23)
+    }
+
+    #[test]
+    fn a_touchscreen_is_reported_at_boot_and_on_hello() {
+        let (mut firmware, mut board, lines) = touch_box();
+        assert!(lines.contains(&"TOUCH CHSC5432".to_owned()), "{lines:?}");
+        let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+        assert_eq!(lines.last().map(String::as_str), Some("TOUCH CHSC5432"));
+    }
+
+    #[test]
+    fn a_box_without_one_never_reads_it() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        board.finger = Some((160, 100));
+        assert!(tap(&mut firmware, &mut board, 160, 100).is_empty());
+    }
+
+    #[test]
+    fn a_tapped_menu_row_is_selected_and_acted_on() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        // VOLUME, MUTE, COMPUTERS, NETWORK, STATUS.
+        let (x, y) = row(1);
+        assert_eq!(tap(&mut firmware, &mut board, x, y), [format!("TAP {x} {y}"), "MUTE ON".to_owned()]);
+        let (x, y) = row(0);
+        assert_eq!(tap(&mut firmware, &mut board, x, y), [format!("TAP {x} {y}"), "VOLUME 80".to_owned(), "AUDIO MUTED DONE".to_owned()]);
+        // The keys still work alongside, from the row the finger left selected.
+        assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["VOLUME 100", "AUDIO MUTED DONE"]);
+    }
+
+    /// The panel's inside, which covers whatever the screen underneath is doing.
+    fn panel(board: &FakeBoard) -> Vec<u16> {
+        (20..196).flat_map(|y| (34..286).map(move |x| (x, y))).map(|(x, y)| pixel(board, x, y)).collect()
+    }
+
+    #[test]
+    fn under_the_last_row_is_still_the_last_row() {
+        let (mut firmware, mut board, _) = touch_box();
+        // STATUS by the keys: VOLUME, MUTE, COMPUTERS, NETWORK, STATUS.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        for _ in 0..4 {
+            press(&mut firmware, &mut board, Key::K1, 50);
+        }
+        press(&mut firmware, &mut board, Key::K0, 50);
+        let status = panel(&board);
+        press(&mut firmware, &mut board, Key::K2, 50);
+
+        // On the box a finger aimed at STATUS landed 15 px under it, between the row and the hints.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        tap(&mut firmware, &mut board, 160, 185);
+        assert!(panel(&board) == status, "the tap opened STATUS");
+    }
+
+    #[test]
+    fn a_tapped_key_hint_is_that_key() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        // K1 NEXT, K0 CHANGE, K2 CLOSE along the bottom.
+        assert_eq!(tap(&mut firmware, &mut board, 60, 210), ["TAP 60 210"]);
+        assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["MUTE ON"], "K1's hint moved to MUTE");
+        assert_eq!(tap(&mut firmware, &mut board, 190, 210), ["TAP 190 210", "MENU CLOSED"]);
+        // On the STATUS view the hints are BACK and CLOSE, and the empty bar to the right is CLOSE too.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        tap(&mut firmware, &mut board, 160, 185);
+        assert_eq!(tap(&mut firmware, &mut board, 260, 210), ["TAP 260 210", "MENU CLOSED"]);
+        // Away from the panel, on the dimmed edge, is K2 too.
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 305, 130), ["TAP 305 130", "MENU CLOSED"]);
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        assert_eq!(tap(&mut firmware, &mut board, 5, 130), ["TAP 5 130", "MENU CLOSED"]);
+        // Closed, the same place is just the screen.
+        assert_eq!(tap(&mut firmware, &mut board, 190, 210), ["TAP 190 210"]);
+    }
+
+    #[test]
+    fn petting_the_buddy_changes_nothing_but_the_screen() {
+        let (mut firmware, mut board, _) = touch_box();
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
+        assert_eq!(tap(&mut firmware, &mut board, 160, 100), ["TAP 160 100"]);
+        assert_eq!(pixel(&board, 202, 34), 0xF800, "a heart over the buddy");
+        board.advance(1500);
+        firmware.poll(&mut board);
+        assert_ne!(pixel(&board, 202, 34), 0xF800, "and it goes");
+        // Off the buddy there's nothing to tap.
+        tap(&mut firmware, &mut board, 20, 200);
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
+    }
+
+    #[test]
+    fn a_tapped_card_asks_for_its_agent() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(
+            &mut firmware,
+            &mut board,
+            r#"{"version":1,"event":"task.start","title":"B","tasks":[{"title":"B","status":"working","elapsed_s":5,"id":"9f2c01ab"},{"title":"A","status":"input_required","elapsed_s":60,"id":"0d4e77c3"}]}"#,
+        );
+        // The second card sits 38 px under the first.
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104", r#"{"version":1,"event":"focus","task":"0d4e77c3"}"#]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66", r#"{"version":1,"event":"focus","task":"9f2c01ab"}"#]);
+        // Under the cards there's nothing; in Pomodoro there are no cards.
+        assert_eq!(tap(&mut firmware, &mut board, 100, 130), ["TAP 100 130"]);
+        press(&mut firmware, &mut board, Key::K1, 50);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66"]);
+    }
+
+    #[test]
+    fn a_card_from_an_older_daemon_or_with_an_odd_id_names_nothing() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(
+            &mut firmware,
+            &mut board,
+            r#"{"version":1,"event":"task.start","title":"B","tasks":[{"title":"B","status":"working","elapsed_s":5},{"title":"A","status":"working","elapsed_s":6,"id":"a\"b"}]}"#,
+        );
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66), ["TAP 100 66"]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104"]);
+    }
+
+    #[test]
+    fn a_slide_is_not_a_tap() {
+        let (mut firmware, mut board, _) = touch_box();
+        press(&mut firmware, &mut board, Key::K1, 1100);
+        board.advance(100);
+        board.finger = Some((160, 61));
+        firmware.poll(&mut board);
+        board.advance(40);
+        board.finger = Some((160, 130));
+        firmware.poll(&mut board);
+        board.advance(40);
+        board.finger = None;
+        firmware.poll(&mut board);
+        assert_eq!(board.take_lines(), ["SWIPE DOWN"], "a swipe, and in the menu it turns nothing");
+    }
+
+    /// A finger from (x, y) to (x, to_y) in 120 ms.
+    fn swipe(firmware: &mut Firmware, board: &mut FakeBoard, x: i32, y: i32, to_y: i32) -> Vec<String> {
+        board.advance(100);
+        for step in 0..=6 {
+            board.finger = Some((x, y + (to_y - y) * step / 6));
+            firmware.poll(board);
+            board.advance(20);
+        }
+        board.finger = None;
+        firmware.poll(board);
+        board.take_lines()
+    }
+
+    /// Five working cards, ids c1 to c5, the first from Claude Code, and seven activities in all.
+    const FIVE_CARDS: &str = r#"{"version":1,"event":"task.start","title":"CC:ONE","tasks_total":7,"tasks":[
+        {"id":"c1","agent":"claude-code","title":"CC:ONE","status":"working","elapsed_s":1},
+        {"id":"c2","agent":"codex","title":"CX:TWO","status":"working","elapsed_s":2},
+        {"id":"c3","agent":"github-actions","title":"CI:THREE","status":"working","elapsed_s":3},
+        {"id":"c4","agent":"opencode","title":"OC:FOUR","status":"working","elapsed_s":4},
+        {"id":"c5","agent":"unknown","title":"XX:FIVE","status":"working","elapsed_s":5}]}"#;
+
+    fn focus(id: &str) -> String {
+        format!(r#"{{"version":1,"event":"focus","task":"{id}"}}"#)
+    }
+
+    #[test]
+    fn a_swipe_turns_the_cards_page_and_taps_follow_it() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(pixel(&board, 22, 58), 0xDBAA, "Claude's spark in its orange, in place of CC:");
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 150, 60), ["SWIPE UP", "CARDS PAGE 2/2"]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c4"));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 104), ["TAP 100 104", &focus("c5")]);
+        assert_eq!(tap(&mut firmware, &mut board, 100, 142), ["TAP 100 142"], "page 2 has two cards");
+
+        // The page line under the cards turns it too, and down goes back.
+        assert_eq!(tap(&mut firmware, &mut board, 160, 212), ["TAP 160 212", "CARDS PAGE 1/2"]);
+        assert_eq!(swipe(&mut firmware, &mut board, 100, 60, 150), ["SWIPE DOWN", "CARDS PAGE 2/2"]);
+        // News starts from the first page.
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        assert_eq!(tap(&mut firmware, &mut board, 100, 66)[1], focus("c1"));
+    }
+
+    #[test]
+    fn the_pages_turn_by_themselves_unless_a_card_waits_or_a_finger_just_turned_them() {
+        let (mut firmware, mut board, _) = touch_box();
+        send(&mut firmware, &mut board, &FIVE_CARDS.replace('\n', ""));
+        let top = |board: &FakeBoard| pixel(board, 22, 58);
+        assert_eq!(top(&board), 0xDBAA);
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF, "page 2 opens with OpenCode's white frame");
+        board.advance(8_100);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA, "and wraps round");
+
+        // A finger's turn holds the page for 30 s.
+        swipe(&mut firmware, &mut board, 100, 150, 60);
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xFFFF);
+        board.advance(11_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
+
+        // A card waiting for an answer keeps the first page up.
+        let waiting = FIVE_CARDS.replace('\n', "").replacen(r#""status":"working""#, r#""status":"input_required""#, 1);
+        send(&mut firmware, &mut board, &waiting.replace("task.start", "agent.input_required"));
+        board.advance(20_000);
+        firmware.poll(&mut board);
+        assert_eq!(top(&board), 0xDBAA);
+    }
+
+    #[test]
+    fn a_tap_calls_the_buddy_back_from_leisure_and_does_nothing_else() {
+        let (mut firmware, mut board, _) = touch_box();
+        let mut lines = Vec::new();
+        for _ in 0..(10 * 60 / 5) {
+            board.advance(5_000);
+            lines.extend(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.heartbeat"}"#));
+            firmware.poll(&mut board);
+            lines.extend(board.take_lines());
+        }
+        assert!(lines.contains(&"MODE LEISURE".to_owned()), "{lines:?}");
+        // Where the buddy stands on duty: in Leisure it's no pet, only a way back.
+        assert_eq!(tap(&mut firmware, &mut board, 160, 100), ["TAP 160 100", "MODE DUTY", "LEISURE ALERT"]);
+        assert_ne!(pixel(&board, 202, 34), 0xF800);
     }
 }

@@ -11,7 +11,7 @@ The product name, in use since 2026-09-15 and written as one word since 2026-10-
 _Avoid_: Vibe Buddy (two words, the spelling until 2026-10-09), AgentBeacon, beacond, beacon-hook (old names, only when talking about history), 氛围助手 ("vibe assistant"; that is a description, not a name)
 
 **The buddy (氛围小助手)**:
-The only anthropomorphic presence on the device: the one who watches the Agents and speaks up for you. It is a role, not a look; at any moment it wears exactly one Character. Before 2026-09-15 it was called 小灯灵 ("little lamp sprite"); in code it is `buddy`.
+The only anthropomorphic presence on the device: the one who watches the Agents and speaks up for you. It is a role, not a look; at any moment it wears exactly one Character. It speaks in two ways: lines, written in advance, when an announcement fires; and spoken replies, written on the spot by the resident session in its persona, when the user talks to it. Before 2026-09-15 it was called 小灯灵 ("little lamp sprite"); in code it is `buddy`.
 _Avoid_: 小灯灵 (old name), pet (fine as a generic word, not when referring to this role), Pet, Codex pet, assistant (on its own it means an Agent, see below)
 
 **Character (角色)**:
@@ -23,7 +23,7 @@ A local AI assistant observed by VibeBuddy, such as Codex or Claude Code. An Age
 _Avoid_: client, AI, assistant; also never means a subagent inside Claude Code
 
 **Adapter**:
-The layer that translates one Agent's events into VibeBuddy domain concepts, consisting of the local privacy-filtering script and the event mapping inside the daemon. There is one Adapter per Agent; aggregation logic does not belong to the Adapter.
+The layer that translates between one Agent and VibeBuddy domain concepts, in both directions: the Agent's events into VibeBuddy concepts (the local privacy-filtering script and the event mapping inside the daemon), and voice commands and spoken replies into and out of that Agent's Sessions. There is one Adapter per Agent; aggregation logic does not belong to the Adapter.
 _Avoid_: integration, plugin, connector
 
 **App**:
@@ -48,7 +48,15 @@ _Avoid_: cloud, server, backend (too broad: later online features are not the Re
 
 **Pairing (配对)**:
 The lasting permission for a computer to link to a box. Pairing is done once per computer and box and needs no account; the paired computers of a box are the only ones that may link to it or take it over.
-_Avoid_: binding, registration, login (an account is a separate, later thing)
+_Avoid_: binding, registration, login (an account is a separate thing, see below)
+
+**Account (账户)**:
+A person's identity with VibeBuddy's online services, needed only for features that cost us money to run, voice commands first. It belongs to a person, never to a box: the user signs in on a computer, in the App, and a box is never signed in. It is layered on pairing and changes nothing about it: linking, takeover and the Relay need no account.
+_Avoid_: user (the person, not their account), box account, device registration, login (the act of signing in)
+
+**Daily allowance (每日额度)**:
+How many voice commands one account may make in a day. Past it, voice stops for that account until the next day; nothing else about the box changes.
+_Avoid_: quota, credits, plan, limit (on its own)
 
 **Takeover (接管)**:
 A paired computer becoming the one the box links to, ending the previous computer's link. Plugging in USB always takes over; otherwise the user takes over from the App, or another paired computer links on its own once the previous one has been gone long enough. Agent activity never moves the box between computers by itself.
@@ -65,11 +73,11 @@ _Avoid_: environment, entry point, entrypoint, surface, terminal (a terminal is 
 ### Sound
 
 **Announcement voice (播报音色)**:
-The single voice the buddy speaks with, shared by all its lines. It belongs to the Character and is never picked on its own: changing voice means changing Character.
+The single voice the buddy speaks with, shared by all its lines and spoken replies. It belongs to the Character and is never picked on its own: changing voice means changing Character.
 _Avoid_: sound, speech (speech means the lines themselves), TTS
 
 **Persona (人设)**:
-A Character's personality and way of talking, written down so that its lines can be written in it. A persona never sees what the Agents are working on.
+A Character's personality and way of talking, written down so that its lines can be written in it. Lines written in a persona never see what the Agents are working on; only the resident session, writing spoken replies in it, does.
 _Avoid_: system prompt (that is one way to use a persona), personality setting, style
 
 **Line (台词)**:
@@ -92,6 +100,24 @@ _Avoid_: do not disturb, DND, sound off
 The loudness level of the device speaker, from 20 to 100, stored on the device and kept across reboots; announcements and the Pomodoro chime share it. The App's slider is only a remote control, and it always shows the value the device reports back; the device menu changes it too. The minimum is not zero: the only way to silence the speaker is mute.
 _Avoid_: loudness, volume settings (that is a place in the App's UI, not this concept)
 
+### Voice commands
+
+**Voice command (语音指令)**:
+One sentence the user speaks to the box, turned into text and handed to the resident session as the user's own input. An Agent is the one who understands and acts on it; VibeBuddy only carries it, and never answers or executes a voice command itself.
+_Avoid_: voice assistant (an assistant means an Agent), prompt (that is the Agent's own word), dictation, voice input
+
+**Resident session (常驻会话)**:
+The one long-running Agent Session every voice command goes to, so the user never has to say which work they mean. It answers from what it can see of the Activities and hands work on to other Sessions, but does no work itself: it runs no commands and changes no files. There is only one, and it is never restarted to make room: when its context grows long, it is compacted. It is an Agent that speaks as the buddy, in the persona of the Character the user picked, and changes persona when the Character changes; it is never an Activity: it makes no task cards, announcements or stats.
+_Avoid_: assistant, concierge, dispatcher, main session
+
+**Brain (大脑)**:
+The Agent the resident session runs on: the user's own Codex, or the user's own Claude Code with their own Anthropic API key (never a Claude subscription). The user picks one, or leaves it automatic: Codex when it is ready, else Claude Code. Each brain has its own resident session; the UI calls the setting "Answered by".
+_Avoid_: model (that is what the brain runs on), backend, engine, provider
+
+**Spoken reply (口头回复)**:
+The short sentence the resident session writes for the user to hear in answer to a voice command, synthesized when it is spoken, in the announcement voice of the Character the user picked. Unlike a line, it is written at the moment it is spoken and may talk about what the Agents are doing.
+_Avoid_: line (lines are written in advance), announcement, TTS, response
+
 ### Modes
 
 **Mode (模式)**:
@@ -113,6 +139,20 @@ _Avoid_: session
 **Device menu (设备菜单)**:
 The box's own settings on its screen, opened by holding K1: volume, mute, giving up a Pomodoro phase, and a status view. It's stepped through with short presses and closes itself; it is an overlay, not a mode, and the mode underneath keeps running. It holds only what the box owns; everything else stays in the App.
 _Avoid_: settings (that's the App's window), menu on its own (that's the App's menu bar menu)
+
+### Touch
+
+**Touchscreen (触摸屏)**:
+A capacitive touch layer over the box's screen. Only some boxes have one: boxes of the same board differ in their screen module, and a buyer can't tell which they'll get. The firmware looks for it at boot and does without it when it isn't there, so touch only ever adds a faster way to something the keys already do, or a reaction that is pure decoration.
+_Avoid_: touch panel, touch box (it's the same box), touch mode (it isn't a Mode)
+
+**Tap (点按)**:
+The one touch gesture: a finger down and up again quickly, in about the same place. A tap acts on what is under it (a task card, a menu row, a key hint, the buddy) and counts as a key press for Leisure and Boredom.
+_Avoid_: click, touch on its own (that's the hardware), press (that's a key)
+
+**Pet (摸摸)**:
+A tap on the buddy. The buddy reacts on screen and nothing else changes; there is no key for it because there is nothing to do.
+_Avoid_: poke, stroke
 
 **Leisure (休闲)**:
 The mode the buddy wanders off into on its own after being idle long enough in On duty. It is driven by boredom, not switched by the user; any Agent activity, a button press or a dropped link sends it straight back to On duty.
@@ -148,9 +188,17 @@ Fixed wording for the App's English UI and English logs. Use these words when wr
 | 当日战绩 | today's stats | Written in the menu as Today: done · asks · busy |
 | 需要确认 | needs input | The voice line is Hey, I need you for a sec.; counted as asks in the stats |
 | 任务卡 | task card | |
+| 触摸屏 / 点按 / 摸摸 | touchscreen / tap / pet | Only some boxes have a touchscreen; on the box's STATUS view the row is TOUCH |
 | 固件 / 刷入 | firmware / flash | |
 | 配对 / 已配对的电脑 | pair / paired computers | On the box's menu the row is COMPUTERS; "this computer" marks the one the App runs on |
+| 账户 / 登录 / 退出登录 | account / sign in / sign out | Never "log in" or "login"; the account belongs to the person, never the box |
 | UART 桥 / 原生 USB | UART bridge / native USB | |
+| 语音指令 | voice command | |
+| 常驻会话 | resident session | Not shown to users so far; in the UI the buddy is the one you talk to |
+| 口头回复 | spoken reply | |
+| 对话 | conversation | The settings tab (Conversation) listing voice commands and the buddy's spoken replies; shown only while the resident session is on |
+| 由谁回答 / 自动 | Answered by / Automatic | The brain setting on the Conversation tab: Automatic, Codex or Claude Code; "brain" stays a code word |
+| Anthropic API 密钥 | Anthropic API key | The user's own key for Claude Code; never "Claude key" or "token", and never a Claude subscription |
 
 ### Activity lifecycle
 
@@ -167,7 +215,7 @@ A piece of work VibeBuddy is currently tracking, together with its current state
 _Avoid_: task, Job, Task (Task refers specifically to the on-device presentation, see below)
 
 **Task card (任务卡)**:
-How an Activity is presented on the device screen. At most 3 are shown at once, with the most recently active on top. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
+How an Activity is presented on the device screen. Up to 6 are sent, three to a page; those waiting for input come first, then the most recently active. Each shows its agent's icon, or the title's prefix for an agent without one. With two pages the box turns the page itself, and a touchscreen can swipe it. In the VibeBuddy Protocol the field that carries them is named `tasks`, a historical name from v1; it doesn't change the fact that the Activity is the domain object.
 _Avoid_: card, entry, Task item
 
 ### State and notifications

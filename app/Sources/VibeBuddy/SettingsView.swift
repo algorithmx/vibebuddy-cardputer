@@ -10,6 +10,17 @@ struct SettingsView: View {
             VoicesView(model: model).tabItem { Label("Character", systemImage: "person.crop.square") }
             HooksView(model: model).tabItem { Label("Agents", systemImage: "link") }
             DeviceView(model: model).tabItem { Label("Device", systemImage: "cpu") }
+            // Voice commands are experimental (VIBEBUDDY_RESIDENT_SESSION=1): no tab while the daemon has them off.
+            if model.residentEnabled {
+                ConversationView(
+                    load: { [client = model.client] in try await client.residentHistory(limit: ConversationView.limit) },
+                    info: { [client = model.client] in try await client.resident() },
+                    setBrain: { [client = model.client] choice in try await client.setResidentBrain(choice) },
+                    setKey: { [client = model.client] key in try await client.setAnthropicKey(key) }
+                )
+                    .tabItem { Label("Conversation", systemImage: "bubble.left.and.bubble.right") }
+            }
+            AccountView(model: model).tabItem { Label("Account", systemImage: "person.crop.circle") }
             AdvancedView(model: model).tabItem { Label("Advanced", systemImage: "wrench.and.screwdriver") }
         }
         .padding(20)
@@ -505,6 +516,10 @@ struct PairedComputersSection: View {
 
     var body: some View {
         Section {
+            // The box lists them over the cable only (ERROR cable_only otherwise), so the list would be empty.
+            if device.network == true {
+                Text("Plug in the cable to see the paired computers.").foregroundStyle(.secondary)
+            }
             ForEach(device.pairedComputers ?? []) { computer in
                 LabeledContent(computer.name.isEmpty ? String(localized: "Unnamed computer") : computer.name) {
                     if computer.key == device.computerKey {
@@ -557,7 +572,7 @@ struct DeviceView: View {
                     Text("This is a \(board) board, which released firmware doesn't run on, so no update is offered.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                if model.firmwareUpdateAvailable, connected, !onCable {
+                if model.firmwareUpdateAvailable, connected, !canFlash {
                     Text("Plug in the cable to update the box's firmware.").font(.caption).foregroundStyle(.secondary)
                 } else if model.firmwareUpdateAvailable, let offer = model.offeredFirmware {
                     Button("Update to \(offer.version)") { FlashConfirm.update(offer, then: model.updateFirmware) }
@@ -577,13 +592,16 @@ struct DeviceView: View {
                 if let operation = model.operation, operation.kind == .firmware {
                     OperationRow(operation: operation)
                     if operation.state == .failed {
-                        Text("Before retrying, hold K0 on the box and replug the cable to put it in download mode.").font(.caption).foregroundStyle(.secondary)
-                        Button("Retry") { model.updateFirmware() }.disabled(!onCable)
+                        // Firmware that updates over the link carries on from where it got to; download mode is for the rest.
+                        if model.status?.device.transfer != true {
+                            Text("Before retrying, hold K0 on the box and replug the cable to put it in download mode.").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Button("Retry") { model.updateFirmware() }.disabled(!canFlash)
                     }
                 }
                 HStack {
                     // Separately distributed firmware (VibeBuddy-firmware-*.zip on Releases) comes in here.
-                    Button("Flash from file…") { flashFromFile() }.disabled(!onCable)
+                    Button("Flash from file…") { flashFromFile() }.disabled(!canFlash)
                     Button("Make the box blink") { model.identify() }
                 }
                 .disabled(model.operationRunning || !connected)
@@ -619,8 +637,9 @@ struct DeviceView: View {
     }
 
     private var connected: Bool { model.status?.device.connected ?? false }
-    /// Flashing goes over the cable only: over Wi-Fi or the Relay the daemon refuses it.
-    private var onCable: Bool { connected && model.status?.device.network != true }
+    /// Firmware that reports `TRANSFER 1` is updated over whatever carries the link (ADR-0016); older firmware is
+    /// flashed over the cable only, and over Wi-Fi or the Relay the daemon refuses it.
+    private var canFlash: Bool { connected && (model.status?.device.network != true || model.status?.device.transfer == true) }
 
     /// The offered version, or why there is none: a bare dash read as "no update checks at all".
     private var latestFirmware: String {
@@ -782,6 +801,83 @@ enum FlashConfirm {
         alert.addButton(withTitle: String(localized: "Flash"))
         alert.addButton(withTitle: String(localized: "Cancel"))
         if alert.runModal() == .alertFirstButtonReturn { flash() }
+    }
+}
+
+/// The person's VibeBuddy account (ADR-0018). The daemon keeps the session; the App only opens the browser, and the
+/// status stream says when signing in finished there.
+struct AccountView: View {
+    @ObservedObject var model: AppModel
+    /// The browser is open on the sign-in page; cleared when the status says signed in.
+    @State private var waiting = false
+
+    private var account: AccountStatus? { model.status?.account }
+
+    var body: some View {
+        Form {
+            if model.status == nil {
+                Text("The daemon isn't running. Restart it on the Advanced tab.").foregroundStyle(.secondary)
+            } else if let account, account.available {
+                if account.signedIn {
+                    Text(signedInText)
+                    HStack {
+                        Button("Sign out") { signOut() }
+                        Button("Delete account…") { confirmDelete() }
+                    }
+                } else {
+                    Text("Signing in opens your browser. Voice commands need an account.").foregroundStyle(.secondary)
+                    HStack {
+                        Button("Sign in") { signIn() }
+                        if waiting {
+                            Text("Waiting for the browser…").foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } else {
+                Text("Signing in isn't available in this version of VibeBuddy.").foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: account?.signedIn) { waiting = false }
+    }
+
+    private var signedInText: String {
+        if let login = account?.githubLogin { return String(localized: "Signed in with GitHub as \(login)") }
+        if let id = account?.githubID { return String(localized: "Signed in with GitHub (user \(id))") }
+        return String(localized: "Signed in as \(account?.email ?? "")")
+    }
+
+    /// Each click starts a new sign-in; the daemon drops any unfinished one.
+    private func signIn() {
+        Task {
+            do {
+                let url = try await model.client.signIn()
+                NSWorkspace.shared.open(url)
+                waiting = true
+            } catch {
+                waiting = false
+                model.lastError = String(localized: "Couldn't sign in: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func signOut() {
+        Task {
+            do { try await model.client.signOut() } catch { model.lastError = String(localized: "Couldn't sign out: \(error.localizedDescription)") }
+        }
+    }
+
+    private func confirmDelete() {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Delete your VibeBuddy account?")
+        alert.informativeText = String(localized: "This deletes the account and everything kept about it, and signs out on every computer. It can't be undone.")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: String(localized: "Delete account")).hasDestructiveAction = true
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            do { try await model.client.deleteAccount() } catch { model.lastError = String(localized: "Couldn't delete the account: \(error.localizedDescription)") }
+        }
     }
 }
 

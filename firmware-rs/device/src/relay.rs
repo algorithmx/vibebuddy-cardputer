@@ -151,7 +151,8 @@ pub async fn task(stack: Stack<'static>, tls: Tls<'static>) {
         SOCKET.store(NEXT_SOCKET.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         let result = session(stack, &tls, host, &box_id).await;
         SOCKET.store(0, Ordering::Relaxed);
-        let _ = IN.try_send(RelayIn::Gone);
+        // Waits for room rather than drop it: a main loop that never hears the socket went keeps its session.
+        IN.send(RelayIn::Gone).await;
         match result {
             Err(MOVED) => continue,
             Err(STOPPED) => return,
@@ -199,8 +200,10 @@ async fn session(stack: Stack<'static>, tls: &Tls<'static>, host: &str, box_id: 
         Some(IpAddress::Ipv4(address)) => address,
         _ => return Err("dns"),
     };
-    // On the heap, which is PSRAM first.
-    let mut rx = alloc::vec![0u8; 4096];
+    // The receive window bounds a firmware update through the Relay to one window per round trip (ADR-0016): at
+    // about 0.3 s to the Relay's edge, 32 KB held a box to about 100 KB/s of sealed lines, measured. Without window
+    // scaling a TCP window stops just short of 64 KB. On the heap, which is PSRAM first.
+    let mut rx = alloc::vec![0u8; 63 * 1024];
     let mut tx = alloc::vec![0u8; 4096];
     let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
     socket.set_timeout(Some(DEAD_AFTER));

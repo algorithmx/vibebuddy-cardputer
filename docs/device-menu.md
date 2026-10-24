@@ -15,7 +15,7 @@ The frequent actions keep their keys, unchanged:
 | Gesture | Does | Change |
 |---|---|---|
 | K0 | Pomodoro start / pause / resume | none |
-| K0 long | Give up the current phase | none (also in the menu) |
+| K0 long | Give up the current phase; while the computer offers voice commands, push-to-talk instead (see [Voice commands](#voice-commands)) | none (also in the menu) |
 | K1 | Switch between On duty and Pomodoro | none |
 | **K1 long** | ~~Leisure now~~ | **opens the menu** |
 | K2 | Take me to the agent's window | none |
@@ -37,7 +37,7 @@ Muse manages with two keys because many of its boards only have two. This box ha
 
 | Row | Shown | K0 does |
 |---|---|---|
-| STOP FOCUS / END BREAK | only while a phase is running, paused or waiting to start its break | gives up the phase, like K0 long, and closes the menu |
+| STOP FOCUS / END BREAK | only while a phase is running, paused or waiting to start its break | gives up the phase, like K0 long without voice commands, and closes the menu |
 | VOLUME | always | steps 20 → 35 → 50 → 65 → 80 → 100 → 20 and plays the "All done!" line at the new level, as the app's preview does |
 | MUTE | always | toggles mute, like K2 long |
 | COMPUTERS | on a box with a key (ADR-0012); shows how many computers are paired | opens the COMPUTERS view below |
@@ -52,7 +52,7 @@ Volume steps are coarse on purpose: six presses cover the range, and the app's s
 
 ![The status view](images/menu-status.png)
 
-What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), how it is linked to its computer (LINK, as in the network view), the voice pack and today's focus tally. Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the computer?" gets answered without opening the app.
+What the box knows about itself, with nothing to change: the firmware and app builds (version over build time, see [`pet.md`](pet.md#build-identifiers)), how it is linked to its computer (LINK, as in the network view), the voice pack, today's focus tally and whether the box has a touchscreen (TOUCH: the chip's name, or NONE). Volume and mute aren't repeated here: the menu's own rows already show them. It's where "is it the box or the computer?" gets answered without opening the app.
 
 ### Computers
 
@@ -86,12 +86,62 @@ Every screen shows how the box is linked as a small icon in its top left: a plug
 
 ![USB, local network and Relay icons](images/link-icons.png)
 
+## Touch
+
+Some boxes have a touchscreen (ADR-0019). The firmware looks for one at boot and, on a box without, nothing here changes. On a box with one, a tap (down and up quickly, in about the same place) does what the keys do:
+
+- **A row** is selected and acted on at once, as K1 to the row and then K0 would. VOLUME steps, MUTE toggles, COMPUTERS opens; FORGET ALL and NEW ID still ask first.
+- **A key hint** along the bottom is that key: tap CLOSE to close, BACK to go back.
+- **The dimmed screen around the panel** closes the menu, as K2 does.
+- **A task card** on duty takes you to that card's agent: the box sends the card's id in a `focus` event and the daemon opens it, the way K2 opens the most pressing one ([`protocol.md`](protocol.md)).
+- **A swipe** up or down the screen, or a tap on the page line under the cards, turns the cards' page (below).
+- **The buddy** on duty, outside the menu, is petted: it hops with a heart for a moment, and nothing else changes.
+
+The tapped row, hint, card or buddy is outlined for a moment, so a tap that landed is seen to. A tap in Leisure only calls the buddy back, like any key, and wakes a screen dimmed for the night. The menu still opens on K1 held, and the Pomodoro screen has nothing to tap: a box on a desk gets brushed, and the timer stays on K0. Every tap prints `TAP <x> <y>` as a diagnostic line, and a swipe `SWIPE UP` or `SWIPE DOWN`.
+
+### Task card pages
+
+The daemon sends up to six cards, three a page, those waiting for input first (#155). Each card shows its agent's icon, the agent's own mark reduced to 16 × 16 pixels (`tools/make-agent-icons.py`), in place of the `CC:`-style prefix; CI has an icon of our own. With two pages:
+
+- the line under the cards says which page is up (`PAGE 1 OF 2`), and how many activities weren't sent at all (`2 MORE`);
+- a thin bar beside the cards shows which page is up;
+- every box turns the page by itself every 8 s, except while a card waits for input, when it stays on the first page;
+- on a touchscreen, a swipe or a tap on the page line turns it, and the box then leaves the pages alone for 30 s;
+- any new task event goes back to the first page.
+
+![The first page](images/cards-page-1.png) ![The second page, after a swipe up](images/cards-page-2.png)
+
+![A tapped row](images/touch-row.png) ![The buddy petted](images/touch-pet.png)
+
 ## Behavior around the menu
 
-- **Agent events don't wait for the menu.** An event that needs the user (input required, failed) closes the menu so the screen can show it; its line is announced as usual. Other events (working, done) update the screen underneath and show once the menu closes. A Pomodoro phase ending closes the menu too, since its alarm needs K0.
+- **Agent events don't wait for the menu** (the voice overlay is different: there they wait, see docs/protocol.md, "Voice commands"). An event that needs the user (input required, failed) closes the menu so the screen can show it; its line is announced as usual. Other events (working, done) update the screen underneath and show once the menu closes. A Pomodoro phase ending closes the menu too, since its alarm needs K0.
 - **Leisure** is left for On duty the moment the menu opens, like any key press today, and doesn't start while the menu is open.
 - **Volume and mute stay where they are.** The menu changes the same values as the app and K2 long. A volume change from the menu prints the `VOLUME <n>` line `device.volume` already uses, so the daemon's status, and the app's slider, follow; mute keeps its `MUTE ON` / `OFF` lines and stays device-only, as [`app.md`](app.md) says.
 - **Nothing moves to the box that belongs to the Mac.** Connecting agents, the voice library, firmware updates, launch at login and notifications all stay in the app: they need the Mac's files, network or system settings. The box holds one voice pack at a time, so there's nothing to choose between on it. The menu is about making the box's own controls visible, not about replacing the app.
+
+## Voice commands
+
+Status: built 2026-10-13, not yet tried on a box; experimental, off until the computer offers it (ADR-0017, [`protocol.md`](protocol.md), "Voice commands (experimental)"). The screens are rendered by the firmware on the Mac: `cargo run -p vibebuddy-firmware-core --example voice_preview -- <directory>`.
+
+A voice command has an overlay of its own, drawn like the menu's panel and, like the menu, not a mode: the mode underneath keeps running.
+
+| Gesture | Without voice commands | While the computer offers them |
+|---|---|---|
+| K0 long | gives up the Pomodoro phase | push-to-talk: records while K0 stays down, up to 30 s; giving up the phase is the menu's STOP FOCUS / END BREAK |
+
+![Recording](images/voice-listening.png) ![What was heard and the reply](images/voice-reply.png) ![An error](images/voice-error.png)
+
+- **LISTENING** appears when the long press fires, a second after K0 went down, and that is when recording starts. The meter shows the level of each 100 ms (green, then yellow, then orange near the top); under it, the seconds left. Letting go sends it; under half a second is taken as a slip and cancelled. K2 cancels; other keys do nothing while recording.
+- **THINKING** follows until the computer answers. What it heard shows dimmed, then each spoken reply as it comes, in large type while it fits and small type after that; past what small type holds, the oldest rows give way. The title says **REPLY** once there is one.
+- After the computer says the turn is done, the text stays up 15 s to be read. An error shows a short message for 6 s: NOT HEARD, UNAVAILABLE, BUSY, or NO MICROPHONE when the box couldn't start recording. With nothing from the computer for a minute, the overlay closes on its own.
+- K2 closes the overlay; a long K0 starts the next command; any other key closes it and does its own job.
+- **Events that need the user win**, as with the menu: input required, failed, or a Pomodoro phase ending closes the overlay, and a recording in progress is given up (`VOICE CANCEL`).
+- **Text only.** Spoken replies are text until there is speech synthesis, so mute changes nothing here. Chinese draws in a 12 px pixel font beside the 5×7 ASCII one, and text with Chinese in it uses small type throughout ([`firmware-bringup.md`](firmware-bringup.md), "Fonts").
+
+## Updates over the link
+
+While firmware or a Character pack comes in over the link (ADR-0016), a panel covers the screen, the menu and a voice command included: **UPDATING** or **NEW CHARACTER**, a progress bar and its percent, and `K2 HOLD: CANCEL`. Only a long K2 counts then: it cancels the transfer. The other keys, a short K2 and touch do nothing until the transfer ends; one its computer has left for 5 minutes ends on its own ([`protocol.md`](protocol.md), "Firmware and Character packs over the link").
 
 ## Constraints from the hardware
 

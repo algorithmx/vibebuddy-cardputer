@@ -11,24 +11,32 @@ use alloc::vec::Vec;
 use serde_json::{Map, Value};
 use vibebuddy_protocol::{Event, ProtocolError, VERSION};
 
-use crate::audio::{Occasion, Sound, clamp_volume, VOLUME_DEFAULT};
+use crate::audio::{ES8311_ADDRESS, Occasion, SAMPLE_RATE, Sound, clamp_volume, VOLUME_DEFAULT};
+use crate::mic;
 use crate::buttons::{ButtonEvent, Buttons, Levels};
-use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, SNAPSHOT_LINE_BYTES, Scene, Screen, Snapshot, State, TaskInput, Tone};
+use crate::display::{Display, LinkPath, MAX_STATS, MAX_TASKS, Mode, Panel, PanelKind, SNAPSHOT_LINE_BYTES, Scene, Screen, Snapshot, State, Target, TaskInput, Tone};
 use crate::leisure::{Leisure, Tier};
 use crate::menu::{self, Action as MenuAction, ComputersRow, Context as MenuContext, Menu, Row, View};
 use crate::pomodoro::{Phase, Pomodoro, Run, Transition};
 use crate::relay_box;
 use crate::storage::{Flash, Settings, SettingsStore, find_partition};
 use crate::text;
-use crate::voice_pack::crc32;
+use crate::spoken_reply::ReplyAudio;
+use crate::agent_icon::AgentIcon;
+use crate::touch::{self, Direction, Gesture, Gestures};
+use crate::voice_pack::{crc32, decode_base64};
 use crate::lines::LinePicker;
 use crate::lan::{Conn, Lan, Output as LanOutput};
 use crate::noise::Sealer;
 use crate::link::{self, Link, LinkStore, PairError, Wifi};
 use crate::look::Look;
 use crate::voices::{Pick, Voices, VoiceError};
+use crate::transfer::{self, Transfer};
+use crate::ota;
+use crate::voice_command::{self, Out as VoiceOut, VoiceCommand};
 
-pub const MAX_LINE_BYTES: usize = 1024;
+/// Longest line taken from a computer: a transfer chunk of 3072 bytes is about 4.2 KB as a line (ADR-0016).
+pub const MAX_LINE_BYTES: usize = 4608;
 const LINE_BUFFER_BYTES: usize = MAX_LINE_BYTES + 2;
 /// With no message for longer than this, the link to the Mac counts as lost.
 const LINK_TIMEOUT_MS: u32 = 15000;
@@ -36,6 +44,9 @@ const LINK_TIMEOUT_MS: u32 = 15000;
 const DONE_TO_IDLE_MS: u32 = 5000;
 /// voice.begin waits at most this long for the line being played to finish; the longest line is under 7 seconds.
 const AUDIO_DRAIN_MS: u32 = 10000;
+/// A transfer whose computer has said nothing about it this long is given up, so the keys and the screen come back:
+/// the daemon waits 3 minutes for a dropped link before it gives up itself (ADR-0016).
+const TRANSFER_ABANDONED_MS: u32 = 5 * 60_000;
 /// Task ends this close together speak once: a burst of three dones read out back to back is noise, and the
 /// screen already shows every card. Longer than the longest line, so the window also covers its playback.
 const MERGE_WINDOW_MS: u32 = 15000;
@@ -78,6 +89,15 @@ pub trait Board: Screen {
     /// K0's level and the levels of K1 and K2 on the expander (true means pressed); None if the expander read fails.
     fn read_buttons(&mut self) -> (bool, Option<(bool, bool)>);
 
+    /// Looks for a touchscreen and returns its chip's name; None on a box without one (ADR-0019).
+    fn init_touch(&mut self) -> Option<&'static str> {
+        None
+    }
+    /// The touch controller's report ([`touch::parse_report`]); None if the read fails.
+    fn read_touch(&mut self) -> Option<[u8; touch::REPORT_BYTES]> {
+        None
+    }
+
     /// Queues a sound to play after whatever is already queued. Returns Err when the queue is full.
     fn play(&mut self, sound: Sound) -> Result<(), ()>;
     /// Stops what is playing and clears the queue.
@@ -108,6 +128,70 @@ pub trait Board: Screen {
     }
     /// Starts the box again from the top, as after power-on.
     fn restart(&mut self) {}
+
+    /// One register read on the codec's I2C bus; None when nothing acknowledges. For the microphone
+    /// diagnostic ([`crate::mic`]).
+    fn i2c_read(&mut self, _address: u8, _register: u8) -> Option<u8> {
+        None
+    }
+    fn i2c_write(&mut self, _address: u8, _register: u8, _value: u8) -> Result<(), ()> {
+        Err(())
+    }
+    /// Starts capturing `bytes` of I2S input (24 kHz, 16-bit, two slots, little endian). Err where the
+    /// board has no input.
+    fn mic_start(&mut self, _bytes: usize) -> Result<(), ()> {
+        Err(())
+    }
+    /// The capture once all of it is in, or why it stopped short; None while it is still running.
+    fn mic_take(&mut self) -> Option<Result<Vec<u8>, &'static str>> {
+        None
+    }
+
+    /// Starts the microphone for a voice command ([`crate::voice_command`]): the left slot (the ES8311's ADC)
+    /// at 24 kHz, without end, until [`Board::voice_stop`]. Err where the board can't record.
+    fn voice_start(&mut self) -> Result<(), ()> {
+        Err(())
+    }
+    /// Appends the samples recorded since the last call, without waiting.
+    fn voice_take(&mut self, _samples: &mut Vec<i16>) {}
+    fn voice_stop(&mut self) {}
+    /// Writes one line of an audio stream (`VOICE DATA`) to the links that can carry one, and drops it whole
+    /// where it doesn't fit right now rather than wait: a gap in `seq` is what the computer expects then.
+    fn write_stream(&mut self, line: &[u8]) {
+        self.write(line);
+    }
+    /// Hands a spoken reply's audio to the player ([`crate::spoken_reply`]), which the speaker plays from while
+    /// no announcement is playing, through the same output and at the same volume.
+    fn reply_audio(&mut self, _audio: ReplyAudio) {}
+    /// A spoken reply is making sound right now.
+    fn reply_speaking(&self) -> bool {
+        false
+    }
+}
+
+/// The codec's registers through the board's I2C, for register sequences in core.
+struct BoardI2c<'a, B: Board> {
+    board: &'a mut B,
+    address: u8,
+}
+
+impl<B: Board> crate::audio::Registers for BoardI2c<'_, B> {
+    type Error = ();
+    fn read(&mut self, register: u8) -> Result<u8, ()> {
+        self.board.i2c_read(self.address, register).ok_or(())
+    }
+    fn write(&mut self, register: u8, value: u8) -> Result<(), ()> {
+        self.board.i2c_write(self.address, register, value)
+    }
+}
+
+/// Where the microphone diagnostic is.
+enum MicState {
+    Idle,
+    /// Capturing since this time.
+    Recording { since: u32 },
+    /// Streaming the capture out as `MIC DATA` lines, one per poll.
+    Sending { capture: Vec<u8>, sent: usize },
 }
 
 /// What the box is linked to without the Relay.
@@ -126,6 +210,8 @@ pub struct Firmware {
     voices: Voices,
     picker: LinePicker,
     buttons: Option<Buttons>,
+    /// The touchscreen's chip, taps so far and when to read it next; None on a box without one.
+    touch: Option<(&'static str, Gestures, u32)>,
     settings: Option<SettingsStore>,
     /// The box's key and paired computers, and where they are kept; None without a link partition.
     link: Option<(LinkStore, Link)>,
@@ -171,6 +257,13 @@ pub struct Firmware {
     menu: Menu,
     /// voice.begin arrived and we are waiting for playback to stop before erasing the partition: total bytes and when the wait began.
     pending_voice_begin: Option<(u32, u32)>,
+    /// A firmware image or a Character pack coming in over the link (ADR-0016).
+    transfer: Transfer,
+    /// A Character pack transfer set the current pack aside, since when (for the line playing to finish first);
+    /// the pack is loaded again whenever that transfer ends, however it ends.
+    pack_set_aside: Option<u32>,
+    /// When the computer last said anything about the transfer: one gone for [`TRANSFER_ABANDONED_MS`] is given up.
+    transfer_heard: u32,
     /// The last task end that was spoken: whether it was a failure, and when.
     last_end_spoken: Option<(bool, u32)>,
 
@@ -179,6 +272,17 @@ pub struct Firmware {
     reported_lights_out: bool,
     reported_hour: i32,
     reported_look: alloc::string::String,
+    mic: MicState,
+    /// Voice commands: whether the computer offers them, the turn and its overlay.
+    voice: VoiceCommand,
+    /// The microphone is running for a voice command.
+    voice_mic: bool,
+    /// The turn whose spoken replies are played; None once they were stopped (an announcement, mute, K2, the
+    /// overlay closing), and the rest of that turn's audio is then ignored.
+    reply_turn: Option<u32>,
+    /// An Agent's news that came while the voice overlay was up: it doesn't take the screen from a conversation
+    /// the user is having, the overlay marks it, and it is announced once the overlay closes. The worst one wins.
+    voice_held: Option<Occasion>,
 }
 
 /// Borrows the Firmware's pomodoro and leisure director to build the context for one frame.
@@ -225,6 +329,20 @@ fn number(fields: &impl Fields, key: &str) -> Option<f64> {
     fields.field(key).and_then(Value::as_f64)
 }
 
+/// Exactly `N` bytes from lowercase or uppercase hex.
+fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let digits = text.as_bytes();
+    if digits.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (index, pair) in digits.chunks(2).enumerate() {
+        let value = |digit: u8| (digit as char).to_digit(16);
+        out[index] = (value(pair[0])? * 16 + value(pair[1])?) as u8;
+    }
+    Some(out)
+}
+
 fn string<'a>(fields: &'a impl Fields, key: &str) -> Option<&'a str> {
     fields.field(key).and_then(Value::as_str)
 }
@@ -258,6 +376,7 @@ impl Firmware {
             voices: Voices::new(),
             picker: LinePicker::new(seed ^ 0x9E37_79B9),
             buttons: None,
+            touch: None,
             settings: None,
             link: None,
             // Good enough for tests and the simulator; the device passes hardware entropy.
@@ -285,11 +404,19 @@ impl Firmware {
             muted: false,
             menu: Menu::new(),
             pending_voice_begin: None,
+            transfer: Transfer::new(),
+            pack_set_aside: None,
+            transfer_heard: 0,
             last_end_spoken: None,
             reported_tier: Tier::Alert,
             reported_lights_out: false,
             reported_hour: -1,
             reported_look: alloc::string::String::from("ROBOT"),
+            mic: MicState::Idle,
+            voice: VoiceCommand::new(),
+            voice_mic: false,
+            reply_turn: None,
+            voice_held: None,
         }
     }
 
@@ -346,6 +473,7 @@ impl Firmware {
             Self::write_literal(board, "DISPLAY ERROR\n");
         }
         Self::write_value_line(board, "FIRMWARE VERSION ", self.version.as_bytes());
+        Self::announce_updates(board);
         self.announce_key(board);
 
         let voices_region = find_partition(board.flash(), "voices");
@@ -372,6 +500,8 @@ impl Firmware {
             }
             None => Self::write_literal(board, "BUTTONS ERROR\n"),
         }
+        self.touch = board.init_touch().map(|chip| (chip, Gestures::new(), board.now_ms()));
+        self.announce_touch(board);
 
         self.last_message_ms = board.now_ms();
         board.write(b"READY vibebuddy-fw ");
@@ -571,6 +701,25 @@ impl Firmware {
     }
 
     pub fn poll<B: Board>(&mut self, board: &mut B) {
+        // A transfer erases one block per pass, so the network and the screen keep running. A pack waits for the line
+        // playing to finish first: it is read from the partition being erased (see continue_voice_begin).
+        let draining = self.transfer.erasing() == Some(transfer::Kind::Character)
+            && self.pack_set_aside.is_some_and(|since| board.audio_busy() && (board.now_ms().wrapping_sub(since) as i32) < AUDIO_DRAIN_MS as i32);
+        if !draining && self.transfer.erasing().is_some() {
+            match self.transfer.erase_step(board.flash()) {
+                Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+                Ok(None) => {}
+                Err(failure) => Self::transfer_error(board, failure),
+            }
+            self.after_transfer(board);
+            self.show_overlay(board);
+        }
+        if self.transfer.active() && board.now_ms().wrapping_sub(self.transfer_heard) >= TRANSFER_ABANDONED_MS {
+            self.transfer.cancel();
+            Self::write_literal(board, "XFER ABANDONED\n");
+            self.after_transfer(board);
+            self.show_overlay(board);
+        }
         let now = board.now_ms();
         let outputs = self.lan.poll(now);
         self.apply_lan(board, outputs);
@@ -590,11 +739,14 @@ impl Firmware {
         }
         self.continue_voice_begin(board);
         self.send_snapshot(board, now);
+        self.tend_mic(board, now);
+        self.tend_voice(board, now);
         if self.menu.expire(now) {
             Self::write_literal(board, "MENU CLOSED\n");
-            self.show_menu(board);
+            self.show_overlay(board);
         }
         self.tick_buttons(board);
+        self.tick_touch(board);
         let transition = self.pomodoro.tick(board.now_ms());
         self.handle_pomodoro_transition(board, transition);
         self.tend_leisure(board);
@@ -621,7 +773,89 @@ impl Firmware {
         }
     }
 
+    /// `device.mic.record`: report what answers on I2C where a microphone ADC could be, set the ES8311's
+    /// microphone gain if there is one, and start capturing; `tend_mic` reports and sends the result.
+    fn start_mic<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>) {
+        if !matches!(self.mic, MicState::Idle) || self.voice_mic {
+            return Self::write_literal(board, "MIC BUSY\n");
+        }
+        let ms = number(fields, "ms").map_or(mic::DEFAULT_MS, |ms| (ms.max(0.0) as u32).clamp(mic::MIN_MS, mic::MAX_MS));
+        let gain = number(fields, "gain_db").map_or(mic::DEFAULT_GAIN_DB, |db| (db.max(0.0) as u32).min(mic::MAX_GAIN_DB));
+        let mut es8311 = false;
+        for (address, [high, low]) in mic::PROBES {
+            let id = board.i2c_read(address, high).zip(board.i2c_read(address, low));
+            es8311 |= address == ES8311_ADDRESS && id.is_some();
+            let line = match id {
+                Some((high, low)) => text!(32, "MIC PROBE 0x{:02X} ID {:02X}{:02X}\n", address, high, low),
+                None => text!(32, "MIC PROBE 0x{:02X} NONE\n", address),
+            };
+            board.write(line.as_bytes());
+        }
+        if es8311 {
+            let line = match mic::set_es8311_mic_gain(&mut BoardI2c { board: &mut *board, address: ES8311_ADDRESS }, gain) {
+                Ok(()) => text!(24, "MIC GAIN {} DB\n", mic::mic_gain_register(gain) as u32 * 6),
+                Err(()) => text!(24, "MIC GAIN ERROR\n"),
+            };
+            board.write(line.as_bytes());
+        }
+        match board.mic_start(mic::capture_bytes(ms)) {
+            Ok(()) => {
+                self.mic = MicState::Recording { since: board.now_ms() };
+                board.write(text!(32, "MIC RECORDING {} MS\n", ms).as_bytes());
+            }
+            Err(()) => Self::write_literal(board, "MIC UNAVAILABLE\n"),
+        }
+    }
+
+    fn tend_mic<B: Board>(&mut self, board: &mut B, now: u32) {
+        match &mut self.mic {
+            MicState::Idle => {}
+            MicState::Recording { since } => {
+                let since = *since;
+                match board.mic_take() {
+                    None => {}
+                    Some(Err(reason)) => {
+                        Self::write_value_line(board, "MIC ERROR ", reason.as_bytes());
+                        self.mic = MicState::Idle;
+                    }
+                    Some(Ok(capture)) => {
+                        // Much longer than asked for means samples were lost on the way in.
+                        let line = text!(48, "MIC CAPTURED {} MS {} BYTES\n", now.wrapping_sub(since), capture.len());
+                        board.write(line.as_bytes());
+                        for (index, [left, right]) in mic::levels(&capture).iter().enumerate() {
+                            let at = index as u32 * mic::LEVEL_WINDOW_MS;
+                            let line = text!(64, "MIC LEVEL {} L {} {} R {} {}\n", at, left.rms, left.peak, right.rms, right.peak);
+                            board.write(line.as_bytes());
+                        }
+                        let line = text!(48, "MIC BEGIN {} {} 16 {}\n", SAMPLE_RATE, mic::CHANNELS, capture.len());
+                        board.write(line.as_bytes());
+                        self.mic = MicState::Sending { capture, sent: 0 };
+                    }
+                }
+            }
+            // One line per pass, so the main loop keeps running while a minute of lines goes out over the UART.
+            MicState::Sending { capture, sent } if *sent < capture.len() => {
+                let end = (*sent + mic::DATA_CHUNK_BYTES).min(capture.len());
+                let mut line = alloc::format!("MIC DATA {} ", *sent / mic::DATA_CHUNK_BYTES);
+                line.push_str(&mic::encode_base64(&capture[*sent..end]));
+                // One write, so the newline can't be dropped apart from its line.
+                line.push('\n');
+                board.write(line.as_bytes());
+                *sent = end;
+            }
+            MicState::Sending { capture, .. } => {
+                let line = text!(48, "MIC END {} {}\n", capture.len(), crc32(0, capture));
+                board.write(line.as_bytes());
+                self.mic = MicState::Idle;
+            }
+        }
+    }
+
     fn set_link_lost<B: Board>(&mut self, board: &mut B, lost: bool) {
+        if lost && !self.link_lost {
+            // Whoever offered voice is gone; the next link offers it again if it can.
+            self.set_voice_available(board, false);
+        }
         self.link_lost = lost;
         let now = board.now_ms();
         self.display.set_link_lost(board, &scene!(self, now), lost);
@@ -653,6 +887,11 @@ impl Firmware {
             Self::write_value_line(board, "AUDIO MUTED ", label.as_bytes());
             return;
         }
+        // A firmware update is silent: the box restarts at its end, and the news comes again after (ADR-0016).
+        if self.transfer.kind() == Some(transfer::Kind::Firmware) {
+            Self::write_value_line(board, "AUDIO UPDATING ", label.as_bytes());
+            return;
+        }
         // While a write is about to start, the partition is no longer trusted.
         let pick = if self.pending_voice_begin.is_some() { None } else { self.voices.pick(occasion, &mut self.picker) };
         let (first, then) = match pick {
@@ -666,6 +905,10 @@ impl Firmware {
                 }
             },
         };
+        // An announcement or the Pomodoro chime wins over a spoken reply: the reply stops and the rest of its turn
+        // stays text only. The announcement is the box's own news and is short; queued behind a reply it
+        // could come half a minute late, and two voices taking turns would be one too many.
+        self.stop_reply(board);
         let queued = self.audio_ready && board.play(first).is_ok() && then.is_none_or(|sound| board.play(sound).is_ok());
         if queued {
             Self::write_value_line(board, "AUDIO QUEUED ", label.as_bytes());
@@ -718,12 +961,130 @@ impl Firmware {
         }
     }
 
+    fn tick_touch<B: Board>(&mut self, board: &mut B) {
+        let now = board.now_ms();
+        let Some((_, gestures, next_read)) = self.touch.as_mut() else {
+            return;
+        };
+        if (now.wrapping_sub(*next_read) as i32) < 0 {
+            return;
+        }
+        *next_read = now.wrapping_add(touch::POLL_MS);
+        let sample = board.read_touch().and_then(|report| touch::parse_report(&report));
+        match gestures.update(sample, now) {
+            Some(Gesture::Tap(point)) => self.on_tap(board, point),
+            Some(Gesture::Swipe(direction)) => self.on_swipe(board, direction),
+            None => {}
+        }
+    }
+
+    /// A swipe up or down turns the task cards' page (#155). Like a tap, it counts as a key press for Leisure and
+    /// Boredom, and in Leisure only calls the buddy back.
+    fn on_swipe<B: Board>(&mut self, board: &mut B, direction: Direction) {
+        let now = board.now_ms();
+        Self::write_literal(board, if direction == Direction::Up { "SWIPE UP\n" } else { "SWIPE DOWN\n" });
+        self.leisure.note_activity(now);
+        if self.display.mode() == Mode::Leisure {
+            self.leisure.tick(now);
+            self.set_mode(board, Mode::Duty);
+            return;
+        }
+        self.turn_page(board, direction == Direction::Up);
+    }
+
+    fn turn_page<B: Board>(&mut self, board: &mut B, forward: bool) {
+        let now = board.now_ms();
+        if let Some((page, pages)) = self.display.turn_page(board, &scene!(self, now), forward) {
+            let line = text!(24, "CARDS PAGE {}/{}\n", page + 1, pages);
+            board.write(line.as_bytes());
+        }
+    }
+
+    /// A tap (ADR-0019). It counts as a key press for Leisure and Boredom, so in Leisure it only calls the buddy
+    /// back, waking a screen dimmed for the night. Otherwise it acts on what it landed on: a menu row is selected
+    /// and acted on, a key hint is that key, the dimmed screen around the menu closes it, the buddy is petted.
+    /// Anything that changes state can also be done with the keys.
+    fn on_tap<B: Board>(&mut self, board: &mut B, point: touch::Point) {
+        let now = board.now_ms();
+        let line = text!(24, "TAP {} {}\n", point.x, point.y);
+        board.write(line.as_bytes());
+        // A transfer's panel covers everything, and only a long K2 cancels it.
+        if self.transfer.active() {
+            return;
+        }
+        self.leisure.note_activity(now);
+        if self.display.mode() == Mode::Leisure {
+            self.leisure.tick(now);
+            self.set_mode(board, Mode::Duty);
+            return;
+        }
+        let Some(target) = self.display.target_at(point.x, point.y) else {
+            return;
+        };
+        self.display.highlight(board, &scene!(self, now), target);
+        match target {
+            Target::Row(index) => {
+                let action = self.menu.tap_row(index, self.menu_context(now), now);
+                self.on_menu_action(board, action);
+            }
+            Target::Hint(index) => {
+                let key = self.menu.view().and_then(|view| self.menu_panel(view, now).hints.get(index).map(|hint| hint.0));
+                let event = match key {
+                    Some(b"K0") => ButtonEvent::K0Short,
+                    Some(b"K1") => ButtonEvent::K1Short,
+                    Some(b"K2") => ButtonEvent::K2Short,
+                    _ => return,
+                };
+                self.on_button(board, event);
+            }
+            // Tapping away from the menu closes it, as K2 does.
+            Target::OutsidePanel => self.on_button(board, ButtonEvent::K2Short),
+            Target::Buddy => self.display.pet(board, &scene!(self, now)),
+            Target::PageLine => self.turn_page(board, true),
+            // The daemon opens that card's agent, as K2 opens the most pressing one.
+            Target::Card(index) => {
+                if let Some(id) = self.display.card_id(index) {
+                    let line = text!(80, "{{\"version\":1,\"event\":\"focus\",\"task\":\"{}\"}}\n", core::str::from_utf8(id).unwrap_or_default());
+                    board.write(line.as_bytes());
+                }
+            }
+        }
+    }
+
     /// Each of the three keys does one thing regardless of mode: K0 is the pomodoro key, K1
     /// switches between duty and pomodoro (long press opens the menu), and K2 asks the Mac to
     /// open the source. While the menu is open the keys are its own (menu.rs). In leisure mode any key first calls the buddy back to duty and then does
     /// its own job: leisure hides nothing that needs a look first.
     fn on_button<B: Board>(&mut self, board: &mut B, event: ButtonEvent) {
         let now = board.now_ms();
+        // While a transfer comes in only a long K2 counts: it cancels (ADR-0016).
+        if self.transfer.active() {
+            if event == ButtonEvent::K2Long {
+                self.transfer.cancel();
+                Self::transfer_error(board, transfer::Error::Cancelled);
+                Self::write_literal(board, "XFER CANCELLED\n");
+                self.after_transfer(board);
+                self.show_overlay(board);
+            }
+            return;
+        }
+        // Letting go of K0 after a long press only ends a recording.
+        if event == ButtonEvent::K0LongEnd {
+            if self.voice.listening() {
+                self.end_recording(board, now);
+            }
+            return;
+        }
+        // The voice command's overlay: while recording only K2 (cancel) counts; afterwards K2 closes it, a
+        // long K0 starts the next command, and any other key closes it and then does its own job.
+        if self.voice.is_open() {
+            match event {
+                ButtonEvent::K2Short => return self.close_voice(board),
+                _ if self.voice.listening() => return,
+                ButtonEvent::K0Long if self.voice.available() => {}
+                _ => self.close_voice(board),
+            }
+        }
         if self.menu.is_open() {
             self.leisure.note_activity(now);
             let action = self.menu.key(event, self.menu_context(now), now);
@@ -753,14 +1114,20 @@ impl Firmware {
             ButtonEvent::K1Long => {
                 self.menu.open(self.menu_context(now), now);
                 Self::write_literal(board, "MENU OPEN\n");
-                self.show_menu(board);
+                self.show_overlay(board);
                 return;
             }
-            ButtonEvent::K0Short | ButtonEvent::K0Long => {}
+            ButtonEvent::K0Short | ButtonEvent::K0Long | ButtonEvent::K0LongEnd => {}
         }
 
+        // While the computer offers voice commands, a long K0 is push-to-talk; giving up a phase is then in
+        // the menu (ADR-0017).
         if event == ButtonEvent::K0Long {
-            self.stop_phase(board);
+            if self.voice.available() {
+                self.start_recording(board, now);
+            } else {
+                self.stop_phase(board);
+            }
             return;
         }
         let before = self.pomodoro.view(now);
@@ -792,6 +1159,10 @@ impl Firmware {
     /// K2 long, or MUTE in the menu.
     fn toggle_mute<B: Board>(&mut self, board: &mut B) {
         self.muted = !self.muted;
+        // Muting silences a reply at once; unmuting doesn't bring back the rest of that turn.
+        if self.muted {
+            self.stop_reply(board);
+        }
         let now = board.now_ms();
         let muted = self.muted;
         self.display.set_muted(board, &scene!(self, now), muted);
@@ -829,7 +1200,7 @@ impl Firmware {
             MenuAction::Close => Self::write_literal(board, "MENU CLOSED\n"),
             MenuAction::StopPhase => {
                 Self::write_literal(board, "MENU CLOSED\n");
-                self.show_menu(board);
+                self.show_overlay(board);
                 self.stop_phase(board);
             }
             // The preview goes through announce, so it is silent when muted, like the app's.
@@ -841,27 +1212,243 @@ impl Firmware {
             MenuAction::ForgetComputers => self.forget_computers(board),
             MenuAction::NewIdentity => {
                 Self::write_literal(board, "MENU CLOSED\n");
-                self.show_menu(board);
+                self.show_overlay(board);
                 return self.new_identity(board);
             }
         }
-        self.show_menu(board);
+        self.show_overlay(board);
     }
 
-    /// Something that needs the user takes the screen back from the menu.
+    /// Something that needs the user takes the screen back from the menu and from a voice command (a
+    /// recording is given up).
+    fn close_overlays<B: Board>(&mut self, board: &mut B) {
+        self.close_menu(board);
+        if self.voice.is_open() {
+            self.close_voice(board);
+        }
+    }
+
     fn close_menu<B: Board>(&mut self, board: &mut B) {
         if self.menu.is_open() {
             self.menu.close();
             Self::write_literal(board, "MENU CLOSED\n");
-            self.show_menu(board);
+            self.show_overlay(board);
         }
     }
 
-    /// Hands the display the panel for what the menu shows now, or none when it's closed.
-    fn show_menu<B: Board>(&mut self, board: &mut B) {
+    /// An Agent's news during a voice command waits for the overlay to close; the worst of what waits is said.
+    fn hold_for_voice<B: Board>(&mut self, board: &mut B, occasion: Occasion) {
+        let rank = |occasion: Occasion| match occasion.fallback().unwrap_or(occasion) {
+            Occasion::Failed => 2,
+            Occasion::InputRequired => 1,
+            _ => 0,
+        };
+        if self.voice_held.is_none_or(|held| rank(occasion) > rank(held)) {
+            self.voice_held = Some(occasion);
+        }
+        Self::write_value_line(board, "AUDIO HELD ", occasion_label(occasion).as_bytes());
+        self.show_overlay(board);
+    }
+
+    /// Once the voice overlay is gone, says what was held back during it.
+    fn release_held<B: Board>(&mut self, board: &mut B) {
+        if !self.voice.is_open()
+            && let Some(occasion) = self.voice_held.take()
+        {
+            self.announce(board, occasion);
+        }
+    }
+
+    /// The panel over the screen now: the menu, a voice command or a transfer.
+    pub fn overlay(&self) -> Option<&Panel> {
+        self.display.panel()
+    }
+
+    /// A transfer coming in covers everything else: how far along it is, and how to cancel it (ADR-0016).
+    fn transfer_panel(&self) -> Option<Panel> {
+        let kind = self.transfer.kind()?;
+        let title: &[u8] = match kind {
+            transfer::Kind::Firmware => b"UPDATING",
+            transfer::Kind::Character => b"NEW CHARACTER",
+        };
+        let (percent, line) = match self.transfer.erasing() {
+            Some(_) => (0, alloc::vec::Vec::from(&b"GETTING READY"[..])),
+            None => {
+                let percent = self.transfer.percent().unwrap_or(0);
+                (percent, crate::text!(8, "{percent}%").as_bytes().to_vec())
+            }
+        };
+        Some(Panel {
+            kind: PanelKind::Progress(percent),
+            title: title.to_vec(),
+            lines: alloc::vec![(line, alloc::vec::Vec::new(), Tone::Plain)],
+            selected: None,
+            // A hint shows at most 12 characters.
+            hints: alloc::vec![(&b"K2"[..], &b"HOLD: CANCEL"[..])],
+        })
+    }
+
+    /// Hands the display the panel for what the menu shows now, or the voice command's overlay, or none.
+    fn show_overlay<B: Board>(&mut self, board: &mut B) {
         let now = board.now_ms();
-        let panel = self.menu.view().map(|view| self.menu_panel(view, now));
+        if let Some(panel) = self.transfer_panel() {
+            return self.display.set_panel(board, &scene!(self, now), Some(panel));
+        }
+        let panel = match self.menu.view() {
+            Some(view) => Some(self.menu_panel(view, now)),
+            None => self.voice.panel(now).map(|mut panel| {
+                let waiting: Option<&[u8]> = match self.voice_held.map(|held| held.fallback().unwrap_or(held)) {
+                    Some(Occasion::Failed) => Some(b"AN AGENT FAILED"),
+                    Some(Occasion::InputRequired) => Some(b"AN AGENT NEEDS YOU"),
+                    _ => None,
+                };
+                if let Some(waiting) = waiting {
+                    panel.lines.push((waiting.to_vec(), Vec::new(), Tone::Warn));
+                }
+                panel
+            }),
+        };
         self.display.set_panel(board, &scene!(self, now), panel);
+    }
+
+    fn write_voice<B: Board>(board: &mut B, out: impl IntoIterator<Item = VoiceOut>) {
+        for out in out {
+            match out {
+                VoiceOut::Line(line) => board.write(line.as_bytes()),
+                VoiceOut::Data(line) => board.write_stream(line.as_bytes()),
+            }
+        }
+    }
+
+    /// `voice.available`, a new link or a lost one.
+    fn set_voice_available<B: Board>(&mut self, board: &mut B, on: bool) {
+        let out = self.voice.set_available(on);
+        Self::write_voice(board, out);
+        self.stop_voice_mic(board);
+        if !on {
+            self.stop_reply(board);
+        }
+        self.show_overlay(board);
+    }
+
+    /// K0 held while voice is offered: the microphone at voice gain, any sound stopped so the box doesn't
+    /// hear itself (a spoken reply too: a new command interrupts the last one's answer), and a new turn.
+    fn start_recording<B: Board>(&mut self, board: &mut B, now: u32) {
+        self.voice.cancel();
+        self.stop_voice_mic(board);
+        self.stop_reply(board);
+        // A box without the ES8311 (the NS4168 variant) has no gain to set; its microphone, if any, is untested.
+        let _ = mic::set_es8311_mic_gain(&mut BoardI2c { board: &mut *board, address: ES8311_ADDRESS }, voice_command::GAIN_DB);
+        let started = matches!(self.mic, MicState::Idle) && board.voice_start().is_ok();
+        if started {
+            self.voice_mic = true;
+            board.stop_audio();
+            let start = self.voice.start(now);
+            Self::write_voice(board, [start]);
+            self.reply_turn = Some(self.voice.turn());
+        } else {
+            self.voice.no_microphone(now);
+        }
+        self.show_overlay(board);
+    }
+
+    fn take_voice_samples<B: Board>(&mut self, board: &mut B) {
+        let mut samples = Vec::new();
+        board.voice_take(&mut samples);
+        let out = self.voice.push(&samples);
+        Self::write_voice(board, out);
+    }
+
+    /// K0 let go, or the 30 s are up: the last samples, then `VOICE END` (or `VOICE CANCEL` if it was short).
+    fn end_recording<B: Board>(&mut self, board: &mut B, now: u32) {
+        self.take_voice_samples(board);
+        let out = self.voice.release(now);
+        Self::write_voice(board, out);
+        self.stop_voice_mic(board);
+        self.show_overlay(board);
+    }
+
+    /// K2, or something that needs the user: the overlay closes, and a recording is given up.
+    fn close_voice<B: Board>(&mut self, board: &mut B) {
+        let out = self.voice.cancel();
+        Self::write_voice(board, out);
+        self.stop_voice_mic(board);
+        self.stop_reply(board);
+        self.show_overlay(board);
+        self.release_held(board);
+    }
+
+    /// Stops the turn's spoken replies, and ignores the rest of its audio.
+    fn stop_reply<B: Board>(&mut self, board: &mut B) {
+        if self.reply_turn.take().is_some() {
+            board.reply_audio(ReplyAudio::Stop);
+        }
+    }
+
+    /// `voice.audio`: a chunk of a spoken reply's MP3, or its end, for the turn being played. While muted the
+    /// replies are only shown. A chunk that doesn't decode is a chunk lost: the next one's `seq` gives it away.
+    fn on_voice_audio<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>) {
+        let field = |key| number(fields, key).filter(|value| *value >= 0.0).map(|value| value as u32);
+        let (Some(turn), Some(reply), Some(seq)) = (field("turn"), field("reply"), field("seq")) else { return };
+        if self.reply_turn != Some(turn) {
+            return;
+        }
+        if fields.get("end") == Some(&Value::Bool(true)) {
+            // Synthesis failed or was cut short: what came plays, and the log says it isn't the whole reply.
+            if fields.get("error").is_some() {
+                let line = text!(48, "VOICE AUDIO CUT SHORT {} {}\n", turn, reply);
+                board.write(line.as_bytes());
+            }
+            if !self.muted {
+                board.reply_audio(ReplyAudio::End { reply, seq });
+            }
+            return;
+        }
+        let Some(data) = string(fields, "data").filter(|_| !self.muted) else { return };
+        let mut bytes = alloc::vec![0u8; data.len() / 4 * 3 + 3];
+        let Some(count) = decode_base64(data.as_bytes(), &mut bytes) else { return };
+        bytes.truncate(count);
+        board.reply_audio(ReplyAudio::Chunk { reply, seq, data: bytes });
+    }
+
+    fn stop_voice_mic<B: Board>(&mut self, board: &mut B) {
+        if self.voice_mic && !self.voice.listening() {
+            board.voice_stop();
+            self.voice_mic = false;
+        }
+    }
+
+    /// Each pass: stream what the microphone has, end the recording at 30 s, move the meter, and close the
+    /// overlay when its time is up.
+    fn tend_voice<B: Board>(&mut self, board: &mut B, now: u32) {
+        if self.voice.listening() {
+            self.take_voice_samples(board);
+            if self.voice.due(now) {
+                self.end_recording(board, now);
+            }
+            self.show_overlay(board);
+        } else if self.voice.waiting() && self.menu.view().is_none() {
+            self.show_overlay(board);
+        }
+        // The text stays up while a reply is still being spoken; when it goes, so does what is left to say.
+        if !board.reply_speaking() && self.voice.expire(now) {
+            self.stop_reply(board);
+            self.show_overlay(board);
+        }
+        // However the overlay went (expired, K2, a lost link, voice withdrawn), what was held back is said now.
+        self.release_held(board);
+        self.stop_voice_mic(board);
+    }
+
+    /// `voice.heard`, `voice.reply`, `voice.done` and `voice.error` for a turn.
+    fn on_voice_turn<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
+        let Some(turn) = number(fields, "turn").filter(|turn| *turn >= 0.0) else { return };
+        let text = string(fields, if event == "voice.error" { "message" } else { "text" });
+        let now = board.now_ms();
+        if self.voice.event(event, turn as u32, text, string(fields, "reason"), now) {
+            self.stop_voice_mic(board);
+            self.show_overlay(board);
+        }
     }
 
     /// What the menu draws for a view.
@@ -1009,6 +1596,7 @@ impl Firmware {
                         self.link_line(now),
                         line(b"VOICE", voice.as_bytes(), Tone::Plain),
                         line(b"TODAY", today.as_bytes(), Tone::Plain),
+                        line(b"TOUCH", self.touch_chip().as_bytes(), Tone::Plain),
                     ],
                     selected: None,
                     hints: alloc::vec![(b"K0", b"BACK"), (b"K2", b"CLOSE")],
@@ -1036,7 +1624,7 @@ impl Firmware {
         };
         Self::report_pomodoro(board, if focus_ended { "FOCUS END" } else { "BREAK END" });
         // The alarm waits for K0, which the menu would take.
-        self.close_menu(board);
+        self.close_overlays(board);
         if focus_ended {
             self.save_tally(board);
         }
@@ -1059,7 +1647,7 @@ impl Firmware {
     fn tend_leisure<B: Board>(&mut self, board: &mut B) {
         let now = board.now_ms();
         let pomodoro = self.pomodoro.view(now);
-        if !self.display.agent_idle() || pomodoro.run == Run::Running || self.link_lost || self.menu.is_open() {
+        if !self.display.agent_idle() || pomodoro.run == Run::Running || self.link_lost || self.menu.is_open() || self.voice.is_open() {
             self.leisure.note_activity(now);
         }
 
@@ -1125,6 +1713,9 @@ impl Firmware {
                 state: task_state(status),
                 elapsed_s: number(item, "elapsed_s").map(|value| value as i32).unwrap_or(0),
                 project: string(item, "project").map(str::as_bytes),
+                // Only a short id of letters and digits goes back out in a JSON line as is.
+                id: string(item, "id").filter(|id| id.len() <= 16 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())).map(str::as_bytes),
+                icon: string(item, "agent").and_then(AgentIcon::for_agent),
             });
         }
 
@@ -1156,17 +1747,24 @@ impl Firmware {
             occasion = Some(special);
         }
 
+        let talking = self.voice.is_open();
         if matches!(state, State::InputRequired | State::Failed) {
-            self.close_menu(board);
+            if talking {
+                self.close_menu(board);
+            } else {
+                self.close_overlays(board);
+            }
         }
-        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks);
+        let shown = self.display.show_tasks(board, &scene!(self, now), state, title.map(str::as_bytes), &tasks, number(fields, "tasks_total").map_or(0, |total| total as usize));
         if shown.is_err() {
             Self::write_literal(board, "DISPLAY ERROR\n");
         } else {
             Self::write_value_line(board, "DISPLAY STATE ", state_label.as_bytes());
         }
         if let Some(occasion) = occasion {
-            if self.end_speaks(occasion, now) {
+            if talking {
+                self.hold_for_voice(board, occasion);
+            } else if self.end_speaks(occasion, now) {
                 self.announce(board, occasion);
             } else {
                 Self::write_value_line(board, "AUDIO MERGED ", occasion_label(occasion).as_bytes());
@@ -1269,7 +1867,11 @@ impl Firmware {
             // The Mac asks when it first connects: mode, firmware build and voice are only reported
             // at boot or on change, and the daemon restarts more often than the device, so without
             // asking it would never know.
-            "device.hello" => self.announce_state(board),
+            // A new link starts with voice commands off; the computer offers them after this if it can.
+            "device.hello" => {
+                self.set_voice_available(board, false);
+                self.announce_state(board);
+            }
             // The daily greeting or a welcome back: a line and nothing else. It isn't agent activity,
             // so it neither changes the screen nor wakes leisure, and only those may be said this way.
             "buddy.say" => {
@@ -1294,12 +1896,17 @@ impl Firmware {
                     None => self.announce_volume(board),
                 }
                 // The app's slider can move while the menu shows the volume.
-                self.show_menu(board);
+                self.show_overlay(board);
                 if fields.get("preview") == Some(&Value::Bool(true)) {
                     self.announce(board, Occasion::Done);
                 }
             }
+            // Voice commands (docs/protocol.md): the computer offers them, then answers each turn.
+            "voice.available" => self.set_voice_available(board, fields.get("on") == Some(&Value::Bool(true))),
+            "voice.heard" | "voice.reply" | "voice.done" | "voice.error" => self.on_voice_turn(board, fields, event),
+            "voice.audio" => self.on_voice_audio(board, fields),
             _ if event.starts_with("voice.") => self.handle_voice_event(board, fields, event),
+            _ if event.starts_with("xfer.") => self.handle_transfer(board, fields, event),
             // Pairing is the computer at the other end of the cable telling the box who it is (ADR-0012).
             // Only over the cable: whoever is at the box decides who may link and which network it joins.
             "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" | "device.relay.set"
@@ -1314,6 +1921,10 @@ impl Firmware {
             "device.relay.set" => self.handle_relay(board, fields),
             // The radio belongs to the device layer, which reports what it hears as `WIFI SEEN` lines.
             "device.wifi.scan" => self.scan_requested = true,
+            // Microphone bring-up (docs/firmware-bringup.md): a diagnostic like the screenshot, so not agent
+            // activity. Over the cable only: a recording is hundreds of lines.
+            "device.mic.record" if self.remote => Self::write_literal(board, "ERROR cable_only\n"),
+            "device.mic.record" => self.start_mic(board, fields),
             // Link self-test: send the received string's length and CRC back to the Mac to check for corrupted serial bytes.
             "device.echo" => {
                 if let Some(data) = string(fields, "data") {
@@ -1493,14 +2104,131 @@ impl Firmware {
         board.restart();
     }
 
+    /// `TRANSFER 1`: this firmware takes firmware images over any link (ADR-0016). `FIRMWARE ROLLED BACK`: the last
+    /// image sent that way didn't confirm itself, and the bootloader went back to this one; it stays until the next.
+    fn announce_updates<B: Board>(board: &mut B) {
+        let Some(otadata) = find_partition(board.flash(), "otadata") else { return };
+        Self::write_literal(board, "TRANSFER 1\n");
+        if ota::rolled_back(board.flash(), otadata).unwrap_or(false) {
+            Self::write_literal(board, "FIRMWARE ROLLED BACK\n");
+        }
+    }
+
+    /// `xfer.ready` or `xfer.ack` with the offset to send from, `xfer.done`, or `xfer.error` with its code; JSON lines,
+    /// since the computer's window is driven by them.
+    fn transfer_reply<B: Board>(board: &mut B, event: &str, offset: Option<u32>) {
+        let line = match offset {
+            Some(offset) => text!(80, "{{\"version\":1,\"event\":\"{}\",\"offset\":{}}}\n", event, offset),
+            None => text!(80, "{{\"version\":1,\"event\":\"{}\"}}\n", event),
+        };
+        board.write(line.as_bytes());
+    }
+
+    fn transfer_error<B: Board>(board: &mut B, failure: transfer::Error) {
+        let line = text!(80, "{{\"version\":1,\"event\":\"xfer.error\",\"code\":\"{}\"}}\n", failure.code());
+        board.write(line.as_bytes());
+    }
+
+    /// `xfer.*`: a firmware image or a Character pack over any link, in chunks, resumable (ADR-0016, [`crate::transfer`]).
+    fn handle_transfer<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
+        self.transfer_heard = board.now_ms();
+        match event {
+            "xfer.begin" => {
+                let kind = string(fields, "kind").and_then(transfer::Kind::parse);
+                let sha256 = string(fields, "sha256").and_then(decode_hex::<32>);
+                let (Some(size), Some(sha256)) = (number(fields, "size"), sha256) else {
+                    return Self::transfer_error(board, transfer::Error::BadMessage);
+                };
+                let Some(kind) = kind else {
+                    return Self::transfer_error(board, transfer::Error::Unsupported);
+                };
+                match self.transfer.begin(board.flash(), kind, size as u32, sha256) {
+                    Ok(Some(offset)) => Self::transfer_reply(board, "xfer.ready", Some(offset)),
+                    // Erasing first; poll answers once it is done.
+                    Ok(None) => {
+                        if kind == transfer::Kind::Character && self.pack_set_aside.is_none() {
+                            board.stop_audio();
+                            self.voices.set_aside();
+                            self.pack_set_aside = Some(board.now_ms());
+                            self.load_look(board);
+                        }
+                    }
+                    Err(failure) => Self::transfer_error(board, failure),
+                }
+            }
+            "xfer.chunk" => {
+                let (Some(offset), Some(crc), Some(data)) = (number(fields, "offset"), number(fields, "crc"), string(fields, "data")) else {
+                    self.transfer.cancel();
+                    Self::transfer_error(board, transfer::Error::BadMessage);
+                    return self.after_transfer(board);
+                };
+                let mut bytes = alloc::vec![0u8; transfer::CHUNK_BYTES + 3];
+                let Some(length) = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes) else {
+                    self.transfer.cancel();
+                    Self::transfer_error(board, transfer::Error::BadMessage);
+                    return self.after_transfer(board);
+                };
+                match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
+                    Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    Err(failure) => Self::transfer_error(board, failure),
+                }
+            }
+            "xfer.end" => match self.transfer.end(board.flash()) {
+                Ok(transfer::Kind::Firmware) => {
+                    Self::transfer_reply(board, "xfer.done", None);
+                    // The new image boots once and confirms itself, or the bootloader goes back (ADR-0013).
+                    board.restart();
+                }
+                Ok(transfer::Kind::Character) => {
+                    self.after_transfer(board);
+                    let id = alloc::string::String::from(self.voices.current_id());
+                    let quoted = serde_json::to_string(&id).unwrap_or_default();
+                    Self::write_value_line(board, "", alloc::format!(r#"{{"version":1,"event":"xfer.done","voice":{quoted}}}"#).as_bytes());
+                    Self::write_value_line(board, "VOICES ", id.as_bytes());
+                    // As after voice.end: the new voice says it is in.
+                    self.announce(board, Occasion::Done);
+                }
+                Err(failure) => Self::transfer_error(board, failure),
+            },
+            "xfer.cancel" => {
+                self.transfer.cancel();
+                Self::transfer_error(board, transfer::Error::Cancelled);
+            }
+            _ => Self::transfer_error(board, transfer::Error::BadMessage),
+        }
+        self.after_transfer(board);
+        self.show_overlay(board);
+    }
+
+    /// A pack transfer that set the current pack aside has ended, however: load what the partition holds now (the new
+    /// pack, or nothing after a failure partway, and then the built-in voice).
+    fn after_transfer<B: Board>(&mut self, board: &mut B) {
+        if self.pack_set_aside.is_none() || self.transfer.active() {
+            return;
+        }
+        self.pack_set_aside = None;
+        self.voices.reload(board.flash());
+        self.load_look(board);
+    }
+
     /// Reports the device's whole static state: firmware build and version, its key, mode, voice and volume.
     fn announce_state<B: Board>(&self, board: &mut B) {
         Self::write_value_line(board, "DISPLAY READY BUILD ", &self.build);
         Self::write_value_line(board, "FIRMWARE VERSION ", self.version.as_bytes());
+        Self::announce_updates(board);
         self.announce_key(board);
         Self::write_value_line(board, "MODE ", self.display.mode().name().as_bytes());
         Self::write_value_line(board, "VOICES ", self.voices.current_id().as_bytes());
         self.announce_volume(board);
+        self.announce_touch(board);
+    }
+
+    fn touch_chip(&self) -> &'static str {
+        self.touch.as_ref().map_or("NONE", |(chip, _, _)| chip)
+    }
+
+    fn announce_touch<B: Board>(&self, board: &mut B) {
+        Self::write_value_line(board, "TOUCH ", self.touch_chip().as_bytes());
     }
 
     /// Voice pack write acknowledgements are all JSON lines: the Mac does stop-and-wait flow control by sequence number, which diagnostic lines can't support.
@@ -1530,6 +2258,7 @@ impl Firmware {
                 // stalled, and DMA replays whatever is in its buffer over and over, so it must be
                 // silence first. The wait continues in poll.
                 board.stop_audio();
+                self.stop_reply(board);
                 self.pending_voice_begin = Some((size as u32, board.now_ms()));
                 self.continue_voice_begin(board);
             }
