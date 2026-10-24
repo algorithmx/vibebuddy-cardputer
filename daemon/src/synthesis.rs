@@ -28,7 +28,7 @@ pub const STAGING_URL: &str = "https://api-staging.korekore.ai";
 pub const MAX_TEXT: usize = 1000;
 /// A request gets this long for its whole answer; 1000 characters is about a minute of speech, made faster than
 /// it plays.
-const TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(120);
 /// No reply needs more: ten minutes at 48 kbps.
 const MAX_AUDIO: usize = 4 * 1024 * 1024;
 
@@ -117,13 +117,13 @@ impl Synthesizer for VoiceService {
 
 pub const ELEVENLABS_URL: &str = "https://api.elevenlabs.io";
 /// Flash v2.5 and the format the voice service asks for: 24 kHz mono MP3 at 48 kbps, what the box plays.
-const ELEVENLABS_MODEL: &str = "eleven_flash_v2_5";
+pub(crate) const ELEVENLABS_MODEL: &str = "eleven_flash_v2_5";
 const ELEVENLABS_FORMAT: &str = "mp3_24000_48";
 /// Volcano Engine's V3 one-way stream: back-to-back JSON objects, each with a piece of audio as base64 in `data`,
 /// until `code` 20000000.
 pub const VOLC_URL: &str = "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
 /// The 1.0 voices, as the service uses; [`voice_for`] gives no Character a 2.0 one.
-const VOLC_RESOURCE_ID: &str = "seed-tts-1.0";
+pub(crate) const VOLC_RESOURCE_ID: &str = "seed-tts-1.0";
 const VOLC_DONE: i64 = 20_000_000;
 
 /// Spoken replies: with the user's own key for the voice's provider, from that provider; else from the voice
@@ -203,6 +203,14 @@ impl Synthesizer for Synthesis {
 /// box decodes as well as 48, behind an ID3 tag, which is left out so the box gets frames only.
 fn forward_volc(reader: impl Read, on_audio: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, String> {
     let mut tag = Id3::default();
+    read_volc(reader, &mut |audio| {
+        let audio = tag.strip(audio);
+        audio.is_empty() || on_audio(&audio)
+    })
+}
+
+/// Hands on the audio of each object in Volcano Engine's stream, until the last; false when `on_audio` stopped it.
+pub(crate) fn read_volc(reader: impl Read, on_audio: &mut dyn FnMut(&[u8]) -> bool) -> Result<bool, String> {
     let mut total = 0;
     for message in serde_json::Deserializer::from_reader(std::io::BufReader::new(reader)).into_iter::<serde_json::Value>() {
         let message = message.map_err(|error| format!("reading audio from Volcano Engine: {error}"))?;
@@ -220,8 +228,7 @@ fn forward_volc(reader: impl Read, on_audio: &mut dyn FnMut(&[u8]) -> bool) -> R
         if total > MAX_AUDIO {
             return Err("Volcano Engine sent more audio than any reply needs".to_owned());
         }
-        let audio = tag.strip(&audio);
-        if !audio.is_empty() && !on_audio(&audio) {
+        if !on_audio(&audio) {
             return Ok(false);
         }
     }
@@ -264,7 +271,7 @@ impl Id3 {
 }
 
 /// A random UUID, which Volcano Engine wants for each request.
-fn request_id() -> Result<String, String> {
+pub(crate) fn request_id() -> Result<String, String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
     bytes[6] = bytes[6] & 0x0f | 0x40;
