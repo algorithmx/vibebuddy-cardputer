@@ -303,8 +303,12 @@ async fn main() {
     let session = Some(state.account.clone());
     state.voice_keys = Arc::new(voice_keys::VoiceKeys::new(config::config_dir().as_deref()));
     let synthesizer = synthesis::from_env(session.clone(), state.voice_keys.clone());
+    let made = config::config_dir().map(|dir| dir.join("characters"));
+    if let Some(made) = &made {
+        let _ = making::DIR.set(made.clone());
+    }
     state.making = Arc::new(making::Maker::new(
-        config::config_dir().map(|dir| dir.join("characters")),
+        made,
         synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
         state.account.clone(),
         state.voice_keys.clone(),
@@ -705,7 +709,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
         .route("/v1/voice-keys", axum::routing::put(put_voice_keys))
         .route("/v1/voices", get(get_voices))
-        .route("/v1/characters", post(post_character))
+        .route("/v1/characters", get(get_characters).post(post_character))
         .route("/v1/account", axum::routing::delete(delete_account))
         .route("/v1/account/sign-in", post(post_sign_in))
         .route("/v1/account/callback", get(get_account_callback))
@@ -1733,6 +1737,11 @@ async fn put_voice_keys(State(state): State<AppState>, Json(request): Json<serde
 /// The voices a made Character can speak with: `characters/voices.tsv`.
 async fn get_voices() -> Json<Vec<making::Voice>> {
     Json(making::voices())
+}
+
+/// The Characters made here, for the App to list beside the presets.
+async fn get_characters(State(state): State<AppState>) -> Json<Vec<making::MadeCharacter>> {
+    Json(state.making.list())
 }
 
 /// Starts making a Character's line audio (`making` in the status follows it); 409 while another is being made.

@@ -11,6 +11,7 @@
 //! speech recognition ([`crate::speech`]) goes to the same service.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -338,9 +339,15 @@ const STOCK_MALE: &str = "elevenlabs:JBFqnCBsd6RMkjVDRZzb";
 
 /// The voice service's name for `character`'s voice (the id the box reports in `VOICES`), as `<vendor>:<voice>`.
 /// The model is multilingual, so a reply in another language than the Character's keeps the Character's voice.
+/// A Character made in the App ([`crate::making`]) speaks in the voice it was made with.
 pub fn voice_for(character: Option<&str>) -> String {
+    voice_among(character, crate::making::DIR.get().map(PathBuf::as_path))
+}
+
+/// [`voice_for`], with the Characters made in `made`.
+fn voice_among(character: Option<&str>, made: Option<&Path>) -> String {
     let Some(file) = character.and_then(|character| VOICE_FILES.iter().find(|(id, _)| *id == character)) else {
-        return DEFAULT_VOICE.to_owned();
+        return character.zip(made).and_then(|(id, made)| crate::making::voice_of(made, id)).unwrap_or_else(|| DEFAULT_VOICE.to_owned());
     };
     let field = |key: &str| voice_field(file.1, key);
     match (field("ENGINE"), field("VOICE")) {
@@ -400,6 +407,20 @@ mod tests {
         assert_eq!(voice_for(Some("robot")), DEFAULT_VOICE);
         assert_eq!(voice_for(None), DEFAULT_VOICE, "no Character pack");
         assert_eq!(voice_for(Some("hsiaoyu")), DEFAULT_VOICE, "an old voice pack");
+    }
+
+    #[test]
+    fn a_made_character_speaks_in_the_voice_it_was_made_with() {
+        let made = crate::voice_keys::tests::scratch("made-voice");
+        std::fs::create_dir_all(made.join("owl-1a2b3c4d")).unwrap();
+        let manifest = r#"{"name":"Owl","base":"ada","voice":"wanwanxiaohe","lines":[{"occasion":"done","text":"好了。"}]}"#;
+        std::fs::write(made.join("owl-1a2b3c4d/manifest.json"), manifest).unwrap();
+        assert_eq!(voice_among(Some("owl-1a2b3c4d"), Some(&made)), "volc:zh_female_wanwanxiaohe_moon_bigtts");
+        assert_eq!(voice_among(Some("ada"), Some(&made)), "elevenlabs:tcSsCJFYrsHpK5rCQZMf", "a preset stays a preset");
+        assert_eq!(voice_among(Some("owl-0000"), Some(&made)), DEFAULT_VOICE, "not made here");
+        assert_eq!(voice_among(Some("../owl-1a2b3c4d"), Some(&made)), DEFAULT_VOICE);
+        assert_eq!(voice_among(Some("owl-1a2b3c4d"), None), DEFAULT_VOICE);
+        let _ = std::fs::remove_dir_all(made);
     }
 
     #[test]

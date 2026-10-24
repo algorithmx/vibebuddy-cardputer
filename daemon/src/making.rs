@@ -165,10 +165,35 @@ pub struct MakingStatus {
     /// Pieces of audio made, of all there are: each line, and each form of address of those with one.
     pub done: usize,
     pub total: usize,
-    /// Why it stopped, for the App to explain: `plan`, `monthly`, `global_cap`, `signed_out` or `own_key`; None for
+    /// Why it stopped, for the App to explain: `plan`, `monthly`, `global_cap`, `signed_out`, `own_key` or `internal`; None for
     /// anything else, which `error` describes.
     pub reason: Option<&'static str>,
     pub error: Option<String>,
+}
+
+/// A Character made here, in `GET /v1/characters`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MadeCharacter {
+    pub id: String,
+    pub name: String,
+    pub base: String,
+    pub voice: String,
+    pub lines: usize,
+    /// Its packs are made, for the lines it has now.
+    pub complete: bool,
+}
+
+/// Where the Characters made here are, for [`voice_of`]; set once at start, never in tests.
+pub static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The voice service's name (`<provider>:<voice>`) for the voice of `id`, a Character made in `dir`.
+pub fn voice_of(dir: &Path, id: &str) -> Option<String> {
+    if !valid_id(id) {
+        return None;
+    }
+    let manifest: Request = serde_json::from_str(&std::fs::read_to_string(dir.join(id).join(MANIFEST)).ok()?).ok()?;
+    let voice = voices().into_iter().find(|voice| voice.id == manifest.voice)?;
+    Some(format!("{}:{}", voice.provider, voice.voice))
 }
 
 /// Why a job can't start.
@@ -233,21 +258,53 @@ impl Maker {
     }
 
     pub fn status(&self) -> Option<MakingStatus> {
-        self.status.lock().unwrap().clone()
+        self.lock().clone()
+    }
+
+    /// The status, even after a job panicked holding it.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<MakingStatus>> {
+        self.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn report(&self, change: impl FnOnce(&mut MakingStatus)) {
-        if let Some(status) = self.status.lock().unwrap().as_mut() {
+        if let Some(status) = self.lock().as_mut() {
             change(status);
         }
         self.changed.send_replace(());
+    }
+
+    /// Runs a job; one that panics ends as failed, `internal`, rather than making forever.
+    fn guard(&self, job: impl FnOnce()) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+            self.report(|status| {
+                status.state = "failed";
+                status.reason = Some("internal");
+                status.error = Some("making the Character stopped unexpectedly".to_owned());
+            });
+        }
+    }
+
+    /// The Characters made here, by id: what was asked, and whether its packs are made.
+    pub fn list(&self) -> Vec<MadeCharacter> {
+        let Some(entries) = self.dir.as_ref().and_then(|dir| std::fs::read_dir(dir).ok()) else { return Vec::new() };
+        let mut made: Vec<MadeCharacter> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let id = entry.file_name().into_string().ok().filter(|id| valid_id(id))?;
+                let manifest: Request = serde_json::from_str(&std::fs::read_to_string(entry.path().join(MANIFEST)).ok()?).ok()?;
+                let complete = entry.path().join("pack.bin").is_file();
+                Some(MadeCharacter { id, name: manifest.name, base: manifest.base, voice: manifest.voice, lines: manifest.lines.len(), complete })
+            })
+            .collect();
+        made.sort_by(|a, b| a.id.cmp(&b.id));
+        made
     }
 
     /// Checks the request and starts making it on a thread of its own; answers the job's first status.
     pub fn start(self: &Arc<Self>, request: Request) -> Result<MakingStatus, StartError> {
         let (id, voice) = self.begin(&request)?;
         let maker = self.clone();
-        std::thread::spawn(move || maker.make(&id, &voice, &request));
+        std::thread::spawn(move || maker.guard(|| maker.make(&id, &voice, &request)));
         Ok(self.status().expect("begun"))
     }
 
@@ -260,7 +317,7 @@ impl Maker {
             Some(id) => return Err(StartError::Invalid(format!("{id} is not a Character made here"))),
             None => new_id(&request.name).map_err(StartError::Unavailable)?,
         };
-        let mut status = self.status.lock().unwrap();
+        let mut status = self.lock();
         if status.as_ref().is_some_and(|status| status.state == "making") {
             return Err(StartError::Busy);
         }
@@ -300,6 +357,9 @@ impl Maker {
         }
         std::fs::create_dir_all(dir).map_err(io)?;
         write(&dir.join(MANIFEST), serde_json::to_string_pretty(request).expect("serializes").as_bytes()).map_err(io)?;
+        // The packs are of the lines before; they come back once these are made.
+        let _ = std::fs::remove_file(dir.join("pack.bin"));
+        let _ = std::fs::remove_dir_all(dir.join("address"));
 
         let forms = forms(&voice.language);
         let pieces = pieces(&request.lines, &forms);
@@ -319,7 +379,6 @@ impl Maker {
         for root in ["audio", "audio-address"] {
             prune(&dir.join(root), &keep);
         }
-        let _ = std::fs::remove_dir_all(dir.join("address"));
         write(&dir.join("pack.bin"), &pack(id, &pools(&dir.join("audio")))?).map_err(io)?;
         for (form, _) in &forms {
             let audio = dir.join("audio-address").join(form);
@@ -746,6 +805,8 @@ mod tests {
         assert_eq!((stopped.state, stopped.reason, stopped.done, stopped.total), ("failed", Some("monthly"), 2, 6));
         let dir = scratch.join("characters").join(&stopped.id);
         assert!(!dir.join("pack.bin").exists(), "no pack until every line is made");
+        let listed = maker.list();
+        assert_eq!(listed, [MadeCharacter { id: stopped.id.clone(), name: "Night Owl".to_owned(), base: "ada".to_owned(), voice: "ada".to_owned(), lines: 3, complete: false }]);
         let first = requests.lock().unwrap().clone();
         assert!(first[0].to_ascii_lowercase().contains("authorization: bearer tok_session"), "{}", first[0]);
         assert!(first[0].contains(r#""for":"character""#) && first[0].contains(r#""voice":"elevenlabs:tcSsCJFYrsHpK5rCQZMf""#), "{}", first[0]);
@@ -754,6 +815,7 @@ mod tests {
         request.id = Some(stopped.id.clone());
         let done = run(&maker, &request);
         assert_eq!((done.state, done.reason, done.done, done.total), ("done", None, 6, 6));
+        assert!(maker.list()[0].complete);
         let all = requests.lock().unwrap().clone();
         // Each line answered with audio once: the refused one was asked again, nothing else was.
         let made: Vec<String> = all.iter().enumerate().filter(|(n, _)| *n != 2).map(|(_, request)| text_of(request)).collect();
@@ -828,6 +890,21 @@ mod tests {
         let pack = std::fs::read(scratch.join("characters").join(&made.id).join("pack.bin")).unwrap();
         let line = character_pack::parse(&pack, 1 << 21).unwrap().pool(Occasion::Done)[0];
         assert!(line.samples > 1590 && line.samples < 1600, "both pieces of the stream, trimmed: {}", line.samples);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn a_job_that_panics_ends_as_failed_not_making_forever() {
+        let (maker, scratch) = maker("making-panic", None, &[], "http://127.0.0.1:9", "http://127.0.0.1:9");
+        let request = request("ada", vec![line("done", "Done.")]);
+        maker.begin(&request).unwrap();
+        maker.guard(|| {
+            let _held = maker.status.lock().unwrap();
+            panic!("a bug");
+        });
+        let status = maker.status().unwrap();
+        assert_eq!((status.state, status.reason), ("failed", Some("internal")));
+        assert!(maker.begin(&request).is_ok(), "the next one can start");
         let _ = std::fs::remove_dir_all(scratch);
     }
 
