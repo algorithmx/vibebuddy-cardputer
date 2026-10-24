@@ -50,7 +50,7 @@ The daemon sends the token as `Authorization: Bearer <token>` and keeps it in `c
 
 ## Voice
 
-Both calls need `Authorization: Bearer <session>` and answer 401 without a valid one. Over the Relay the box will use a voice token instead (vibebuddy-cloud#10).
+Both calls need `Authorization: Bearer <session>` and answer 401 without a valid one. Only daemons call them: the box's audio reaches the daemon over the link, however the box is linked (ADR-0018).
 
 ### Recognizing a voice command
 
@@ -81,5 +81,13 @@ Each recognition counts one command and each spoken reply one reply, against the
 ```
 
 until 00:00 UTC. `GET /v1/account` shows where the day stands.
+
+When voice as a whole reaches its daily spending cap, every call gets
+
+```text
+429 {"reason":"global_cap"}
+```
+
+until 00:00 UTC, whatever the account's allowance.
 
 The `/v0/voice/…` calls take the same bodies without a session and run on staging only, until the daemon has moved to v1.
