@@ -10,7 +10,9 @@ import json
 import fcntl
 import os
 import pty
+import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,6 +26,11 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# The agent's ancestors in the scenarios and the window listings. Each stands for a real process the harness starts
+# with the session's environment, since the daemon reads the window system from `/proc/<pid>/environ`.
+PLACEHOLDER_PIDS = (4242, 4000, 4343, 5151)
+PLACEHOLDER = re.compile(r"(?<![\w.])(" + "|".join(map(str, PLACEHOLDER_PIDS)) + r")(?![\w.])")
+SLEEP = shutil.which("sleep") or "/bin/sleep"
 
 
 def wait_for(predicate, description, timeout=8):
@@ -59,6 +66,9 @@ class HostHarness:
         self.records = []
         self.pump_errors = []
         self.files = []
+        self.sessions = []
+        self.pids = {}
+        self.listeners = []
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._prepare_environment()
 
@@ -319,9 +329,35 @@ sys.exit(data.get("exit", 0))
         commands = [json.loads(line) for line in log.read_text().splitlines(keepends=True) if line.endswith("\n")]
         return [command for command in commands if program is None or command["program"] == program]
 
+    def use_session(self, environment):
+        """Starts a process for each placeholder pid with exactly `environment`, as the agent's terminal would have it,
+        and maps the placeholders to them from now on; the processes started before are stopped."""
+        for process in self.sessions:
+            self._stop(process)
+        self.sessions = [subprocess.Popen([SLEEP, "600"], env=environment, stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                         for _ in PLACEHOLDER_PIDS]
+        self.pids = {placeholder: process.pid for placeholder, process in zip(PLACEHOLDER_PIDS, self.sessions)}
+
+    def real_pids(self, text):
+        """`text` with each placeholder pid replaced by the process that stands for it."""
+        return PLACEHOLDER.sub(lambda match: str(self.pids.get(int(match[1]), match[1])), text)
+
+    def listening_socket(self, name):
+        """A Unix socket that accepts connections, as a running compositor's does, under a short path."""
+        path = Path(self.control_dir.name) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        listener.listen(16)
+        self.listeners.append(listener)
+        return path
+
     def command_reply(self, name, args=None, **reply):
         """Without `args`, the reply answers every call. With `args`, it answers calls whose leading arguments match, and
-        replaces an earlier reply for the same arguments; the default reply is kept."""
+        replaces an earlier reply for the same arguments; the default reply is kept. Placeholder pids in the reply
+        become the processes that stand for them."""
+        reply = json.loads(self.real_pids(json.dumps(reply)))
         path = self.root / f"{name}.json"
         data = json.loads(path.read_text()) if path.exists() else {}
         if args is None:
@@ -350,6 +386,10 @@ sys.exit(data.get("exit", 0))
         if self.simulator:
             self.simulator.stdin.close()
             self.simulator.stdout.close()
+        for process in self.sessions:
+            self._stop(process)
+        for listener in self.listeners:
+            listener.close()
         for stream in self.files:
             stream.close()
         self.control_dir.cleanup()

@@ -6,7 +6,8 @@ use std::time::Duration;
 use futures::{SinkExt, Stream, StreamExt};
 use serde::Deserialize;
 
-use crate::status::{Config, Status};
+use crate::i18n::tr;
+use crate::status::{Config, Status, Supervisor};
 
 const BASE: &str = "http://127.0.0.1:7331";
 const RETRY: Duration = Duration::from_secs(2);
@@ -159,10 +160,18 @@ pub async fn screenshot() -> Result<Vec<u8>, String> {
     }
 }
 
-pub async fn restart_daemon() -> Result<(), String> {
+/// Restarts the daemon through what supervises it, as last reported. On Linux that is the systemd user service, which
+/// works while the daemon is down too; the daemon's own restart endpoint only exits, so outside the service nothing
+/// would start it again, and the user is told to.
+pub async fn restart_daemon(supervisor: Option<Supervisor>) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        // The daemon cannot restart itself over HTTP while it is down. Both Advanced and the tray use its supervisor.
+        if supervisor == Some(Supervisor::Other) {
+            return Err(tr(
+                "This daemon doesn't run as the vibebuddyd systemd service, so VibeBuddy can't restart it. Start it again the way you started it.",
+                &[],
+            ));
+        }
         let command = tokio::process::Command::new("systemctl")
             .args(["--user", "restart", "vibebuddyd"])
             .kill_on_drop(true)
@@ -182,7 +191,10 @@ pub async fn restart_daemon() -> Result<(), String> {
         }
     }
     #[cfg(not(target_os = "linux"))]
-    post("/v1/daemon/restart", None).await
+    {
+        let _ = supervisor;
+        post("/v1/daemon/restart", None).await
+    }
 }
 
 async fn post(path: &str, body: Option<serde_json::Value>) -> Result<(), String> {

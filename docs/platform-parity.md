@@ -11,7 +11,7 @@ Reviewed 2026-10-17, second pass (the first pass had errors; see "Corrections" a
 | | Mac app (`app/`) | Linux app (`desktop/`) |
 |---|---|---|
 | Toolkit | SwiftUI and AppKit, menu bar | Rust, iced window and ksni tray |
-| Daemon supervision | the app starts and restarts `vibebuddyd` (`DaemonSupervisor.swift`, backoff `[1,2,5]` s, gives up after three failed starts) | systemd user service (`packaging/linux/vibebuddyd.service`: `Restart=always`, `RestartSec=2`, default start limit) |
+| Daemon supervision | the app starts and restarts `vibebuddyd` (`DaemonSupervisor.swift`, backoff `[1,2,5]` s, gives up after three failed starts), or leaves it to an old LaunchAgent the user kept (`managesDaemon`) | systemd user service (`packaging/linux/vibebuddyd.service`: `Restart=always`, `RestartSec=2`, default start limit). The daemon reports in its status whether it runs as that service (`daemon.supervisor`: `systemd` or `other`, from its cgroup), and the app keeps the last answer while the daemon is down |
 | Quitting the app | stops the daemon: the box goes offline ("Quit VibeBuddy (the box goes offline)") | leaves the daemon running: the box stays online (`tray.rs`, "Quit") |
 | Install | Homebrew cask, DMG | `install.sh` from the release tarball, pacman package, or build from source |
 | Tests in CI | `SelfTest` only (model and status decoding), macOS runner | `cargo test --workspace` on Ubuntu (daemon, hook, Linux app), clippy, the localization check, the Python tool tests, and the Linux host suite with a simulated box (`tools/test-linux-host.sh`, see `docs/linux-host-testing.md`) |
@@ -42,7 +42,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 | Device: Wi-Fi (scan, join, forget, change), paired computers, take over, make the box blink, box screen (refresh, save) | yes | yes | same |
 | Device: firmware update, flash from a firmware zip, retry with the K0 hint | yes | yes (`firmware_file.rs`) | same |
 | Device: several boards plugged in ("This is the box"), the port pin notice, cable help | yes; the help also mentions macOS's accessory permission | yes; the help also points to "Permission denied" in the daemon log (the serial group) | same, each with its platform's hint |
-| Advanced: daemon status, Open logs folder, Restart daemon, Export diagnostics, config path | yes; restart works while down | yes, plus Show daemon log (in `xdg-terminal-exec`, else GNOME Terminal, Konsole, Xfce Terminal or xterm); restart uses systemd while up or down, as the tray does, and reports errors | Linux has one more |
+| Advanced: daemon status, Open logs folder, Restart daemon, Export diagnostics, config path | yes; restart works while down | yes, plus Show daemon log (in `xdg-terminal-exec`, else GNOME Terminal, Konsole, Xfce Terminal or xterm); restart uses systemd while up or down, as the tray does, and reports errors. A daemon that doesn't run as the service (started by hand, say) gets "start it again the way you started it" from Restart and "its log isn't in the journal" from Show daemon log, and its own restart endpoint refuses, since exiting would only stop it | Linux has one more |
 | First-run guide | includes connecting agents and launch at login | Welcome, Find the box, Pick a character, Wi-Fi, Done (`install.sh` already connected agents and set autostart; `docs/app.md`) | differs, by design |
 
 ### Notifications
@@ -51,7 +51,7 @@ Status key: **same**; **differs** (both do it, by a different mechanism or with 
 |---|---|---|---|
 | Box gone for 30 s | the app (`AppModel.swift`, `checkLink`) | the daemon, through `notify-send` (`link_alert.rs`) | same rule, different sender |
 | New box firmware available | the app (`AppModel.swift`) | the app, through `notify-send` (`main.rs`, `notify_new_firmware`) | same |
-| Daemon failed | the app, when its supervisor gives up (`AppModel.swift`, `onGiveUp`); retains the last reported notify toggle | the app, through `notify-send` (`outage.rs`), once after 30 s without the daemon and again only after recovery. An inactive/deactivating unit suppresses the alert and is rechecked after another 30 s, so a later failed restart can notify | same last-known-toggle rule (on before the first status); different supervisors and failure timing |
+| Daemon failed | the app, when its supervisor gives up (`AppModel.swift`, `onGiveUp`); retains the last reported notify toggle | the app, through `notify-send` (`outage.rs`), once after 30 s without the daemon and again only after recovery. An inactive/deactivating unit suppresses the alert and is rechecked after another 30 s, so a later failed restart can notify. For a daemon that didn't run as the service, the unit's state says nothing about it: the alert goes out without asking systemd and says to start the daemon again by hand | same last-known-toggle rule (on before the first status); different supervisors and failure timing |
 | "Codex hook config updated" | the app, after migrating legacy hook commands (`HookInstaller.migrateLegacyCommands`) | no such migration on Linux | Mac only, by design |
 
 ### Menu bar and tray
@@ -82,10 +82,10 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
 |---|---|---|---|
 | Claude Code session in the Claude desktop app | opens that session: `claude://code/continue?session=…` | focuses the window that owns the agent's process, on Hyprland, Sway or X11; that is the app window, not the session | Linux gap: window, not session; unverified on the Claude Linux beta |
 | Codex in the Codex app | opens that thread: `codex://threads/<id>` | same as above: the app window on Hyprland, Sway or X11 | Linux gap; unverified on the ChatGPT/Codex Linux preview |
-| Terminal session | brings the terminal forward; with the Automation permission, the exact tab (Ghostty, iTerm2, Terminal) | focuses the terminal window: `hyprctl` on Hyprland, `swaymsg` on Sway, `wmctrl` on X11 (`window_focus.rs`); the window system is read from systemd's user manager at each press, then from the daemon's own environment | differs; tabs Mac only |
+| Terminal session | brings the terminal forward; with the Automation permission, the exact tab (Ghostty, iTerm2, Terminal) | focuses the terminal window: `hyprctl` on Hyprland, `swaymsg` on Sway, `wmctrl` on X11 (`window_focus.rs`). The window system is read at each press from the environment of the processes being focused (`/proc/<pid>/environ`), and Hyprland and Sway count only while their socket answers. Only when none of those environments can be read does it fall back to systemd's user manager, then the daemon's own environment, each taken whole | differs; tabs Mac only |
 | Warp | its focus deep link back to the pane | not handled (the hook ignores `WARP_FOCUS_URL` outside macOS) | Mac only |
 | Inside tmux | switches the tmux client to the pane, then the terminal tab | switches the tmux client to the pane (any desktop), then focuses its window (Hyprland, Sway or X11) | differs |
-| GNOME or KDE under Wayland (no supported window backend) | not applicable | no window focus; K2 logs the failure; a tmux pane switch still happens | **Linux gap** |
+| GNOME or KDE under Wayland (no supported window backend) | not applicable | no window focus; K2 logs that the session runs no supported window system and runs no helper; a tmux pane switch still happens | **Linux gap** |
 | GitHub Actions card | `open` the run page | `xdg-open` the run page | same |
 | No host (SSH, background process) | nothing to open, logged | same | same |
 
@@ -103,13 +103,15 @@ pane (`Surface::Window`); it never reports a desktop session ID (`desktop_sessio
 
 1. **K2 focus: Hyprland, Sway and X11 now; GNOME and KDE under Wayland still not.** On GNOME and KDE Wayland, K2 does
    nothing visible except a tmux pane switch. The Sway and X11 backends (`daemon/src/window_focus.rs`) are checked
-   headless against synthetic window listings; desktop acceptance on each is pending. Before this change, the gap
-   covered every desktop but Hyprland.
+   headless against synthetic window listings, and the choice of backend against stale variables in systemd's user
+   manager and the daemon's environment; desktop acceptance on each is pending. Before this change, the gap covered
+   every desktop but Hyprland.
 2. **Daemon-failure notification: implemented; desktop acceptance pending.** The Linux app sends it (`outage.rs`)
    and rechecks intentional-stop suppression. Both apps retain the last reported toggle after daemon loss. Linux
    bounds status response headers to 10 s and stream inactivity to 45 s before reporting the daemon down; the Mac
    uses a 45 s stream inactivity timeout. SSE keepalives keep quiet healthy streams alive. Advanced and tray restart
-   both use systemd on Linux, including while the daemon is down. Real notification/UI acceptance remains pending.
+   both use systemd on Linux, including while the daemon is down, for a daemon that runs as the service; one that
+   doesn't is told apart by its cgroup. Real notification/UI acceptance remains pending.
 3. **K2 reaches the Claude or Codex app window, not the session.** Focus works on Hyprland, Sway and X11. Whether
    the Linux builds of those apps set `CLAUDE_CODE_HOST_SESSION_ID` and register the `claude:` and `codex:` URL schemes is
    unknown: the apps are not installed on the machine where this was checked, so this has not been checked. The Claude
@@ -126,9 +128,10 @@ tabs and Warp (Mac only), the app menus, the first-run guide's shorter Linux pat
 
 Verified by reading the code: every row above.
 
-Checked headless, with no desktop: the daemon-failure notification policy and its probe (`DaemonOutageTests`), the Sway and
-X11 focus backends and their selection (`SwayFocusTests`, `X11FocusTests`, `daemon/src/window_focus.rs`), the Hyprland K2
-regressions, and the tray host's behaviour in isolation (an Xvfb display with a private bus, and with the user's bus).
+Checked headless, with no desktop: the daemon-failure notification policy and its probe (`DaemonOutageTests`), including
+a daemon outside the service; the Sway and X11 focus backends and their selection from the agent's processes, with stale
+variables elsewhere (`SwayFocusTests`, `X11FocusTests`, `daemon/src/window_focus.rs`); the Hyprland K2 regressions, now
+against a live instance socket; and the tray host's behaviour in isolation (an Xvfb display with a private bus, and with the user's bus).
 
 Not run on a machine: K2 on a real Sway or X11 session; the daemon-failure notification on a real desktop and systemd
 unit; the tray without the AppIndicator extension on Fedora, upstream GNOME or KDE; the notifications under each desktop

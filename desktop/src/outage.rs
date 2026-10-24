@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::i18n::tr;
+use crate::status::Supervisor;
 
 /// How long the daemon must stay unreachable before anyone is told: long enough to skip a restart after a crash.
 pub const GRACE: Duration = Duration::from_secs(30);
@@ -43,8 +44,8 @@ impl Service {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A status arrived: the daemon answers, and this is its notify toggle.
-    Status { notify_link: bool },
+    /// A status arrived: the daemon answers, with its notify toggle and who supervises it.
+    Status { notify_link: bool, supervisor: Option<Supervisor> },
     /// The status stream couldn't reach the daemon. It reports this again on every retry.
     Down,
     /// The grace period has passed since the outage began.
@@ -59,7 +60,17 @@ pub enum Effect {
     Wait(Duration),
     /// Read the unit's state, then send `Event::Service`.
     CheckService,
-    Notify,
+    /// Tell the user, saying who can bring the daemon back.
+    Notify(Restart),
+}
+
+/// Who can start the daemon again, as the notification says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restart {
+    /// The app, from the tray or Advanced, through the systemd service.
+    Here,
+    /// The user: the daemon didn't run as the service, so its unit's state says nothing and no button restarts it.
+    Yourself,
 }
 
 pub struct Outage {
@@ -69,6 +80,8 @@ pub struct Outage {
     notified: bool,
     /// The toggle from the last status the daemon sent. It survives the daemon going away; on until one was read.
     notify_link: bool,
+    /// Who supervised the daemon, from the last status that said; unknown until then, as from an older daemon.
+    supervisor: Option<Supervisor>,
 }
 
 impl Outage {
@@ -78,15 +91,17 @@ impl Outage {
             down_since: None,
             notified: false,
             notify_link: true,
+            supervisor: None,
         }
     }
 
     pub fn handle(&mut self, event: Event, now: Instant) -> Option<Effect> {
         match event {
-            Event::Status { notify_link } => {
+            Event::Status { notify_link, supervisor } => {
                 self.down_since = None;
                 self.notified = false;
                 self.notify_link = notify_link;
+                self.supervisor = supervisor.or(self.supervisor);
                 None
             }
             Event::Down => {
@@ -96,7 +111,13 @@ impl Outage {
                 self.down_since = Some(now);
                 Some(Effect::Wait(self.grace))
             }
-            Event::GraceElapsed => self.due(now).then_some(Effect::CheckService),
+            Event::GraceElapsed if !self.due(now) => None,
+            // The service's state is about another daemon, or none: tell the user without asking systemd.
+            Event::GraceElapsed if self.supervisor == Some(Supervisor::Other) => {
+                self.notified = true;
+                Some(Effect::Notify(Restart::Yourself))
+            }
+            Event::GraceElapsed => Some(Effect::CheckService),
             Event::Service(service) => {
                 if !self.due(now) {
                     return None;
@@ -107,7 +128,7 @@ impl Outage {
                     return Some(Effect::Wait(self.grace));
                 }
                 self.notified = true;
-                Some(Effect::Notify)
+                Some(Effect::Notify(Restart::Here))
             }
         }
     }
@@ -133,11 +154,14 @@ pub async fn service() -> Service {
 
 /// The notification, sent with `notify-send` as the firmware one is. It is spawned and not awaited, so a slow
 /// notification server never holds up the app.
-pub fn notify() -> Result<(), String> {
-    let body = tr(
-        "The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.",
-        &[],
-    );
+pub fn notify(restart: Restart) -> Result<(), String> {
+    let body = match restart {
+        Restart::Here => tr("The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.", &[]),
+        Restart::Yourself => tr(
+            "The daemon stopped and didn't come back. It didn't run as the vibebuddyd systemd service, so start it again the way you started it.",
+            &[],
+        ),
+    };
     std::process::Command::new("notify-send")
         .args(["--app-name=VibeBuddy", "VibeBuddy", body.as_str()])
         .spawn()
@@ -157,6 +181,39 @@ mod tests {
         Outage::new(GRACE)
     }
 
+    /// A status from a daemon the systemd service runs.
+    fn status(notify_link: bool) -> Event {
+        Event::Status { notify_link, supervisor: Some(Supervisor::Systemd) }
+    }
+
+    #[test]
+    fn a_daemon_outside_the_service_notifies_without_asking_systemd() {
+        let start = Instant::now();
+        let mut policy = outage();
+        policy.handle(Event::Status { notify_link: true, supervisor: Some(Supervisor::Other) }, start);
+        assert_eq!(policy.handle(Event::Down, at(start, 1.0)), Some(Effect::Wait(GRACE)));
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 31.0)), Some(Effect::Notify(Restart::Yourself)));
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 62.0)), None);
+    }
+
+    #[test]
+    fn the_supervisor_survives_a_status_from_an_older_daemon() {
+        let start = Instant::now();
+        let mut policy = outage();
+        policy.handle(Event::Status { notify_link: true, supervisor: Some(Supervisor::Other) }, start);
+        policy.handle(Event::Status { notify_link: true, supervisor: None }, at(start, 1.0));
+        policy.handle(Event::Down, at(start, 2.0));
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 32.0)), Some(Effect::Notify(Restart::Yourself)));
+    }
+
+    #[test]
+    fn with_no_supervisor_known_the_service_is_asked() {
+        let start = Instant::now();
+        let mut policy = outage();
+        policy.handle(Event::Down, start);
+        assert_eq!(policy.handle(Event::GraceElapsed, at(start, 30.0)), Some(Effect::CheckService));
+    }
+
     #[test]
     fn the_grace_boundary_is_exact() {
         let start = Instant::now();
@@ -171,7 +228,7 @@ mod tests {
         let start = Instant::now();
         let mut policy = outage();
         policy.handle(Event::Down, start);
-        assert_eq!(policy.handle(Event::Status { notify_link: true }, at(start, 5.0)), None);
+        assert_eq!(policy.handle(status(true), at(start, 5.0)), None);
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 30.0)), None);
     }
 
@@ -193,7 +250,7 @@ mod tests {
         policy.handle(Event::GraceElapsed, at(start, 30.0));
         assert_eq!(
             policy.handle(Event::Service(Service::Failed), at(start, 30.0)),
-            Some(Effect::Notify)
+            Some(Effect::Notify(Restart::Here))
         );
         assert_eq!(policy.handle(Event::Down, at(start, 32.0)), None);
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), None);
@@ -206,12 +263,12 @@ mod tests {
         policy.handle(Event::Down, start);
         policy.handle(Event::GraceElapsed, at(start, 30.0));
         policy.handle(Event::Service(Service::Failed), at(start, 30.0));
-        policy.handle(Event::Status { notify_link: true }, at(start, 40.0));
+        policy.handle(status(true), at(start, 40.0));
         assert_eq!(policy.handle(Event::Down, at(start, 50.0)), Some(Effect::Wait(GRACE)));
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 80.0)), Some(Effect::CheckService));
         assert_eq!(
             policy.handle(Event::Service(Service::Failed), at(start, 80.0)),
-            Some(Effect::Notify)
+            Some(Effect::Notify(Restart::Here))
         );
     }
 
@@ -220,7 +277,7 @@ mod tests {
         let start = Instant::now();
         let mut policy = outage();
         policy.handle(Event::Down, start);
-        policy.handle(Event::Status { notify_link: true }, at(start, 5.0));
+        policy.handle(status(true), at(start, 5.0));
         policy.handle(Event::Down, at(start, 10.0));
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 30.0)), None);
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 40.0)), Some(Effect::CheckService));
@@ -232,7 +289,7 @@ mod tests {
         let mut policy = outage();
         policy.handle(Event::Down, start);
         policy.handle(Event::GraceElapsed, at(start, 30.0));
-        policy.handle(Event::Status { notify_link: true }, at(start, 31.0));
+        policy.handle(status(true), at(start, 31.0));
         assert_eq!(policy.handle(Event::Service(Service::Failed), at(start, 31.0)), None);
     }
 
@@ -240,7 +297,7 @@ mod tests {
     fn turning_the_notification_off_silences_it() {
         let start = Instant::now();
         let mut policy = outage();
-        policy.handle(Event::Status { notify_link: false }, start);
+        policy.handle(status(false), start);
         policy.handle(Event::Down, start);
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 30.0)), None);
     }
@@ -249,7 +306,7 @@ mod tests {
     fn the_last_known_toggle_outlives_the_daemon() {
         let start = Instant::now();
         let mut policy = outage();
-        policy.handle(Event::Status { notify_link: false }, start);
+        policy.handle(status(false), start);
         policy.handle(Event::Down, at(start, 1.0));
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 31.0)), None);
     }
@@ -284,7 +341,7 @@ mod tests {
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), Some(Effect::CheckService));
         assert_eq!(
             policy.handle(Event::Service(Service::Failed), at(start, 60.0)),
-            Some(Effect::Notify)
+            Some(Effect::Notify(Restart::Here))
         );
         assert_eq!(policy.handle(Event::Down, at(start, 62.0)), None);
     }
@@ -296,7 +353,7 @@ mod tests {
         policy.handle(Event::Down, start);
         policy.handle(Event::GraceElapsed, at(start, 30.0));
         policy.handle(Event::Service(Service::Inactive), at(start, 30.0));
-        policy.handle(Event::Status { notify_link: true }, at(start, 40.0));
+        policy.handle(status(true), at(start, 40.0));
         assert_eq!(policy.handle(Event::GraceElapsed, at(start, 60.0)), None);
     }
 
@@ -309,7 +366,7 @@ mod tests {
             policy.handle(Event::GraceElapsed, at(start, 30.0));
             assert_eq!(
                 policy.handle(Event::Service(service), at(start, 30.0)),
-                Some(Effect::Notify),
+                Some(Effect::Notify(Restart::Here)),
                 "{service:?}"
             );
         }

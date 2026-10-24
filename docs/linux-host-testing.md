@@ -52,6 +52,14 @@ lists are recorded; responses, exit codes, stderr and a `sleep` before answering
 that start with those arguments, so a window listing and the focus call can differ. The window listings are synthetic
 (`tools/fixtures/linux-windows/README.md`).
 
+K2 reads the window system from the environment of the processes it focuses, so the agent's ancestors are real. The
+scenarios and listings name placeholder pids (4242, 4000, 4343, 5151); `use_session` starts a process for each with
+exactly the session environment a scenario wants (a live Hyprland by default), and the harness puts their real pids in
+the hook's reports and the stubs' replies. Hyprland's and Sway's sockets are real listening Unix sockets
+(`listening_socket`), since the daemon believes only a socket that accepts a connection. The daemon in the harness is
+started by hand, so it reports `supervisor: "other"`; the outage scenarios set `VIBEBUDDY_SUPERVISOR=systemd`, as an
+installed daemon would report.
+
 The PTY has no USB VID/PID metadata. The explicit-port path therefore assumes bridge pacing and reports
 `device.bridge=true`. USB discovery, write timing, DTR reset, udev permissions and actual re-enumeration still need a
 box. Replug tests replace the PTY behind a stable symlink. The harness clears `TIOCEXCL` after stopping its daemon
@@ -71,7 +79,8 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | K2 short press on release | Source focus command; needs-input priority; completed source retained; destination survives daemon restart. |
 | Nearest ancestor window; Lua dispatch rejected; desktop command fails | Correct PID choice, legacy Hyprland fallback and recovery on the next press. |
 | K2 on Sway: nearest ancestor's container focused with `swaymsg`; needs-input priority; completed source survives a restart; refused focus, failing or slow `swaymsg`, missing window, malformed tree; a stale `SWAYSOCK` falls back to Hyprland | `SwayFocusTests`. `swaymsg -t get_tree` and `[con_id=N] focus` are answered by a synthetic tree and reply. A refused focus is logged with its reply and the next press recovers; failures and timeouts are logged, and nothing else is focused. |
-| K2 on X11: nearest ancestor raised with `wmctrl -i -a`; missing, malformed or invalid listing rows; refused raise; failing or slow `wmctrl`; an Xwayland session stays on Hyprland | `X11FocusTests`. `wmctrl -l -p` is answered by a synthetic listing. Invalid rows are skipped, and errors are logged with their stderr. Missing executables, the selection rules and reading the session from `systemctl --user show-environment` are covered by unit tests in `daemon/src/window_focus.rs`. |
+| K2 on X11: nearest ancestor raised with `wmctrl -i -a`; missing, malformed or invalid listing rows; refused raise; failing or slow `wmctrl`; an Xwayland session stays on Hyprland | `X11FocusTests`. `wmctrl -l -p` is answered by a synthetic listing. Invalid rows are skipped, and errors are logged with their stderr. Missing executables, the selection rules and parsing a process's or systemd's environment are covered by unit tests in `daemon/src/window_focus.rs`. |
+| Window-system evidence: the agent's processes run Sway while systemd's user manager and the daemon still hold an ended Hyprland session's variables; only a stale Hyprland signature, with agent processes that say nothing graphical; agent processes that can't say, with Sway in the user manager; GNOME on Wayland with Xwayland's `DISPLAY` while the user manager holds an earlier X11 login | The agent's session wins and nothing else is asked; a stale signature or a socket nobody listens on picks no backend, runs no helper and logs that the session runs no supported window system; systemd's user manager is the fallback, taken whole. |
 | K0/K1 taps, K2 hold, K1 hold and menu K2 | Pomodoro/mode diagnostics reach status; mute/menu actions stay local and do not open a source. |
 | Firmware clock advanced across a focus period | Focus completion diagnostic without waiting 25 minutes. |
 | Disconnect, new PTY, device reset | Offline/reconnect status; settings and pairing key restored from the same simulated flash. |
@@ -86,6 +95,7 @@ marked synthetic deliberately inject or replace output to exercise device-layer 
 | Factory log line followed by several heartbeat intervals, then ROM reset/build | No hello or heartbeat is written to foreign firmware; normal traffic resumes after our build appears. |
 | Daemon stopped (status stream retries every 2 s), with the unit `inactive`, `failed`, unreadable, slow or never read, and the app's notify toggle on, off or never read | `DaemonOutageTests`. `daemon_outage_probe` runs the app's real status stream through the outage policy and its `systemctl`/`notify-send` adapters. One `notify-send` per outage after a 4 s grace (shortened for the probe; the 30 s boundary is unit-tested with explicit instants); none for a brief restart, a stopped unit or a disabled toggle; rearmed after recovery. |
 | Inactive service followed by failed startup with no status recovery; restart requested while HTTP is down | The outage policy rechecks the stopped service and notifies when it later fails. The same restart adapter used by Advanced and the tray calls systemd without HTTP and reports a refused restart. |
+| A daemon that doesn't run as the systemd service: its status, its restart endpoint, an outage with the unit `inactive`, a restart from the app | Status says `supervisor: "other"`; the endpoint refuses with 409 and the daemon keeps running; the outage notifies without asking systemd and says to start the daemon again by hand; Restart calls no `systemctl` and says why. |
 
 `tools/fixtures/device/wifi.json` contains synthetic device-layer reports, using test-only network names and a
 documentation-range IP address. Other scenarios generate actions directly or run the actual firmware core.
@@ -133,6 +143,8 @@ flashing are separate acceptance tasks.
 
 ## Validation
 
-On the branch that brought this suite in, from `574b700`: the full runner passed 55 scenarios (28 device and host, 11
-daemon outage, 9 Sway, 7 X11). `cargo test --workspace` passed, as did Clippy, with the four warnings that
-`574b700` already had. The localization check passed. No box, graphical desktop or Mac was used.
+On the branch that brought this suite in, from `574b700`, after the review fixes: the full runner passed 61 scenarios (29
+device and host, 13 daemon outage, 12 Sway, 7 X11). Breaking each new rule on purpose (every socket counted as live, the
+agent's own processes ignored, the outage policy blind to the supervisor) failed the scenarios meant to catch it.
+`cargo test --workspace` passed, as did Clippy, with the four warnings that `574b700` already had. The localization
+check passed. No box, graphical desktop or Mac was used.

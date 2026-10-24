@@ -511,25 +511,57 @@ fn activate(bundle_id: &str) -> Result<CommandSpec, String> {
     })
 }
 
-/// Focuses the window that owns the nearest of the agent's ancestors, on whichever window system the session runs
-/// (see `window_focus`). Hyprland, Sway and X11 each list windows with their pids and focus one.
+/// Focuses the window that owns the nearest of the agent's ancestors, on the window system of the session those
+/// processes run in (see `window_focus`). Hyprland, Sway and X11 each list windows with their pids and focus one.
 async fn focus_window(pids: &[u32]) -> Result<String, String> {
-    let session = session_environment().await;
-    match window_focus::compositor(|name| session.get(name).cloned(), |path| Path::new(path).exists()) {
-        Compositor::Hyprland => focus_hyprland(pids, &session).await,
-        Compositor::Sway => window_focus::focus_sway(pids, &session).await,
-        Compositor::X11 => window_focus::focus_x11(pids, &session).await,
+    let session = session_of(pids).await;
+    match window_focus::compositor(|name| session.get(name).cloned(), socket_answers) {
+        Some(Compositor::Hyprland) => focus_hyprland(pids, &session).await,
+        Some(Compositor::Sway) => window_focus::focus_sway(pids, &session).await,
+        Some(Compositor::X11) => window_focus::focus_x11(pids, &session).await,
+        None => Err(window_focus::NO_WINDOW_SYSTEM.to_owned()),
     }
 }
 
-/// The login session's window-system variables, read at each press: the user manager has those the desktop imported
-/// after the daemon started (G4 review 3.4). Without systemd's answer, the daemon's own environment.
-async fn session_environment() -> window_focus::Session {
+/// The session of the processes being focused, read from their own environments at each press. Only when none of
+/// them has a graphical one that can be read (a sandboxed terminal, say) does it fall back to systemd's user manager,
+/// then the daemon's own environment, each taken whole and only if it names a window system that answers.
+async fn session_of(pids: &[u32]) -> window_focus::Session {
+    if let Some(session) = window_focus::source_session(pids.iter().map(|&pid| process_session(pid))) {
+        return with_runtime_dir(session);
+    }
     let manager = run("systemctl", &["--user", "show-environment"]).await.unwrap_or_else(|error| {
         tracing::debug!(%error, "cannot read the session's environment from systemd");
         String::new()
     });
-    window_focus::session(&manager, |name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    let own: Vec<String> = std::env::vars().map(|(name, value)| format!("{name}={value}")).collect();
+    [window_focus::session(manager.lines()), window_focus::session(own.iter().map(String::as_str))]
+        .into_iter()
+        .map(with_runtime_dir)
+        .find(|session| window_focus::compositor(|name| session.get(name).cloned(), socket_answers).is_some())
+        .unwrap_or_default()
+}
+
+/// A process's session variables, from `/proc/<pid>/environ`: what it started with. None when it can't be read,
+/// as for another user's process or one that has exited.
+fn process_session(pid: u32) -> Option<window_focus::Session> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(window_focus::session(String::from_utf8_lossy(&environ).split('\0')))
+}
+
+/// Hyprland's socket lives in the runtime directory; one the session doesn't name is the daemon's, which systemd sets.
+fn with_runtime_dir(mut session: window_focus::Session) -> window_focus::Session {
+    if !session.contains_key("XDG_RUNTIME_DIR")
+        && let Some(dir) = std::env::var("XDG_RUNTIME_DIR").ok().filter(|dir| !dir.is_empty())
+    {
+        session.insert("XDG_RUNTIME_DIR", dir);
+    }
+    session
+}
+
+/// Whether a compositor listens on this socket: a file a crashed one left behind refuses the connection.
+fn socket_answers(path: &str) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 async fn focus_hyprland(pids: &[u32], session: &window_focus::Session) -> Result<String, String> {

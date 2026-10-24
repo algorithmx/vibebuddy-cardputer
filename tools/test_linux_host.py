@@ -29,11 +29,20 @@ class HostTestCase(unittest.TestCase):
     def setUp(self):
         self.host = HostHarness(self._testMethodName)
         self.addCleanup(self.host.close)
+        self.host.use_session(self.session_environment())
         self.host.start(firmware=self.firmware, environment=self.daemon_environment())
 
     def daemon_environment(self):
-        """Session variables the daemon starts with; a desktop test overrides this."""
+        """Variables the daemon starts with; a test of the daemon's own evidence overrides this."""
         return {}
+
+    def session_environment(self):
+        """The agent's terminal's environment, which K2 reads the window system from: a live Hyprland by default;
+        a desktop test overrides this."""
+        signature = "test_instance"
+        self.host.listening_socket(f"runtime/hypr/{signature}/.socket.sock")
+        return {"HYPRLAND_INSTANCE_SIGNATURE": signature, "XDG_RUNTIME_DIR": str(Path(self.host.control_dir.name) / "runtime"),
+                "WAYLAND_DISPLAY": "wayland-1", "XDG_SESSION_TYPE": "wayland"}
 
     def post(self, path, body=None, expected=202):
         code, response = self.host.request(path, body, method="POST")
@@ -46,7 +55,7 @@ class HostTestCase(unittest.TestCase):
     def hook(self, name, session="test-session", pids=None):
         return self.post("/v1/claude-hooks", {
             "session_id": session, "prompt_id": "test-turn", "hook_event_name": name,
-            "surface": "window", "host_pids": pids or [4242, 4000],
+            "surface": "window", "host_pids": [self.host.pids.get(pid, pid) for pid in pids or [4242, 4000]],
         })
 
 
@@ -314,6 +323,16 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(menus[1]["mode_line"], "Mode: Pomodoro")
         self.assertIn("click to restart", menus[3]["device_line"])
 
+    def test_status_names_the_supervisor_and_restart_refuses_without_one(self):
+        # The harness runs the daemon by hand, so it isn't the systemd service, and exiting would only stop it.
+        self.assertEqual(self.host.status()["daemon"]["supervisor"], "other")
+        code, response = self.host.request("/v1/daemon/restart", method="POST")
+        self.assertEqual(code, 409, response)
+        self.assertIn(NOT_THE_SERVICE, response["message"])
+        time.sleep(0.5)  # longer than the daemon waits before exiting on a restart it accepts
+        self.assertIsNone(self.host.daemon.poll())
+        self.assertEqual(self.host.status()["daemon"]["supervisor"], "other")
+
     def test_malformed_fragmented_and_coalesced_device_output(self):
         self.host.filter(fragment=3)
         self.host.emit(b'not-json\n{"version":99,"event":"button","button":"K2","action":"press"}\n'
@@ -355,6 +374,10 @@ class LinuxHostTests(HostTestCase):
 
 NOTIFY_ARGS = ["--app-name=VibeBuddy", "VibeBuddy",
                "The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab."]
+NOTIFY_YOURSELF_ARGS = ["--app-name=VibeBuddy", "VibeBuddy",
+                        "The daemon stopped and didn't come back. It didn't run as the vibebuddyd systemd service, "
+                        "so start it again the way you started it."]
+NOT_THE_SERVICE = "doesn't run as the vibebuddyd systemd service"
 # The status stream retries every 2 s, so a brief restart must fit inside one retry plus the grace period.
 PROBE_GRACE_MS = 4000
 PROBE_WAIT = PROBE_GRACE_MS / 1000 + 8
@@ -364,6 +387,10 @@ PROBE_WAIT = PROBE_GRACE_MS / 1000 + 8
 class DaemonOutageTests(HostTestCase):
     """The Linux app's daemon-failure notification: the real status stream drives the outage policy via the probe."""
     firmware = False
+
+    def daemon_environment(self):
+        # As installed: the daemon runs as the systemd service, so the unit's state is about it.
+        return {"VIBEBUDDY_SUPERVISOR": "systemd"}
 
     def setUp(self):
         super().setUp()
@@ -409,11 +436,11 @@ class DaemonOutageTests(HostTestCase):
 
     def test_a_brief_restart_within_the_grace_period_stays_silent(self):
         self.start_probe()
-        self.wait_count("Status { notify_link: true } -> None", 1)
+        self.wait_count("Status { notify_link: true, supervisor: Some(Systemd) } -> None", 1)
         self.host.stop_daemon()
         self.wait_count("Down -> Some(Wait", 1)
         self.host.start_daemon()
-        self.wait_count("Status { notify_link: true } -> None", 2)
+        self.wait_count("Status { notify_link: true, supervisor: Some(Systemd) } -> None", 2)
         self.wait_count("GraceElapsed -> None", 1, timeout=PROBE_WAIT)
         self.assert_no_check_or_notify()
         self.assertEqual(self.vibebuddy_notifications(), [])
@@ -422,10 +449,10 @@ class DaemonOutageTests(HostTestCase):
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("-> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         # Retries keep failing after the notification; none of them may notify again.
         self.wait_count("Down -> None", 3, timeout=PROBE_WAIT)
-        self.assertEqual(self.count("-> Some(Notify)"), 1)
+        self.assertEqual(self.count("-> Some(Notify(Here))"), 1)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
         self.assertEqual([command["args"] for command in self.host.commands("systemctl")],
                          [["--user", "is-active", "vibebuddyd"]])
@@ -434,11 +461,11 @@ class DaemonOutageTests(HostTestCase):
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("-> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         self.host.start_daemon()
         self.wait_count("Status {", 2)
         self.host.stop_daemon()
-        self.wait_count("-> Some(Notify)", 2, timeout=PROBE_WAIT)
+        self.wait_count("-> Some(Notify(Here))", 2, timeout=PROBE_WAIT)
         self.assertEqual(self.await_notifications(2), [NOTIFY_ARGS, NOTIFY_ARGS])
 
     def test_the_notify_toggle_silences_an_outage_after_the_daemon_is_gone(self):
@@ -448,7 +475,7 @@ class DaemonOutageTests(HostTestCase):
         config["notify_link"] = False
         code, response = self.host.request("/v1/config", config, method="PUT")
         self.assertEqual(code, 200, response)
-        self.wait_count("Status { notify_link: false } -> None", 1)
+        self.wait_count("Status { notify_link: false, supervisor: Some(Systemd) } -> None", 1)
         self.host.stop_daemon()
         self.wait_count("GraceElapsed -> None", 1, timeout=PROBE_WAIT)
         self.assert_no_check_or_notify()
@@ -457,7 +484,7 @@ class DaemonOutageTests(HostTestCase):
     def test_without_any_status_the_notification_is_on(self):
         self.host.stop_daemon()
         self.start_probe()
-        self.wait_count("-> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("-> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
     def test_a_unit_stopped_on_purpose_stays_silent(self):
@@ -475,7 +502,7 @@ class DaemonOutageTests(HostTestCase):
         self.host.stop_daemon()
         self.wait_count("Service(Inactive) -> Some(Wait", 1, timeout=PROBE_WAIT)
         self.host.command_reply("systemctl", stdout="failed\n", exit=3)
-        self.wait_count("Service(Failed) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("Service(Failed) -> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
     def test_restart_uses_systemd_when_the_daemon_is_down_and_reports_failure(self):
@@ -486,16 +513,38 @@ class DaemonOutageTests(HostTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.host.commands("systemctl")[-1]["args"], ["--user", "restart", "vibebuddyd"])
         self.host.command_reply("systemctl", stderr="restart refused", exit=1)
-        result = subprocess.run([probe, "--restart"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        result = subprocess.run([probe, "--restart", "systemd"], env=self.host.env, capture_output=True, text=True, timeout=12)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("restart refused", result.stderr)
+
+    def test_restart_refuses_a_daemon_outside_the_service(self):
+        # systemctl would restart the unit, not this daemon; the daemon's own endpoint would only stop it.
+        self.host.stop_daemon()
+        probe = os.environ.get("VIBEBUDDY_TEST_OUTAGE_PROBE", str(REPO / "target/debug/examples/daemon_outage_probe"))
+        result = subprocess.run([probe, "--restart", "other"], env=self.host.env, capture_output=True, text=True, timeout=12)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(NOT_THE_SERVICE, result.stderr)
+        self.assertEqual(self.host.commands("systemctl"), [])
+
+    def test_a_daemon_outside_the_service_notifies_without_asking_systemd(self):
+        # Started by hand, the unit is `inactive` whatever this daemon does; that must not read as a deliberate stop.
+        self.host.command_reply("systemctl", stdout="inactive\n", exit=3)
+        self.host.stop_daemon()
+        self.host.env["VIBEBUDDY_SUPERVISOR"] = "other"
+        self.host.start_daemon()
+        self.start_probe()
+        self.wait_count("supervisor: Some(Other) } -> None", 1)
+        self.host.stop_daemon()
+        self.wait_count("GraceElapsed -> Some(Notify(Yourself))", 1, timeout=PROBE_WAIT)
+        self.assertEqual(self.await_notifications(1), [NOTIFY_YOURSELF_ARGS])
+        self.assertEqual(self.host.commands("systemctl"), [])
 
     def test_a_crash_looping_unit_notifies(self):
         self.host.command_reply("systemctl", stdout="failed\n", exit=3)
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("Service(Failed) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("Service(Failed) -> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
     def test_an_unreadable_unit_state_still_notifies(self):
@@ -504,7 +553,7 @@ class DaemonOutageTests(HostTestCase):
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("Service(Unknown) -> Some(Notify)", 1, timeout=PROBE_WAIT)
+        self.wait_count("Service(Unknown) -> Some(Notify(Here))", 1, timeout=PROBE_WAIT)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
     def test_a_slow_systemctl_times_out_and_still_notifies(self):
@@ -512,7 +561,7 @@ class DaemonOutageTests(HostTestCase):
         self.start_probe()
         self.wait_count("Status {", 1)
         self.host.stop_daemon()
-        self.wait_count("Service(Unknown) -> Some(Notify)", 1, timeout=PROBE_WAIT + 2)
+        self.wait_count("Service(Unknown) -> Some(Notify(Here))", 1, timeout=PROBE_WAIT + 2)
         self.assertEqual(self.await_notifications(1), [NOTIFY_ARGS])
 
 
@@ -520,16 +569,17 @@ WINDOW_FIXTURES = Path(__file__).with_name("fixtures") / "linux-windows"
 SWAY_TREE = (WINDOW_FIXTURES / "sway-get-tree.json").read_text()
 WMCTRL_LIST = (WINDOW_FIXTURES / "wmctrl-list.txt").read_text()
 NO_WINDOW = "has no host window"
+NO_WINDOW_SYSTEM = "runs no supported window system"
 
 
 @unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
 class SwayFocusTests(HostTestCase):
     """K2 on Sway: the daemon lists windows with `swaymsg -t get_tree` and focuses one by container id."""
 
-    def daemon_environment(self):
-        socket = self.host.root / "sway.sock"
-        socket.touch()  # the daemon only believes in a Sway socket that exists
-        return {"SWAYSOCK": str(socket)}
+    def session_environment(self):
+        # The daemon only believes in a Sway socket that accepts a connection.
+        self.sway_socket = self.host.listening_socket("sway.sock")
+        return {"SWAYSOCK": str(self.sway_socket), "WAYLAND_DISPLAY": "wayland-1", "XDG_SESSION_TYPE": "wayland"}
 
     def restart_daemon_with(self, **variables):
         self.host.stop_daemon()
@@ -615,28 +665,56 @@ class SwayFocusTests(HostTestCase):
         wait_for(lambda: "swaymsg timed out" in self.log_text(), "timeout logged", timeout=12)
         self.assertEqual(self.focus_calls(), [])
 
-    def test_a_stale_sway_socket_falls_back_to_hyprland(self):
-        self.restart_daemon_with(SWAYSOCK=str(self.host.root / "gone.sock"))
-        self.host.command_reply("hyprctl", clients=[{"pid": 4242, "address": "0xabc"}])
+    def test_a_stale_sway_socket_focuses_nothing(self):
+        stale = self.host.root / "gone.sock"
+        stale.touch()  # what a crashed compositor leaves: the file, with nobody listening
+        self.host.use_session({"SWAYSOCK": str(stale), "WAYLAND_DISPLAY": "wayland-1", "XDG_SESSION_TYPE": "wayland"})
         self.hook("UserPromptSubmit")
         self.host.press("K2")
-        wait_for(lambda: any("0xabc" in " ".join(command["args"]) for command in self.host.commands("hyprctl")),
-                 "stale socket ignored")
+        wait_for(lambda: NO_WINDOW_SYSTEM in self.log_text(), "no window system logged")
         self.assertEqual(self.host.commands("swaymsg"), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
+
+    def test_the_agents_session_wins_over_a_hyprland_left_in_systemd(self):
+        # An earlier Hyprland login left its variables in the user manager (linger, say), and the daemon has them too.
+        self.host.command_reply("systemctl", args=["--user", "show-environment"],
+                                stdout="HYPRLAND_INSTANCE_SIGNATURE=old_instance\nXDG_RUNTIME_DIR=/run/user/1000\n")
+        self.restart_daemon_with(HYPRLAND_INSTANCE_SIGNATURE="old_instance")
+        self.answer_sway()
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: self.focus_calls() == [["[con_id=17] focus"]], "Sway, from the agent's own session")
+        self.assertEqual(self.host.commands("hyprctl"), [])
+        self.assertEqual(self.host.commands("systemctl"), [])  # the agent's session settles it; nothing else is asked
+
+    def test_a_hyprland_left_in_systemd_alone_focuses_nothing(self):
+        # The agent's processes say nothing graphical (as over SSH), and the only Hyprland sign is a stale one.
+        self.host.use_session({"XDG_RUNTIME_DIR": str(self.host.root)})
+        self.host.command_reply("systemctl", args=["--user", "show-environment"],
+                                stdout=f"HYPRLAND_INSTANCE_SIGNATURE=old_instance\nXDG_RUNTIME_DIR={self.host.root}\n")
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: NO_WINDOW_SYSTEM in self.log_text(), "no window system logged")
+        self.assertEqual(self.host.commands("hyprctl"), [])
+        self.assertEqual(self.host.commands("swaymsg"), [])
+
+    def test_without_a_readable_session_systemd_still_finds_sway(self):
+        # A daemon systemd started before the desktop imported its variables, and agent processes that don't say.
+        self.host.use_session({})
+        self.host.command_reply("systemctl", args=["--user", "show-environment"],
+                                stdout=f"SWAYSOCK={self.sway_socket}\nXDG_SESSION_TYPE=wayland\n")
+        self.answer_sway()
+        self.hook("UserPromptSubmit")
+        self.host.press("K2")
+        wait_for(lambda: self.focus_calls() == [["[con_id=17] focus"]], "Sway, from systemd's user manager")
 
 
 @unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")
 class X11FocusTests(HostTestCase):
     """K2 on X11: `wmctrl -l -p` lists the windows with their pids, and `wmctrl -i -a` raises one by its id."""
 
-    def daemon_environment(self):
+    def session_environment(self):
         return {"XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
-
-    def restart_daemon_with(self, **variables):
-        self.host.stop_daemon()
-        self.host.env.update(variables)
-        self.host.start_daemon()
-        self.host.wait_device(lambda device: device["paired"], "daemon restart handshake", timeout=12)
 
     def raise_calls(self):
         return [command["args"] for command in self.host.commands("wmctrl") if command["args"][:1] == ["-i"]]
@@ -694,14 +772,15 @@ class X11FocusTests(HostTestCase):
         wait_for(lambda: "wmctrl timed out" in self.log_text(), "timeout logged", timeout=12)
         self.assertEqual(self.raise_calls(), [])
 
-    def test_a_wayland_session_with_xwayland_is_not_treated_as_x11(self):
-        self.restart_daemon_with(XDG_SESSION_TYPE="wayland", WAYLAND_DISPLAY="wayland-0")
-        self.host.command_reply("hyprctl", clients=[{"pid": 4242, "address": "0xabc"}])
+    def test_gnome_or_kde_on_wayland_focuses_nothing_despite_an_x11_left_in_systemd(self):
+        # Xwayland sets DISPLAY, and an earlier X11 login left its variables in the user manager.
+        self.host.use_session({"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"})
+        self.host.command_reply("systemctl", args=["--user", "show-environment"], stdout="XDG_SESSION_TYPE=x11\nDISPLAY=:0\n")
         self.hook("UserPromptSubmit")
         self.host.press("K2")
-        wait_for(lambda: any("0xabc" in " ".join(command["args"]) for command in self.host.commands("hyprctl")),
-                 "Xwayland session stays on Hyprland")
+        wait_for(lambda: NO_WINDOW_SYSTEM in self.log_text(), "no window system logged")
         self.assertEqual(self.host.commands("wmctrl"), [])
+        self.assertEqual(self.host.commands("hyprctl"), [])
 
 
 @unittest.skipUnless(ENABLED, "run tools/test-linux-host.sh on Linux")

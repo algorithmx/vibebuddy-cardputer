@@ -1,6 +1,7 @@
 //! Headless driver for the daemon-failure notification. The app's real status stream feeds the outage state machine,
 //! and its effects run through the adapters the app uses, so the decisions are the app's. Arguments: the daemon's base
 //! URL and the grace period in milliseconds (the app's is 30 s). Prints one line per event with the effect it caused.
+//! `--restart [systemd|other]` instead runs the app's restart for a daemon with that supervisor, unknown by default.
 
 #[allow(dead_code)]
 #[path = "../src/client.rs"]
@@ -32,7 +33,8 @@ async fn main() {
     let base = args.next().expect("the daemon's base URL");
     // Exercise the recovery adapter the real app uses, including when its HTTP server is gone.
     if base == "--restart" {
-        if let Err(error) = client::restart_daemon().await {
+        let supervisor = args.next().map(|name| if name == "systemd" { status::Supervisor::Systemd } else { status::Supervisor::Other });
+        if let Err(error) = client::restart_daemon(supervisor).await {
             eprintln!("{error}");
             std::process::exit(1);
         }
@@ -48,6 +50,7 @@ async fn main() {
             let event = match update {
                 client::Update::Status(status) => Event::Status {
                     notify_link: status.config.notify_link,
+                    supervisor: status.daemon.supervisor,
                 },
                 client::Update::Down => Event::Down,
             };
@@ -75,8 +78,8 @@ async fn main() {
                     let _ = tx.send(Event::Service(outage::service().await));
                 });
             }
-            Some(Effect::Notify) => {
-                if let Err(error) = outage::notify() {
+            Some(Effect::Notify(restart)) => {
+                if let Err(error) = outage::notify(restart) {
                     println!("notify failed: {error}");
                 }
             }

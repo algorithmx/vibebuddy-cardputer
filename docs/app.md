@@ -141,9 +141,12 @@ this app most needs to know:
   notify toggle is on, using the last value the daemon reported. A unit the user stopped stays silent.
 - **Tray.** A StatusNotifierItem through `ksni`. Without a tray host the settings window opens about 10 seconds after
   start. The README's Linux section explains why and names the GNOME extension.
-- **K2.** The daemon focuses the agent's window on Hyprland, Sway or X11 (`daemon/src/window_focus.rs`). GNOME and KDE
-  under Wayland only switch the tmux pane, if there is one. The app itself has no K2 code.
-- **Supervision.** A systemd user service runs the daemon, so quitting the app leaves the box online.
+- **K2.** The daemon focuses the agent's window on Hyprland, Sway or X11 (`daemon/src/window_focus.rs`), choosing the
+  window system from the environment of the processes it focuses, and Hyprland or Sway only while their socket answers.
+  GNOME and KDE under Wayland only switch the tmux pane, if there is one. The app itself has no K2 code.
+- **Supervision.** A systemd user service runs the daemon, so quitting the app leaves the box online. The daemon says in
+  its status whether it runs as that service. If it doesn't (started by hand, say), Restart, Show daemon log and the
+  daemon-failure alert say so instead of acting on the unit.
 
 ## Acceptance
 

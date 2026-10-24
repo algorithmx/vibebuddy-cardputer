@@ -1,6 +1,8 @@
-//! Brings the window of an agent's session forward on Linux, on the window system the session runs. Hyprland is the
-//! default, as it always was; Sway and X11 are chosen only when the session says so. Each backend lists the windows
-//! with their pids and focuses the one owned by the nearest of the agent's ancestors.
+//! Brings the window of an agent's session forward on Linux, on the window system that session runs. The evidence is
+//! the environment of the processes being focused (`/proc/<pid>/environ`): the terminal an agent runs in carries the
+//! variables of the graphical session its window belongs to, whatever any other session left behind. A window system
+//! counts only on live evidence; with none, nothing is focused. Each backend lists the windows with their pids and
+//! focuses the one owned by the nearest of the agent's ancestors.
 
 use std::collections::BTreeMap;
 
@@ -9,30 +11,45 @@ use serde::Deserialize;
 use crate::source_opener::run_with_env;
 
 pub const NO_HOST_WINDOW: &str = "session has no host window (SSH, tmux or a background process)";
+pub const NO_WINDOW_SYSTEM: &str = "the session runs no supported window system (Hyprland, Sway or X11)";
 
-/// The variables that say which window system the session runs and how its helpers reach it.
-const SESSION_VARIABLES: [&str; 6] = ["HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "XDG_SESSION_TYPE", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"];
+/// The variables that say which window system a session runs and how its helpers reach it.
+const SESSION_VARIABLES: [&str; 7] = [
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
+    "XDG_SESSION_TYPE",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+];
 
-/// Those variables as the login session has them, by name; also the environment the backend's helper runs with.
+/// The ones only a graphical session sets: an environment with none of them says nothing about a window system.
+const GRAPHICAL_VARIABLES: [&str; 4] = ["HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "WAYLAND_DISPLAY", "DISPLAY"];
+
+/// A session's variables, by name; also the environment the backend's helper runs with.
 pub type Session = BTreeMap<&'static str, String>;
 
-/// The session's variables, from `systemctl --user show-environment` (`manager`, one `NAME=value` a line) where it
-/// has them, otherwise from `process`, the daemon's own environment. systemd starts the daemon at its own start,
-/// which can be before the desktop imports its variables; the manager has the ones the desktop imported since.
-/// A value systemd had to quote (`$'…'`) is left to the process: none of these normally needs it.
-pub fn session(manager: &str, process: impl Fn(&str) -> Option<String>) -> Session {
-    let imported: BTreeMap<&str, &str> = manager.lines().filter_map(|line| line.split_once('=')).collect();
-    SESSION_VARIABLES
+/// The session variables among `entries`, each `NAME=value`: a process's environment, or the lines of
+/// `systemctl --user show-environment`. A value systemd had to quote (`$'…'`) is dropped: none of these normally needs it.
+pub fn session<'a>(entries: impl IntoIterator<Item = &'a str>) -> Session {
+    entries
         .into_iter()
-        .filter_map(|name| {
-            let value = imported
-                .get(name)
-                .filter(|value| !value.is_empty() && !value.starts_with("$'"))
-                .map(|value| (*value).to_owned())
-                .or_else(|| process(name))?;
-            Some((name, value))
-        })
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(_, value)| !value.is_empty() && !value.starts_with("$'"))
+        .filter_map(|(name, value)| Some((*SESSION_VARIABLES.iter().find(|known| **known == name)?, value.to_owned())))
         .collect()
+}
+
+/// Whether an environment belongs to a graphical session at all.
+pub fn graphical(session: &Session) -> bool {
+    GRAPHICAL_VARIABLES.iter().any(|name| session.contains_key(name))
+}
+
+/// The session of the nearest process in `environments` (nearest first; None where one couldn't be read) whose
+/// environment is graphical. It is taken whole, never merged with another source's variables.
+pub fn source_session(environments: impl IntoIterator<Item = Option<Session>>) -> Option<Session> {
+    environments.into_iter().flatten().find(graphical)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,25 +59,36 @@ pub enum Compositor {
     X11,
 }
 
-/// Which window system the session runs on. `var` reads an environment variable, `socket_exists` tells whether a path
-/// is there. Both are parameters, so the choice is testable without the real environment.
+/// Which window system a session runs, if any we support. `var` reads one of its variables; `live` tells whether a
+/// Unix socket at a path accepts a connection. Both are parameters, so the choice is testable without a desktop.
 ///
-/// Hyprland is answered first, as before. A Sway socket counts only while it exists, so one a dead compositor left
-/// behind doesn't win. Then `XDG_SESSION_TYPE` decides when it is set: `x11` is X11, anything else stays on Hyprland.
-/// Without a session type, a `DISPLAY` with no `WAYLAND_DISPLAY` is X11.
-pub fn compositor(var: impl Fn(&str) -> Option<String>, socket_exists: impl Fn(&str) -> bool) -> Compositor {
-    if var("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-        return Compositor::Hyprland;
+/// Hyprland and Sway count only while their socket answers, so a variable an ended session left behind (in systemd's
+/// user manager, say) never wins. Hyprland listens in `$XDG_RUNTIME_DIR/hypr/<signature>`, or in `/tmp/hypr` before
+/// 0.40. X11 needs `XDG_SESSION_TYPE=x11`, or no session type and a `DISPLAY` without a `WAYLAND_DISPLAY`: Xwayland
+/// sets `DISPLAY` too, and GNOME or KDE on Wayland are not X11.
+pub fn compositor(var: impl Fn(&str) -> Option<String>, live: impl Fn(&str) -> bool) -> Option<Compositor> {
+    if let Some(signature) = var("HYPRLAND_INSTANCE_SIGNATURE").filter(|signature| valid_signature(signature)) {
+        let current = var("XDG_RUNTIME_DIR").map(|dir| format!("{dir}/hypr/{signature}/.socket.sock"));
+        let legacy = format!("/tmp/hypr/{signature}/.socket.sock");
+        if current.iter().chain([&legacy]).any(|socket| live(socket)) {
+            return Some(Compositor::Hyprland);
+        }
     }
-    if var("SWAYSOCK").is_some_and(|socket| socket_exists(&socket)) {
-        return Compositor::Sway;
+    if var("SWAYSOCK").is_some_and(|socket| live(&socket)) {
+        return Some(Compositor::Sway);
     }
     match var("XDG_SESSION_TYPE").as_deref() {
-        Some("x11") => Compositor::X11,
-        Some(_) => Compositor::Hyprland,
-        None if var("DISPLAY").is_some() && var("WAYLAND_DISPLAY").is_none() => Compositor::X11,
-        None => Compositor::Hyprland,
+        Some("x11") => Some(Compositor::X11),
+        Some(_) => None,
+        None if var("DISPLAY").is_some() && var("WAYLAND_DISPLAY").is_none() => Some(Compositor::X11),
+        None => None,
     }
+}
+
+/// Hyprland's instance signatures are its commit, a timestamp and a random part, joined by `_`; anything else never
+/// becomes part of a path.
+fn valid_signature(signature: &str) -> bool {
+    !signature.is_empty() && signature.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// `swaymsg -t get_tree` lists the windows, then the nearest ancestor's window is focused by its container id.
@@ -167,68 +195,96 @@ mod tests {
         pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).to_owned())
     }
 
-    fn choose(pairs: &[(&str, &str)], sockets: &[&str]) -> Compositor {
-        compositor(|name| lookup(pairs, name), |path| sockets.contains(&path))
+    /// The window system for these variables, with only the sockets in `live` answering.
+    fn choose(pairs: &[(&str, &str)], live: &[&str]) -> Option<Compositor> {
+        compositor(|name| lookup(pairs, name), |path| live.contains(&path))
+    }
+
+    const HYPRLAND: [(&str, &str); 2] = [("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456"), ("XDG_RUNTIME_DIR", "/run/user/1000")];
+    const HYPRLAND_SOCKET: &str = "/run/user/1000/hypr/abc_123_456/.socket.sock";
+
+    fn owned(pairs: &[(&'static str, &str)]) -> Session {
+        pairs.iter().map(|&(name, value)| (name, value.to_owned())).collect()
     }
 
     #[test]
-    fn hyprland_is_chosen_when_nothing_else_is_known() {
-        assert_eq!(choose(&[], &[]), Compositor::Hyprland);
+    fn nothing_known_is_no_window_system() {
+        assert_eq!(choose(&[], &[]), None);
     }
 
     #[test]
-    fn a_hyprland_session_wins_over_every_other_sign() {
-        let pairs = [
-            ("HYPRLAND_INSTANCE_SIGNATURE", "abc"),
-            ("SWAYSOCK", "/run/sway.sock"),
-            ("XDG_SESSION_TYPE", "x11"),
-        ];
-        assert_eq!(choose(&pairs, &["/run/sway.sock"]), Compositor::Hyprland);
+    fn hyprland_counts_only_while_its_socket_answers() {
+        assert_eq!(choose(&HYPRLAND, &[HYPRLAND_SOCKET]), Some(Compositor::Hyprland));
+        // A signature an ended session left behind, in systemd's user manager say, is not a Hyprland session.
+        assert_eq!(choose(&HYPRLAND, &[]), None);
+        assert_eq!(choose(&[HYPRLAND[0], ("XDG_SESSION_TYPE", "x11")], &[]), Some(Compositor::X11));
+    }
+
+    #[test]
+    fn hyprland_before_0_40_listens_in_tmp() {
+        assert_eq!(choose(&HYPRLAND[..1], &["/tmp/hypr/abc_123_456/.socket.sock"]), Some(Compositor::Hyprland));
+    }
+
+    #[test]
+    fn a_signature_that_could_leave_its_directory_is_ignored() {
+        let pairs = [("HYPRLAND_INSTANCE_SIGNATURE", "../../sway"), ("XDG_RUNTIME_DIR", "/run/user/1000")];
+        assert_eq!(compositor(|name| lookup(&pairs, name), |_| true), None);
+    }
+
+    #[test]
+    fn a_live_hyprland_wins_over_every_other_sign() {
+        let pairs = [HYPRLAND[0], HYPRLAND[1], ("SWAYSOCK", "/run/sway.sock"), ("XDG_SESSION_TYPE", "x11")];
+        assert_eq!(choose(&pairs, &[HYPRLAND_SOCKET, "/run/sway.sock"]), Some(Compositor::Hyprland));
     }
 
     #[test]
     fn a_live_sway_socket_selects_sway() {
-        assert_eq!(choose(&[("SWAYSOCK", "/run/sway.sock"), ("XDG_SESSION_TYPE", "wayland")], &["/run/sway.sock"]), Compositor::Sway);
+        assert_eq!(choose(&[("SWAYSOCK", "/run/sway.sock"), ("XDG_SESSION_TYPE", "wayland")], &["/run/sway.sock"]), Some(Compositor::Sway));
     }
 
     #[test]
     fn a_stale_sway_socket_is_ignored() {
-        // A socket path a dead compositor left behind doesn't exist any more.
-        assert_eq!(choose(&[("SWAYSOCK", "/run/gone.sock"), ("XDG_SESSION_TYPE", "wayland")], &[]), Compositor::Hyprland);
-        assert_eq!(choose(&[("SWAYSOCK", "/run/gone.sock"), ("XDG_SESSION_TYPE", "x11")], &[]), Compositor::X11);
+        // A socket a dead compositor left behind no longer accepts a connection.
+        assert_eq!(choose(&[("SWAYSOCK", "/run/gone.sock"), ("XDG_SESSION_TYPE", "wayland")], &[]), None);
+        assert_eq!(choose(&[("SWAYSOCK", "/run/gone.sock"), ("XDG_SESSION_TYPE", "x11")], &[]), Some(Compositor::X11));
     }
 
     #[test]
     fn an_x11_session_type_selects_x11() {
-        assert_eq!(choose(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")], &[]), Compositor::X11);
+        assert_eq!(choose(&[("XDG_SESSION_TYPE", "x11"), ("DISPLAY", ":0")], &[]), Some(Compositor::X11));
     }
 
     #[test]
-    fn a_wayland_session_with_xwayland_stays_on_hyprland() {
+    fn gnome_or_kde_on_wayland_is_no_supported_window_system() {
         // Xwayland sets DISPLAY too, so the session type, not the display, decides.
         let pairs = [("XDG_SESSION_TYPE", "wayland"), ("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0")];
-        assert_eq!(choose(&pairs, &[]), Compositor::Hyprland);
+        assert_eq!(choose(&pairs, &[]), None);
     }
 
     #[test]
     fn a_bare_display_without_wayland_is_x11_when_no_session_type_is_set() {
-        assert_eq!(choose(&[("DISPLAY", ":0")], &[]), Compositor::X11);
-        assert_eq!(choose(&[("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0")], &[]), Compositor::Hyprland);
+        assert_eq!(choose(&[("DISPLAY", ":0")], &[]), Some(Compositor::X11));
+        assert_eq!(choose(&[("DISPLAY", ":0"), ("WAYLAND_DISPLAY", "wayland-0")], &[]), None);
     }
 
     #[test]
-    fn the_session_comes_from_systemd_first_then_the_daemon() {
-        // systemd started the daemon before the desktop imported its variables, so only the manager has Sway's socket.
-        let manager = "HOME=/home/me\nSWAYSOCK=/run/sway.sock\nXDG_SESSION_TYPE=wayland\nDISPLAY=\nXAUTHORITY=$'/tmp/odd\\npath'\n";
-        let process = [("XDG_SESSION_TYPE", "tty"), ("DISPLAY", ":0"), ("XAUTHORITY", "/tmp/xauth"), ("HOME", "/root")];
-        let found = session(manager, |name| lookup(&process, name));
-        let expected = [("DISPLAY", ":0"), ("SWAYSOCK", "/run/sway.sock"), ("XAUTHORITY", "/tmp/xauth"), ("XDG_SESSION_TYPE", "wayland")];
-        assert_eq!(found, Session::from_iter(expected.map(|(name, value)| (name, value.to_owned()))));
+    fn a_session_keeps_only_its_window_system_variables() {
+        let environ = "HOME=/home/me\0SWAYSOCK=/run/sway.sock\0DISPLAY=\0XAUTHORITY=$'/tmp/odd\\npath'\0XDG_RUNTIME_DIR=/run/user/1000\0garbage";
+        let expected = owned(&[("SWAYSOCK", "/run/sway.sock"), ("XDG_RUNTIME_DIR", "/run/user/1000")]);
+        assert_eq!(session(environ.split('\0')), expected);
+        // The same parser reads `systemctl --user show-environment`, one variable a line.
+        assert_eq!(session("SWAYSOCK=/run/sway.sock\nXDG_RUNTIME_DIR=/run/user/1000\n".lines()), expected);
     }
 
     #[test]
-    fn without_systemd_the_session_is_the_daemons_own() {
-        assert_eq!(session("", |name| lookup(&[("SWAYSOCK", "/run/sway.sock")], name)).get("SWAYSOCK").map(String::as_str), Some("/run/sway.sock"));
+    fn the_nearest_graphical_process_gives_the_whole_session() {
+        let shell = owned(&[("XDG_RUNTIME_DIR", "/run/user/1000")]);
+        let terminal = owned(&[("SWAYSOCK", "/run/sway.sock"), ("WAYLAND_DISPLAY", "wayland-1")]);
+        let older = owned(&[("HYPRLAND_INSTANCE_SIGNATURE", "abc_123_456"), ("DISPLAY", ":0")]);
+        // Unreadable and non-graphical environments are passed over; the first graphical one is taken as it is.
+        let found = source_session([None, Some(shell), Some(terminal.clone()), Some(older)]);
+        assert_eq!(found, Some(terminal));
+        assert_eq!(source_session([None, Some(Session::new())]), None);
     }
 
     #[test]

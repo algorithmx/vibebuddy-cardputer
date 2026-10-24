@@ -226,6 +226,8 @@ struct App {
     tray_host: bool,
     /// Tells the user if the daemon fails and stays down, once per outage.
     outage: outage::Outage,
+    /// Who supervises the daemon, from the last status that said; kept while the daemon is down, to restart it.
+    supervisor: Option<status::Supervisor>,
     #[cfg(target_os = "linux")]
     tray: Option<TrayHandle>,
     /// VibeBuddy's Omarchy plugin is in the bar, showing the face; the tray icon would be a second one.
@@ -273,6 +275,7 @@ impl App {
             pending_voice: launch_voice(),
             tray_host: true,
             outage: outage::Outage::new(outage::GRACE),
+            supervisor: None,
             #[cfg(target_os = "linux")]
             tray: None,
             #[cfg(target_os = "linux")]
@@ -342,7 +345,9 @@ impl App {
                     .then(|| self.pending_voice.take())
                     .flatten();
                 notify_new_firmware(&status);
-                self.outage.handle(outage::Event::Status { notify_link: status.config.notify_link }, Instant::now());
+                self.supervisor = status.daemon.supervisor.or(self.supervisor);
+                let event = outage::Event::Status { notify_link: status.config.notify_link, supervisor: status.daemon.supervisor };
+                self.outage.handle(event, Instant::now());
                 self.status = Some(*status);
                 return Task::batch([self.refresh_tray(), voice.map_or_else(Task::none, |id| Task::done(Message::UseVoice(id)))]);
             }
@@ -619,7 +624,7 @@ impl App {
                     self.notice = Some(save_screenshot(png));
                 }
             }
-            Message::RestartDaemon => return Task::perform(client::restart_daemon(), Message::Done),
+            Message::RestartDaemon => return Task::perform(client::restart_daemon(self.supervisor), Message::Done),
             Message::CheckFromMenu => {
                 self.tab = Tab::General;
                 return Task::batch([Task::done(Message::OpenSettings), Task::done(Message::CheckForUpdatesNow)]);
@@ -677,7 +682,10 @@ impl App {
                 }
             }
             Message::ShowDaemonLog => {
-                if let Err(error) = show_daemon_log() {
+                if self.supervisor == Some(status::Supervisor::Other) {
+                    // Outside the service, the daemon logs wherever it was started, not to the journal.
+                    self.notice = Some(Err(tr("This daemon doesn't run as the vibebuddyd systemd service, so its log isn't in the journal.", &[])));
+                } else if let Err(error) = show_daemon_log() {
                     self.notice = Some(Err(error));
                 }
             }
@@ -703,8 +711,8 @@ impl App {
         match effect {
             Some(outage::Effect::Wait(after)) => Task::perform(tokio::time::sleep(after), |()| Message::OutageGrace),
             Some(outage::Effect::CheckService) => Task::perform(outage::service(), Message::OutageService),
-            Some(outage::Effect::Notify) => {
-                if let Err(error) = outage::notify() {
+            Some(outage::Effect::Notify(restart)) => {
+                if let Err(error) = outage::notify(restart) {
                     eprintln!("vibebuddy-desktop: {error}");
                 }
                 Task::none()
@@ -1599,9 +1607,14 @@ impl App {
     fn diagnostics_summary(&self) -> String {
         let device = self.status.as_ref().map(|status| &status.device);
         format!(
-            "App {}\ndaemon {}\nfirmware {}\noffered firmware {}\nvoice {}\nOS {}\n",
+            "App {}\ndaemon {}\nsupervisor {}\nfirmware {}\noffered firmware {}\nvoice {}\nOS {}\n",
             env!("CARGO_PKG_VERSION"),
             self.status.as_ref().map_or("not connected", |status| status.daemon.build.as_str()),
+            match self.supervisor {
+                Some(status::Supervisor::Systemd) => "the vibebuddyd systemd service",
+                Some(status::Supervisor::Other) => "not the systemd service",
+                None => "—",
+            },
             device.and_then(|device| device.firmware_label()).as_deref().unwrap_or("—"),
             self.updates().and_then(|updates| updates.firmware.as_ref()).map_or("—", |offer| offer.version.as_str()),
             device.and_then(|device| device.voice.as_deref()).unwrap_or("—"),
