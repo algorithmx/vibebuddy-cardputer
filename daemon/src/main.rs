@@ -730,6 +730,8 @@ fn app(state: AppState) -> Router {
         .route("/v1/voice-keys", axum::routing::put(put_voice_keys))
         .route("/v1/voices", get(get_voices))
         .route("/v1/characters", get(get_characters).post(post_character))
+        .route("/v1/characters/presets/{id}/lines", get(get_preset_lines))
+        .route("/v1/characters/{id}", axum::routing::delete(delete_character))
         .route("/v1/account", axum::routing::delete(delete_account))
         .route("/v1/account/sign-in", post(post_sign_in))
         .route("/v1/account/callback", get(get_account_callback))
@@ -1765,6 +1767,26 @@ async fn get_characters(State(state): State<AppState>) -> Json<Vec<making::MadeC
     Json(state.making.list())
 }
 
+/// Deletes a Character made here: 404 for one not made here, 409 while it is being made.
+async fn delete_character(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> (StatusCode, Json<ApiResponse>) {
+    let (status, message) = match state.making.delete(&id) {
+        Ok(()) => return (StatusCode::OK, Json(ApiResponse { accepted: true, message: format!("deleted {id}") })),
+        Err(making::DeleteError::NotFound) => (StatusCode::NOT_FOUND, format!("{id} is not a Character made here")),
+        Err(making::DeleteError::Busy) => (StatusCode::CONFLICT, format!("{id} is being made")),
+        Err(making::DeleteError::Io(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(ApiResponse { accepted: false, message }))
+}
+
+/// A preset's lines, which a made Character starts from: `[{"occasion", "text"}]`; 404 for anything not a preset.
+async fn get_preset_lines(axum::extract::Path(id): axum::extract::Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match making::preset_lines(&id) {
+        Some(lines) => Json(lines).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(ApiResponse { accepted: false, message: format!("{id} is not a preset Character") })).into_response(),
+    }
+}
+
 /// Starts making a Character's line audio (`making` in the status follows it); 409 while another is being made.
 async fn post_character(State(state): State<AppState>, Json(request): Json<making::Request>) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -2251,6 +2273,47 @@ mod tests {
         let status = serde_json::to_string(&state.snapshot().await).unwrap();
         assert!(status.contains(r#""making":{"id":"owl-"#), "{status}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_made_character_is_deleted_through_the_api_but_not_while_it_is_made() {
+        let dir = voice_keys::tests::scratch("making-delete-main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
+        let body = serde_json::json!({"name": "Owl", "base": "ada", "voice": "ada", "lines": [{"occasion": "done", "text": "Done."}]});
+        let started = post_character(State(state.clone()), Json(serde_json::from_value(body.clone()).unwrap())).await;
+        let bytes = http_body_util::BodyExt::collect(started.into_body()).await.unwrap().to_bytes();
+        let id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"].as_str().unwrap().to_owned();
+        let delete = |id: &str| delete_character(State(state.clone()), axum::extract::Path(id.to_owned()));
+        // No service: the job fails at once, leaving its manifest; wait for that.
+        for _ in 0..200 {
+            if state.making.status().is_some_and(|status| status.state != "making") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dir.join(&id).join("manifest.json").is_file());
+        assert_eq!(delete("..").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete("nobody-00000000").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete(&id).await.0, StatusCode::OK);
+        assert!(!dir.join(&id).exists() && dir.is_dir());
+        assert_eq!(delete(&id).await.0, StatusCode::NOT_FOUND);
+        // One whose job runs (marked, not run) stays.
+        let (running, _) = state.making.begin(&serde_json::from_value(body).unwrap()).unwrap();
+        assert_eq!(delete(&running).await.0, StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_presets_lines_are_served_for_the_app_to_start_from() {
+        let get = |id: &str| get_preset_lines(axum::extract::Path(id.to_owned()));
+        let response = get("wanwanxiaohe").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let lines: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lines.len(), 55);
+        assert!(lines[0]["occasion"].is_string() && lines[0]["text"].is_string(), "{:?}", lines[0]);
+        assert_eq!(get("robot").await.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
