@@ -63,6 +63,9 @@ pub struct DeviceState {
     pub wifi_error: Option<String>,
     /// The Relay this computer uses, `wss://host`; None without a key. Set by the daemon, not the box.
     pub relay_server: Option<String>,
+    /// Why the Relay won't carry this computer's link (ADR-0020): `signed_out`, `plan`, or `unavailable` (it
+    /// couldn't check the plan; tried again later). Set by the daemon from [`crate::relay::RelayConfig::refused`].
+    pub relay_refused: Option<String>,
     /// The Relay the box uses, as it last said (`RELAY URL`); it follows the computer on the cable.
     pub box_relay: Option<String>,
     /// The networks the box heard on its last scan, strongest first, one entry per name.
@@ -348,6 +351,10 @@ pub struct Status {
     pub updates: crate::updates::UpdateStatus,
     /// The person's VibeBuddy account (ADR-0018).
     pub account: crate::account::AccountStatus,
+    /// Which of the user's own keys for spoken replies are set, and refused (ADR-0020); never a key.
+    pub voice_keys: crate::voice_keys::VoiceKeysStatus,
+    /// The Character being made, or the last one made, since the daemon started (ADR-0020).
+    pub making: Option<crate::making::MakingStatus>,
 }
 
 /// What the apps explain for `WIFI FAILED <why>`: `wrong_password` (the network turned the box away, which a
@@ -438,6 +445,7 @@ mod tests {
                 wifi_address: None,
                 wifi_error: None,
                 relay_server: None,
+                relay_refused: None,
                 box_relay: None,
                 wifi_seen: Vec::new(),
                 foreign_firmware: false,

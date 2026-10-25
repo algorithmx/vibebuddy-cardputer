@@ -13,6 +13,7 @@ mod relay;
 mod resident;
 mod resident_claude;
 mod link_alert;
+mod making;
 mod occasions;
 mod persona;
 mod rom_flasher;
@@ -26,6 +27,7 @@ mod transfer;
 mod synthesis;
 mod updates;
 mod voice;
+mod voice_keys;
 mod voice_writer;
 
 use std::convert::Infallible;
@@ -114,6 +116,10 @@ struct AppState {
     written: Arc<Mutex<persona::Written>>,
     /// The person's VibeBuddy account (ADR-0018); unavailable in tests unless one sets it.
     account: Arc<account::Account>,
+    /// The user's own keys for spoken replies (ADR-0020); none can be set in tests unless one sets it.
+    voice_keys: Arc<voice_keys::VoiceKeys>,
+    /// Making a Character's line audio (ADR-0020); nothing can be made in tests unless one sets it.
+    making: Arc<making::Maker>,
 }
 
 impl AppState {
@@ -129,6 +135,8 @@ impl AppState {
             .unwrap_or_default();
         let (device_bus, _) = broadcast::channel(1024);
         let (status_changed, _) = broadcast::channel(64);
+        let account = Arc::new(account::Account::new(None, None, 7331));
+        let voice_keys = Arc::new(voice_keys::VoiceKeys::new(None));
         Self {
             transport,
             activities: Arc::new(Mutex::new(activities)),
@@ -151,7 +159,9 @@ impl AppState {
             voice: Arc::new(voice::Voice::new(None, None)),
             noise_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             written: Arc::default(),
-            account: Arc::new(account::Account::new(None, None, 7331)),
+            making: Arc::new(making::Maker::new(None, None, account.clone(), voice_keys.clone())),
+            account,
+            voice_keys,
         }
     }
 
@@ -164,7 +174,8 @@ impl AppState {
     }
 
     async fn snapshot(&self) -> Status {
-        let device = self.device.lock().await.clone();
+        let mut device = self.device.lock().await.clone();
+        device.relay_refused = self.relay.as_ref().and_then(relay::RelayConfig::refused);
         let updates = self.updates.lock().await.status(&device, self.update_checks_enabled().await);
         Status {
             daemon: DaemonInfo {
@@ -179,6 +190,8 @@ impl AppState {
             config: self.config.lock().await.clone(),
             updates,
             account: self.account.status(),
+            voice_keys: self.voice_keys.status(),
+            making: self.making.status(),
         }
     }
 
@@ -229,6 +242,11 @@ async fn main() {
         }
         None => None,
     };
+    let account = Arc::new(account::Account::new(
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        config::config_dir().as_deref(),
+        bind_address.port(),
+    ));
     let mut serial_config = SerialConfig::from_env(known_box_file());
     let mut relay_config = None;
     // Paired, the box can also be reached over the local network when it isn't on the cable (ADR-0012).
@@ -240,7 +258,7 @@ async fn main() {
             discovery: lan::Discovery::default(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
-        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release());
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release()).with_account(account.clone());
         serial_config = serial_config.with_relay(relay.clone());
         relay_config = Some(relay);
     }
@@ -268,11 +286,7 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
-    state.account = Arc::new(account::Account::new(
-        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
-        config::config_dir().as_deref(),
-        bind_address.port(),
-    ));
+    state.account = account;
     state.state_dir = config::state_dir();
     if let Some(dir) = &state.state_dir {
         state.written = Arc::new(Mutex::new(persona::Written::load(&dir.join(persona::RECORD_FILE))));
@@ -289,7 +303,19 @@ async fn main() {
         })
     });
     let session = Some(state.account.clone());
-    state.voice = Arc::new(voice::Voice::new(speech::from_env(session.clone()), state.resident.clone()).with_synthesizer(synthesis::from_env(session)));
+    state.voice_keys = Arc::new(voice_keys::VoiceKeys::new(config::config_dir().as_deref()));
+    let synthesizer = synthesis::from_env(session.clone(), state.voice_keys.clone());
+    let made = config::config_dir().map(|dir| dir.join("characters"));
+    if let Some(made) = &made {
+        let _ = making::DIR.set(made.clone());
+    }
+    state.making = Arc::new(making::Maker::new(
+        made,
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        state.account.clone(),
+        state.voice_keys.clone(),
+    ));
+    state.voice = Arc::new(voice::Voice::new(speech::from_env(session), state.resident.clone()).with_synthesizer(Some(synthesizer)));
     if let Some(resident) = state.resident.clone() {
         let wearing = wearing(&state).await;
         tokio::spawn(async move { resident.warm(&wearing).await });
@@ -315,6 +341,8 @@ async fn main() {
         follow_resident_readiness(&state, resident);
     }
     follow_account(&state);
+    follow_voice_keys(&state);
+    follow_making(&state);
     // On macOS the app reports a lost link; elsewhere there is no app, so the daemon does it.
     if !cfg!(target_os = "macos") {
         tokio::spawn(link_alert::watch(state.clone()));
@@ -487,6 +515,46 @@ fn follow_account(state: &AppState) {
             offer_voice_again(&follower).await;
         }
     });
+    // Today's usage and refusals are only shown.
+    let mut usage = state.account.watch_usage();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while usage.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
+    // So is why the Relay turned this computer away.
+    if let Some(relay) = &state.relay {
+        let mut refusal = relay.watch_refusal();
+        let follower = state.clone();
+        tokio::spawn(async move {
+            while refusal.changed().await.is_ok() {
+                follower.notify_status();
+            }
+        });
+    }
+}
+
+/// A provider refusing or taking an own key happens on a reply's thread; the status stream hears of it here.
+fn follow_voice_keys(state: &AppState) {
+    let mut changes = state.voice_keys.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
+}
+
+/// A Character being made reports each line on its own thread; the status stream hears of it here.
+fn follow_making(state: &AppState) {
+    let mut changes = state.making.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
 }
 
 /// Checks the resident session's readiness every [`resident::READINESS_TTL`] and tells the box each time it flips.
@@ -650,10 +718,16 @@ fn app(state: AppState) -> Router {
         .route("/v1/resident/history", get(get_resident_history))
         .route("/v1/resident/brain", axum::routing::put(put_resident_brain))
         .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
+        .route("/v1/voice-keys", axum::routing::put(put_voice_keys))
+        .route("/v1/voices", get(get_voices))
+        .route("/v1/characters", get(get_characters).post(post_character))
+        .route("/v1/characters/presets/{id}/lines", get(get_preset_lines))
+        .route("/v1/characters/{id}", axum::routing::delete(delete_character))
         .route("/v1/account", axum::routing::delete(delete_account))
         .route("/v1/account/sign-in", post(post_sign_in))
         .route("/v1/account/callback", get(get_account_callback))
         .route("/v1/account/sign-out", post(post_sign_out))
+        .route("/v1/account/refresh", post(post_account_refresh))
         .with_state(state)
 }
 
@@ -1653,6 +1727,69 @@ async fn set_anthropic_key(state: AppState, key: Option<String>) -> axum::respon
     get_resident(State(state)).await.into_response()
 }
 
+/// Sets or clears the user's own keys for spoken replies (ADR-0020): `{"elevenlabs"?, "volc"?}`, each a key, or null
+/// or "" to clear it; one left out stays. Answers which are set, as in the status; a key is never sent back or logged.
+async fn put_voice_keys(State(state): State<AppState>, Json(request): Json<serde_json::Map<String, serde_json::Value>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let refuse = |message: String| (StatusCode::BAD_REQUEST, Json(ApiResponse { accepted: false, message })).into_response();
+    let mut changes = Vec::new();
+    for (name, value) in request {
+        let Some(provider) = voice_keys::Provider::named(&name) else { return refuse(format!("{name} is not a provider: elevenlabs or volc")) };
+        match value {
+            serde_json::Value::Null => changes.push((provider, None)),
+            serde_json::Value::String(key) => changes.push((provider, Some(key))),
+            _ => return refuse(format!("{name} must be a key, or null to clear it")),
+        }
+    }
+    if let Err(error) = state.voice_keys.set(&changes) {
+        warn!(%error, "failed to save the own keys");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response();
+    }
+    Json(state.voice_keys.status()).into_response()
+}
+
+/// The voices a made Character can speak with: `characters/voices.tsv`.
+async fn get_voices() -> Json<Vec<making::Voice>> {
+    Json(making::voices())
+}
+
+/// The Characters made here, for the App to list beside the presets.
+async fn get_characters(State(state): State<AppState>) -> Json<Vec<making::MadeCharacter>> {
+    Json(state.making.list())
+}
+
+/// Deletes a Character made here: 404 for one not made here, 409 while it is being made.
+async fn delete_character(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> (StatusCode, Json<ApiResponse>) {
+    let (status, message) = match state.making.delete(&id) {
+        Ok(()) => return (StatusCode::OK, Json(ApiResponse { accepted: true, message: format!("deleted {id}") })),
+        Err(making::DeleteError::NotFound) => (StatusCode::NOT_FOUND, format!("{id} is not a Character made here")),
+        Err(making::DeleteError::Busy) => (StatusCode::CONFLICT, format!("{id} is being made")),
+        Err(making::DeleteError::Io(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(ApiResponse { accepted: false, message }))
+}
+
+/// A preset's lines, which a made Character starts from: `[{"occasion", "text"}]`; 404 for anything not a preset.
+async fn get_preset_lines(axum::extract::Path(id): axum::extract::Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match making::preset_lines(&id) {
+        Some(lines) => Json(lines).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(ApiResponse { accepted: false, message: format!("{id} is not a preset Character") })).into_response(),
+    }
+}
+
+/// Starts making a Character's line audio (`making` in the status follows it); 409 while another is being made.
+async fn post_character(State(state): State<AppState>, Json(request): Json<making::Request>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (status, message) = match state.making.start(request) {
+        Ok(making) => return (StatusCode::ACCEPTED, Json(making)).into_response(),
+        Err(making::StartError::Busy) => (StatusCode::CONFLICT, "another Character is being made".to_owned()),
+        Err(making::StartError::Invalid(message)) => (StatusCode::BAD_REQUEST, message),
+        Err(making::StartError::Unavailable(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(ApiResponse { accepted: false, message })).into_response()
+}
+
 #[derive(Serialize)]
 struct SignInResponse {
     url: String,
@@ -1699,6 +1836,15 @@ async fn post_sign_out(State(state): State<AppState>) -> (StatusCode, Json<ApiRe
     state.notify_status();
     match result {
         Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "signed out".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+/// Reads today's voice use and the plan from the service, for the App's Account tab; the status stream carries them.
+async fn post_account_refresh(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    match tokio::task::spawn_blocking(move || account.refresh_usage()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))) {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "refreshed".to_owned() })),
         Err(error) => account_refusal(&error),
     }
 }
@@ -2076,6 +2222,89 @@ mod tests {
         let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!((info["anthropic_key_set"].as_bool(), info["problem"].as_str()), (Some(false), Some("anthropic_key_missing")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn own_keys_are_set_and_cleared_and_never_sent_back() {
+        let dir = voice_keys::tests::scratch("main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.voice_keys = Arc::new(voice_keys::VoiceKeys::new(Some(&dir)));
+        let put = |body: serde_json::Value| put_voice_keys(State(state.clone()), Json(serde_json::from_value(body).unwrap()));
+
+        let response = put(serde_json::json!({"elevenlabs": "sk_eleven_secret", "volc": "volc_secret"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer, serde_json::json!({"elevenlabs": {"set": true, "refused": false}, "volc": {"set": true, "refused": false}}));
+        let status = serde_json::to_string(&state.snapshot().await).unwrap();
+        assert!(status.contains(r#""voice_keys":{"elevenlabs":{"set":true"#), "{status}");
+        assert!(!status.contains("secret") && !String::from_utf8_lossy(&body).contains("secret"));
+
+        let response = put(serde_json::json!({"volc": null})).await;
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((answer["elevenlabs"]["set"].as_bool(), answer["volc"]["set"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(put(serde_json::json!({"openai": "k"})).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put(serde_json::json!({"volc": 1})).await.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn voices_are_listed_and_only_a_character_in_one_of_them_starts() {
+        assert!(get_voices().await.0.iter().any(|voice| voice.id == "wanwanxiaohe" && voice.provider == "volc"));
+        let dir = voice_keys::tests::scratch("making-main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
+        let post = |voice: &str| {
+            let body = serde_json::json!({"name": "Owl", "base": "ada", "voice": voice, "lines": [{"occasion": "done", "text": "Done."}]});
+            post_character(State(state.clone()), Json(serde_json::from_value(body).unwrap()))
+        };
+        assert_eq!(post("elevenlabs:somebody").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(post("ada").await.status(), StatusCode::ACCEPTED);
+        let status = serde_json::to_string(&state.snapshot().await).unwrap();
+        assert!(status.contains(r#""making":{"id":"owl-"#), "{status}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_made_character_is_deleted_through_the_api_but_not_while_it_is_made() {
+        let dir = voice_keys::tests::scratch("making-delete-main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
+        let body = serde_json::json!({"name": "Owl", "base": "ada", "voice": "ada", "lines": [{"occasion": "done", "text": "Done."}]});
+        let started = post_character(State(state.clone()), Json(serde_json::from_value(body.clone()).unwrap())).await;
+        let bytes = http_body_util::BodyExt::collect(started.into_body()).await.unwrap().to_bytes();
+        let id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"].as_str().unwrap().to_owned();
+        let delete = |id: &str| delete_character(State(state.clone()), axum::extract::Path(id.to_owned()));
+        // No service: the job fails at once, leaving its manifest; wait for that.
+        for _ in 0..200 {
+            if state.making.status().is_some_and(|status| status.state != "making") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dir.join(&id).join("manifest.json").is_file());
+        assert_eq!(delete("..").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete("nobody-00000000").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete(&id).await.0, StatusCode::OK);
+        assert!(!dir.join(&id).exists() && dir.is_dir());
+        assert_eq!(delete(&id).await.0, StatusCode::NOT_FOUND);
+        // One whose job runs (marked, not run) stays.
+        let (running, _) = state.making.begin(&serde_json::from_value(body).unwrap()).unwrap();
+        assert_eq!(delete(&running).await.0, StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_presets_lines_are_served_for_the_app_to_start_from() {
+        let get = |id: &str| get_preset_lines(axum::extract::Path(id.to_owned()));
+        let response = get("wanwanxiaohe").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let lines: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lines.len(), 55);
+        assert!(lines[0]["occasion"].is_string() && lines[0]["text"].is_string(), "{:?}", lines[0]);
+        assert_eq!(get("robot").await.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -239,6 +239,78 @@ pub async fn set_anthropic_key(key: Option<String>) -> Result<ResidentInfo, Stri
     resident_setting(request).await
 }
 
+/// A provider of spoken replies the user can give their own key for (ADR-0020).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyProvider {
+    ElevenLabs,
+    Volc,
+}
+
+impl KeyProvider {
+    pub const ALL: [Self; 2] = [Self::ElevenLabs, Self::Volc];
+
+    /// Its name in the daemon's API.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ElevenLabs => "elevenlabs",
+            Self::Volc => "volc",
+        }
+    }
+}
+
+/// Sets the user's own key for a provider of spoken replies (None clears it). The daemon never sends it back; the
+/// status says it is set.
+pub async fn set_voice_key(provider: KeyProvider, key: Option<String>) -> Result<(), String> {
+    let request = reqwest::Client::new().put(format!("{BASE}/v1/voice-keys")).json(&serde_json::json!({provider.as_str(): key}));
+    let response = request.timeout(Duration::from_secs(10)).send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    Err(body["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the daemon answered {status}")))
+}
+
+/// The voices a made Character can speak with.
+pub async fn character_voices() -> Result<Vec<crate::making::Voice>, String> {
+    get_json("/v1/voices").await
+}
+
+/// The Characters made on this computer.
+pub async fn made_characters() -> Result<Vec<crate::making::MadeCharacter>, String> {
+    get_json("/v1/characters").await
+}
+
+/// A preset's lines, which a made Character starts from.
+pub async fn preset_lines(id: &str) -> Result<Vec<crate::making::Line>, String> {
+    get_json(&format!("/v1/characters/presets/{id}/lines")).await
+}
+
+/// Starts making a Character's line audio, or resumes one stopped (`request.id`); `making` in the status follows it.
+pub async fn make_character(request: crate::making::Request) -> Result<crate::making::Making, String> {
+    let response = reqwest::Client::new().post(format!("{BASE}/v1/characters")).json(&request).send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if status.is_success() {
+        return response.json().await.map_err(|error| error.to_string());
+    }
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    Err(body["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the daemon answered {status}")))
+}
+
+/// Deletes a Character made here; the daemon refuses while it is being made.
+pub async fn delete_character(id: String) -> Result<(), String> {
+    accepted(reqwest::Client::new().delete(format!("{BASE}/v1/characters/{id}"))).await
+}
+
+async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
+    let response = reqwest::Client::new().get(format!("{BASE}{path}")).timeout(Duration::from_secs(10)).send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("the daemon answered {status}"));
+    }
+    response.json().await.map_err(|error| error.to_string())
+}
+
 async fn resident_setting(request: reqwest::RequestBuilder) -> Result<ResidentInfo, String> {
     let response = request.timeout(Duration::from_secs(10)).send().await.map_err(|error| error.to_string())?;
     let status = response.status();
@@ -324,6 +396,11 @@ pub async fn sign_in() -> Result<String, String> {
 }
 
 /// Ends this computer's session only.
+/// Has the daemon read today's voice use from the service; it comes back in the status.
+pub async fn refresh_account() -> Result<(), String> {
+    post("/v1/account/refresh", None).await
+}
+
 pub async fn sign_out() -> Result<(), String> {
     post("/v1/account/sign-out", None).await
 }

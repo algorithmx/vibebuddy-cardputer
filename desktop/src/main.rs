@@ -13,6 +13,7 @@ mod custom;
 mod face;
 mod firmware_file;
 mod i18n;
+mod making;
 #[cfg(target_os = "linux")]
 mod instance;
 mod preview;
@@ -23,7 +24,7 @@ mod tray;
 
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{button, checkbox, column, container, image, pick_list, row, scrollable, slider, space, text, text_input, toggler};
+use iced::widget::{button, checkbox, column, container, image, pick_list, progress_bar, row, scrollable, slider, space, text, text_input, toggler};
 use iced::{Element, Font, Length, Subscription, Task, Theme, window};
 
 use i18n::{UiLanguage, tr};
@@ -127,6 +128,33 @@ enum Message {
     UseRobot,
     UseCustom,
     CopyPrompt,
+    /// Making a Character (ADR-0020): open the form in place of the Character tab, or (false) leave it.
+    MakeCharacter(bool),
+    MakeBase(Lender),
+    /// A preset's lines, for the form if it still starts from that preset.
+    MakeLines(&'static str, Result<Vec<making::Line>, String>),
+    MakeName(String),
+    MakeVoice(making::Voice),
+    MakeLine(usize, String),
+    MakeRemoveLine(usize),
+    MakeChooseDrawings,
+    MakeDrawings(Result<Option<Vec<character::Image>>, String>),
+    /// Wear the base's look again rather than the user's.
+    MakeBaseLook,
+    MakeStart,
+    /// The daemon took the job, from the form or a Resume, or didn't.
+    MakeStarted(Result<making::Making, String>),
+    MadeCharacters(Result<Vec<making::MadeCharacter>, String>),
+    MadeFaces(Vec<(String, image::Handle)>),
+    CharacterVoices(Result<Vec<making::Voice>, String>),
+    /// Write a made Character to the box, by id.
+    UseMade(String),
+    /// Make the rest of a made Character whose job stopped, by id.
+    ResumeMade(String),
+    /// Ask to delete a made Character (by id), or (None) don't; deleting waits for a second click.
+    AskDeleteMade(Option<String>),
+    DeleteMade(String),
+    MadeDeleted(Result<(), String>),
     AskFirmwareUpdate(bool),
     FlashFirmware,
     FlashFromFile,
@@ -184,6 +212,12 @@ enum Message {
     DeleteAccount,
     /// Signing out or deleting the account finished; the account itself comes with the next status.
     AccountDone(Result<(), String>),
+    OwnKeyDraft(client::KeyProvider, String),
+    SaveOwnKey(client::KeyProvider),
+    ClearOwnKey(client::KeyProvider),
+    OpenOwnKeyPage(client::KeyProvider),
+    /// The daemon took the key, or didn't; whether it is set comes with the next status.
+    OwnKeySaved(client::KeyProvider, Result<(), String>),
     Done(Result<(), String>),
     Quit,
 }
@@ -225,6 +259,15 @@ struct App {
     custom_problem: Option<String>,
     /// The robot's face for its card.
     robot_face: Option<image::Handle>,
+    /// The Characters made on this computer, each one's face, and the voices one can be made with (ADR-0020); asked
+    /// when the daemon comes up and whenever a job changes state.
+    made: Vec<making::MadeCharacter>,
+    made_faces: Vec<(String, image::Handle)>,
+    character_voices: Vec<making::Voice>,
+    /// The Make a Character form, while it shows in place of the Character tab.
+    make: Option<MakeForm>,
+    /// The made Character waiting for a second click to be deleted, since it can't be undone.
+    confirm_delete_made: Option<String>,
     /// The firmware update waits for a second click, since the box restarts.
     confirm_firmware: bool,
     /// A firmware zip picked with Flash from file…, waiting for the user to confirm.
@@ -265,6 +308,8 @@ struct App {
     signing_in: bool,
     /// Deleting the account waits for a second click, since it can't be undone.
     confirm_delete_account: bool,
+    /// The own keys being typed, by provider; cleared once the daemon has one, and never filled from the daemon.
+    own_key_drafts: [String; 2],
     /// The outcome of the last action, shown at the bottom of the window.
     notice: Option<Result<String, String>>,
     /// The language picked in Settings, and, while it differs from the UI's, the offer to restart.
@@ -280,6 +325,21 @@ struct App {
     /// VibeBuddy's Omarchy plugin is in the bar, showing the face; the tray icon would be a second one.
     #[cfg(target_os = "linux")]
     plugin: bool,
+}
+
+/// Making a Character: the preset it starts from, its lines as edited (occasions stay, each keeps a line), the voice,
+/// and the user's own look, if any.
+struct MakeForm {
+    base: Lender,
+    name: String,
+    voice: Option<making::Voice>,
+    lines: Vec<making::Line>,
+    /// The preset's occasions, in its order.
+    occasions: Vec<String>,
+    /// The user's own look and its face; None wears the base's.
+    look: Option<(Vec<u8>, image::Handle)>,
+    problem: Option<String>,
+    starting: bool,
 }
 
 struct RestartOffer {
@@ -307,6 +367,11 @@ impl App {
             lender: None,
             custom_problem: None,
             robot_face: None,
+            made: Vec::new(),
+            made_faces: Vec::new(),
+            character_voices: Vec::new(),
+            make: None,
+            confirm_delete_made: None,
             confirm_firmware: false,
             file_firmware: None,
             wifi_ssid: String::new(),
@@ -328,6 +393,7 @@ impl App {
             resident_setting_error: None,
             signing_in: false,
             confirm_delete_account: false,
+            own_key_drafts: Default::default(),
             notice: None,
             language: UiLanguage::saved(),
             restart_offer: None,
@@ -421,11 +487,18 @@ impl App {
                 } else {
                     Task::none()
                 };
+                let job = |status: &Status| status.making.as_ref().map(|making| (making.id.clone(), making.state.clone()));
+                let made = if self.status.as_ref().is_none_or(|before| job(before) != job(&status)) {
+                    self.refresh_made()
+                } else {
+                    Task::none()
+                };
                 self.status = Some(*status);
                 return Task::batch([
                     self.refresh_tray(),
                     voice.map_or_else(Task::none, |id| Task::done(Message::UseVoice(id))),
                     resident,
+                    made,
                 ]);
             }
             Message::Daemon(client::Update::Down) => {
@@ -519,6 +592,10 @@ impl App {
                 if tab == Tab::Conversation {
                     self.conversation_seen = None;
                     return Task::done(Message::PollConversation);
+                }
+                // Reading the day's use costs a request to the service, so only when the tab opens; the status brings it.
+                if tab == Tab::Account && self.status.as_ref().is_some_and(|status| status.account.signed_in) {
+                    return Task::perform(client::refresh_account(), |_| Message::AccountDone(Ok(())));
                 }
             }
             Message::Resident(Ok(enabled)) => {
@@ -720,6 +797,11 @@ impl App {
                 if let Some(id) = current.as_deref().and_then(assets::voice_id).filter(|&id| assets::language_of(id) == Some(language)) {
                     return Task::done(Message::UseVoice(id));
                 }
+                if let Some(made) = self.made.iter().find(|made| made.complete && current.as_deref() == Some(made.id.as_str()))
+                    && self.made_language(made) == Some(language)
+                {
+                    return Task::done(Message::UseMade(made.id.clone()));
+                }
                 let lends = self.lender.is_some_and(|lender| assets::language_of(lender.id) == Some(language));
                 if current.as_deref() == Some(CUSTOM) && lends && self.custom_look.is_some() {
                     return Task::done(Message::UseCustom);
@@ -758,6 +840,161 @@ impl App {
                 return Task::perform(write, Message::Done);
             }
             Message::CopyPrompt => return iced::clipboard::write(CUSTOM_PROMPT.to_owned()),
+            Message::MakeCharacter(open) => {
+                self.make = None;
+                let Some(base) = self.voices.first().map(Lender::of).filter(|_| open) else { return Task::none() };
+                self.make = Some(MakeForm {
+                    base,
+                    name: String::new(),
+                    voice: None,
+                    lines: Vec::new(),
+                    occasions: Vec::new(),
+                    look: None,
+                    problem: None,
+                    starting: false,
+                });
+                return Task::batch([Task::done(Message::MakeBase(base)), self.refresh_made()]);
+            }
+            Message::MakeBase(base) => {
+                let Some(form) = &mut self.make else { return Task::none() };
+                (form.base, form.lines, form.occasions, form.voice) = (base, Vec::new(), Vec::new(), None);
+                return Task::perform(client::preset_lines(base.id), move |lines| Message::MakeLines(base.id, lines));
+            }
+            Message::MakeLines(base, lines) => {
+                let Some(form) = self.make.as_mut().filter(|form| form.base.id == base) else { return Task::none() };
+                match lines {
+                    Ok(lines) => {
+                        form.occasions = lines.iter().fold(Vec::new(), |mut seen, line| {
+                            if !seen.contains(&line.occasion) {
+                                seen.push(line.occasion.clone());
+                            }
+                            seen
+                        });
+                        form.lines = lines;
+                        form.problem = None;
+                    }
+                    Err(error) => form.problem = Some(tr("Couldn't read the lines of %@: %@", &[&assets::voice_name(base), &error])),
+                }
+                // The preset's own voice to begin with: voices.tsv has each preset's under its id.
+                form.voice = self.character_voices.iter().find(|voice| voice.id == base).cloned();
+            }
+            Message::MakeName(name) => {
+                if let Some(form) = &mut self.make {
+                    form.name = name;
+                }
+            }
+            Message::MakeVoice(voice) => {
+                if let Some(form) = &mut self.make {
+                    form.voice = Some(voice);
+                }
+            }
+            Message::MakeLine(index, text) => {
+                if let Some(line) = self.make.as_mut().and_then(|form| form.lines.get_mut(index)) {
+                    line.text = text;
+                }
+            }
+            Message::MakeRemoveLine(index) => {
+                if let Some(form) = self.make.as_mut().filter(|form| making::can_remove(index, &form.lines)) {
+                    form.lines.remove(index);
+                }
+            }
+            Message::MakeChooseDrawings => return Task::perform(custom::choose_drawings(), Message::MakeDrawings),
+            Message::MakeDrawings(drawings) => {
+                let Some(form) = &mut self.make else { return Task::none() };
+                match drawings {
+                    Ok(None) => {}
+                    Ok(Some(drawings)) => match character::build_look(&drawings) {
+                        Some(look) => {
+                            let face = character::look_frames(&look).and_then(|frames| frames.first().map(|frame| handle(frame, 1)));
+                            form.look = face.map(|face| (look, face));
+                            form.problem = None;
+                        }
+                        None => form.problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
+                    },
+                    Err(error) => form.problem = Some(error),
+                }
+            }
+            Message::MakeBaseLook => {
+                if let Some(form) = &mut self.make {
+                    form.look = None;
+                }
+            }
+            Message::MakeStart => {
+                let Some(form) = &mut self.make else { return Task::none() };
+                let Some(voice) = &form.voice else { return Task::none() };
+                form.starting = true;
+                let request = making::Request {
+                    id: None,
+                    name: form.name.trim().to_owned(),
+                    base: form.base.id.to_owned(),
+                    voice: voice.id.clone(),
+                    lines: form.lines.clone(),
+                };
+                return Task::perform(client::make_character(request), Message::MakeStarted);
+            }
+            Message::MakeStarted(Ok(started)) => {
+                // The user's look stays with the Character's packs, so it can be written again later.
+                if let Some((look, _)) = self.make.take().and_then(|form| form.look)
+                    && let Some(dir) = making::directory(&started.id)
+                {
+                    custom::write(&dir.join("look.bin"), &look);
+                }
+                return self.refresh_made();
+            }
+            Message::MakeStarted(Err(error)) => match &mut self.make {
+                Some(form) => (form.starting, form.problem) = (false, Some(error)),
+                None => self.notice = Some(Err(error)),
+            },
+            Message::MadeCharacters(Ok(made)) => {
+                let faces = made.clone();
+                self.made = made;
+                return Task::perform(
+                    async move {
+                        let mut found = Vec::new();
+                        for made in faces {
+                            let frame = making::look_of(&made).await.as_deref().and_then(character::look_frames).and_then(|frames| frames.into_iter().next());
+                            if let Some(frame) = frame {
+                                found.push((made.id, handle(&frame, 1)));
+                            }
+                        }
+                        found
+                    },
+                    Message::MadeFaces,
+                );
+            }
+            Message::MadeCharacters(Err(_)) => {}
+            Message::MadeFaces(faces) => self.made_faces = faces,
+            Message::CharacterVoices(Ok(voices)) => {
+                if let Some(form) = self.make.as_mut().filter(|form| form.voice.is_none()) {
+                    form.voice = voices.iter().find(|voice| voice.id == form.base.id).cloned();
+                }
+                self.character_voices = voices;
+            }
+            Message::CharacterVoices(Err(_)) => {}
+            Message::UseMade(id) => {
+                let Some(made) = self.made.iter().find(|made| made.id == id).cloned() else { return Task::none() };
+                let form = self.made_language(&made).and_then(|language| self.characters.address(language)).map(str::to_owned);
+                let write = async move {
+                    let pack = making::pack_of(&made, form.as_deref()).await?;
+                    client::write_voice_pack(pack, None, form.as_deref()).await
+                };
+                return Task::perform(write, Message::Done);
+            }
+            Message::AskDeleteMade(id) => self.confirm_delete_made = id,
+            Message::DeleteMade(id) => {
+                self.confirm_delete_made = None;
+                return Task::perform(client::delete_character(id), Message::MadeDeleted);
+            }
+            Message::MadeDeleted(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(Err(error));
+                }
+                return self.refresh_made();
+            }
+            Message::ResumeMade(id) => match making::manifest(&id) {
+                Ok(request) => return Task::perform(client::make_character(request), Message::MakeStarted),
+                Err(error) => self.notice = Some(Err(error)),
+            },
             Message::AskFirmwareUpdate(asking) => self.confirm_firmware = asking,
             Message::FlashFirmware => {
                 self.confirm_firmware = false;
@@ -890,6 +1127,29 @@ impl App {
                     self.notice = Some(Err(error));
                 }
             }
+            Message::OwnKeyDraft(provider, draft) => self.own_key_drafts[provider as usize] = draft,
+            Message::SaveOwnKey(provider) => {
+                let key = self.own_key_drafts[provider as usize].trim().to_owned();
+                if !key.is_empty() {
+                    return Task::perform(client::set_voice_key(provider, Some(key)), move |result| Message::OwnKeySaved(provider, result));
+                }
+            }
+            Message::ClearOwnKey(provider) => {
+                return Task::perform(client::set_voice_key(provider, None), move |result| Message::OwnKeySaved(provider, result));
+            }
+            Message::OpenOwnKeyPage(provider) => {
+                let page = match provider {
+                    client::KeyProvider::ElevenLabs => ELEVENLABS_KEYS,
+                    client::KeyProvider::Volc => VOLC_CONSOLE,
+                };
+                if let Err(error) = launch("xdg-open", &[std::ffi::OsStr::new(page)]) {
+                    self.notice = Some(Err(error));
+                }
+            }
+            Message::OwnKeySaved(provider, result) => match result {
+                Ok(()) => self.own_key_drafts[provider as usize].clear(),
+                Err(error) => self.notice = Some(Err(tr("Couldn't save your own key: %@", &[&error]))),
+            },
             Message::Done(result) => {
                 // The box answers a volume change through the status stream; drop the dragged value then.
                 self.volume = None;
@@ -903,6 +1163,26 @@ impl App {
     }
 
     /// Pushes the menu and the face's color to the tray; a no-op until the tray is up.
+    /// Asks for the Characters made here, and the voices once.
+    fn refresh_made(&self) -> Task<Message> {
+        let voices = if self.character_voices.is_empty() {
+            Task::perform(client::character_voices(), Message::CharacterVoices)
+        } else {
+            Task::none()
+        };
+        Task::batch([Task::perform(client::made_characters(), Message::MadeCharacters), voices])
+    }
+
+    /// The language a made Character speaks: its voice's, else its base preset's.
+    fn made_language(&self, made: &making::MadeCharacter) -> Option<assets::Language> {
+        let voice = self.character_voices.iter().find(|voice| voice.id == made.voice);
+        match voice.map(|voice| voice.language.as_str()) {
+            Some("zh") => Some(assets::Language::Chinese),
+            Some("en") => Some(assets::Language::English),
+            _ => assets::language_of(&made.base),
+        }
+    }
+
     fn refresh_tray(&self) -> Task<Message> {
         #[cfg(target_os = "linux")]
         if let Some(TrayHandle(handle)) = self.tray.clone() {
@@ -1158,6 +1438,9 @@ impl App {
     }
 
     fn sound(&self) -> Element<'_, Message> {
+        if let Some(form) = &self.make {
+            return self.make_form(form);
+        }
         let box_volume = self.status.as_ref().and_then(|status| status.device.volume);
         let level = self.volume.or(box_volume).unwrap_or(60);
         let online = self.status.as_ref().is_some_and(|status| status.device.connected);
@@ -1264,6 +1547,55 @@ impl App {
             .spacing(8)
         }))
         .spacing(8);
+        let job = self.status.as_ref().and_then(|status| status.making.as_ref());
+        let job_running = job.is_some_and(making::Making::running);
+        let made_cards = self.made.iter().map(|made| {
+            let in_use = current.as_deref() == Some(made.id.as_str());
+            let action: Element<'_, Message> = if in_use {
+                text(tr("In use", &[])).style(text::success).into()
+            } else if made.complete {
+                button(text(tr("Use", &[]))).on_press_maybe((online && !busy).then_some(Message::UseMade(made.id.clone()))).into()
+            } else if job.is_some_and(|job| job.running() && job.id == made.id) {
+                text(tr("Making…", &[])).size(13).into()
+            } else {
+                button(text(tr("Resume", &[]))).on_press_maybe((!job_running).then_some(Message::ResumeMade(made.id.clone()))).into()
+            };
+            let base = assets::voice_name(&made.base);
+            let voice = self.character_voices.iter().find(|voice| voice.id == made.voice).map_or_else(|| made.voice.clone(), |voice| voice.name.clone());
+            let detail = if made.complete {
+                tr("Made from %@ · voice: %@", &[&base, &voice])
+            } else {
+                tr("Not finished · made from %@ · voice: %@", &[&base, &voice])
+            };
+            let face = self.made_faces.iter().find(|(id, _)| *id == made.id).map(|(_, face)| image(face.clone()));
+            let deletable = !in_use && !job.is_some_and(|job| job.running() && job.id == made.id);
+            let delete: Element<'_, Message> = if self.confirm_delete_made.as_deref() == Some(made.id.as_str()) {
+                row![
+                    text(tr("Delete “%@”? This can't be undone.", &[&made.name])).size(13),
+                    button(text(tr("Delete", &[]))).style(button::danger).on_press(Message::DeleteMade(made.id.clone())),
+                    button(text(tr("Cancel", &[]))).style(button::secondary).on_press(Message::AskDeleteMade(None)),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                button(text(tr("Delete…", &[]))).style(button::secondary).on_press_maybe(deletable.then(|| Message::AskDeleteMade(Some(made.id.clone())))).into()
+            };
+            let hint = in_use.then(|| text(tr("It's on the box: put another character on the box to delete this one.", &[])).size(13));
+            let card = row![]
+                .push(face)
+                .push(column![text(made.name.clone()), text(detail).size(13)].push(hint))
+                .push(space::horizontal())
+                .push(delete)
+                .push(action)
+                .spacing(12)
+                .align_y(iced::Alignment::Center);
+            character_card(card.into(), in_use)
+        });
+        let make_button = button(text(tr("Make a Character…", &[])))
+            .style(button::secondary)
+            .on_press_maybe((self.status.is_some() && !job_running).then_some(Message::MakeCharacter(true)));
+        let job_row = job.and_then(|job| self.making_row(job, online && !busy));
         let progress = operation.filter(|operation| operation.kind == status::OperationKind::VoicePack).map(|operation| {
             let failed = operation.state == status::OperationState::Failed;
             column![text(operation.summary()).size(13)].push(failed.then(|| {
@@ -1288,8 +1620,104 @@ impl App {
             character_card(robot_card.into(), robot_in_use),
             column(cards).spacing(10),
             character_card(custom_card.into(), custom_in_use),
+            column(made_cards).spacing(10),
+            make_button,
         ]
+        .push(job_row)
         .push(progress)
+        .spacing(12);
+        scrollable(page).into()
+    }
+
+    /// The Character being made, or the last one: its progress, why it stopped, or that it is ready for the box.
+    fn making_row(&self, job: &making::Making, can_write: bool) -> Option<Element<'_, Message>> {
+        let made = self.made.iter().find(|made| made.id == job.id);
+        if job.running() {
+            let label = tr("Making “%@”… %lld of %lld", &[&job.name, &job.done, &job.total]);
+            return Some(row![progress_bar(0.0..=1.0, job.progress()).length(200), text(label).size(13)].spacing(12).align_y(iced::Alignment::Center).into());
+        }
+        let provider = made
+            .and_then(|made| self.character_voices.iter().find(|voice| voice.id == made.voice))
+            .map_or_else(|| tr("the voice's provider", &[]), making::Voice::provider_name);
+        if let Some(why) = job.explanation(&provider) {
+            let resume = made.map(|made| button(text(tr("Resume", &[]))).on_press(Message::ResumeMade(made.id.clone())));
+            return Some(row![text(why).size(13).style(text::danger).width(Length::Fill)].push(resume).spacing(12).align_y(iced::Alignment::Center).into());
+        }
+        let current = self.status.as_ref().and_then(|status| status.device.voice.as_deref());
+        let made = made.filter(|made| made.complete && current != Some(made.id.as_str()))?;
+        Some(
+            row![
+                text(tr("“%@” is made.", &[&made.name])).size(13).style(text::success),
+                space::horizontal(),
+                button(text(tr("Write to box", &[]))).on_press_maybe(can_write.then_some(Message::UseMade(made.id.clone()))),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center)
+            .into(),
+        )
+    }
+
+    /// Making a Character, in place of the Character tab: start from a preset, change its lines (occasions stay, each
+    /// keeps a line), pick a voice and, optionally, bring a look; the daemon then makes the line audio.
+    fn make_form<'a>(&'a self, form: &'a MakeForm) -> Element<'a, Message> {
+        let bases: Vec<Lender> = self.voices.iter().map(Lender::of).collect();
+        let voices = making::sorted(&self.character_voices, assets::language_of(form.base.id).map(assets::Language::code));
+        let keys = self.status.as_ref().and_then(|status| status.voice_keys.as_ref());
+        let account = self.status.as_ref().map(|status| status.account.clone()).unwrap_or_default();
+        let readiness = form.voice.as_ref().map(|voice| (making::Readiness::of(voice, keys, &account), voice.provider_name()));
+        let job_running = self.status.as_ref().and_then(|status| status.making.as_ref()).is_some_and(making::Making::running);
+        let problem = form.problem.clone().or_else(|| if form.lines.is_empty() { None } else { making::problem(&form.name, &form.lines, &form.occasions) });
+        let can_make = !form.starting && !form.lines.is_empty() && problem.is_none() && readiness.as_ref().is_some_and(|(ready, _)| ready.can_start()) && !job_running;
+        let base_face = self.voices.iter().position(|voice| voice.id == form.base.id).and_then(|index| self.faces.get(index).cloned().flatten());
+        let face = form.look.as_ref().map(|(_, face)| face.clone()).or(base_face);
+        let readiness = readiness.map(|(ready, provider)| {
+            let note = text(ready.explanation(&provider)).size(13);
+            if ready.can_start() { note.style(text::secondary) } else { note.style(text::danger) }
+        });
+        let mut lines = column![].spacing(6);
+        for occasion in &form.occasions {
+            lines = lines.push(text(making::occasion_name(occasion)).size(14));
+            for (index, line) in form.lines.iter().enumerate().filter(|(_, line)| &line.occasion == occasion) {
+                lines = lines.push(
+                    row![
+                        text_input("", &line.text).on_input(move |text| Message::MakeLine(index, text)),
+                        button(text("−")).style(button::secondary).on_press_maybe(making::can_remove(index, &form.lines).then_some(Message::MakeRemoveLine(index))),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+        }
+        let look = row![text(tr("Look", &[]))]
+            .push(face.map(image))
+            .push(button(text(tr("Choose images…", &[]))).style(button::secondary).on_press(Message::MakeChooseDrawings))
+            .push(form.look.is_some().then(|| {
+                button(text(tr("Use %@'s look", &[&assets::voice_name(form.base.id)]))).style(button::secondary).on_press(Message::MakeBaseLook)
+            }))
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        let page = column![
+            text(tr("Make a Character", &[])).size(18),
+            text(tr("Start from a character, change what it says, and pick a voice. VibeBuddy makes each line in that voice, then you can write it to the box.", &[])).size(13),
+            row![text(tr("Start from", &[])), pick_list(bases, Some(form.base), Message::MakeBase)].spacing(8).align_y(iced::Alignment::Center),
+            row![text(tr("Name", &[])), text_input(&tr("Name", &[]), &form.name).on_input(Message::MakeName).width(320)]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            row![text(tr("Voice", &[])), pick_list(voices, form.voice.clone(), Message::MakeVoice)].spacing(8).align_y(iced::Alignment::Center),
+        ]
+        .push(readiness)
+        .push(look)
+        .push(lines)
+        .push(text(tr("{address} is where the buddy says what it calls you; each line with it is made once with each form of address.", &[])).size(13))
+        .push(problem.map(|problem| text(problem).size(13).style(text::danger)))
+        .push(
+            row![
+                space::horizontal(),
+                button(text(tr("Cancel", &[]))).style(button::secondary).on_press(Message::MakeCharacter(false)),
+                button(text(tr("Make", &[]))).on_press_maybe(can_make.then_some(Message::MakeStart)),
+            ]
+            .spacing(8),
+        )
         .spacing(12);
         scrollable(page).into()
     }
@@ -1604,8 +2032,10 @@ impl App {
                 .spacing(12)
             }
         });
+        let refusal = device.filter(|_| !online).and_then(status::Device::relay_refusal).map(|refusal| text(refusal).size(13));
         column![row![text(tr("Link", &[])).width(140), text(link)].spacing(12)]
             .push(busy_row)
+            .push(refusal)
             .push(pin)
             .push(choice)
             .push(not_found)
@@ -1902,8 +2332,57 @@ impl App {
         setting.into()
     }
 
-    /// The VibeBuddy account (ADR-0018): the daemon keeps the session; this only opens the browser to sign in.
+    /// The Account tab: the VibeBuddy account, then the user's own keys, as on the Mac.
     fn account(&self) -> Element<'_, Message> {
+        let keys = self.status.as_ref().and_then(|status| status.voice_keys.as_ref()).map(|keys| self.own_keys(keys));
+        column![self.vibebuddy_account()].push(keys).spacing(24).into()
+    }
+
+    /// The user's own keys for spoken replies (ADR-0020). Each is typed once and never shown again: the daemon only
+    /// says whether it has one.
+    fn own_keys(&self, keys: &status::VoiceKeys) -> Element<'_, Message> {
+        let mut section = column![
+            text(tr("Your own keys", &[])).size(16),
+            text(tr("With your own key, spoken replies in that provider's voices go straight to it, billed to your account there, and never through VibeBuddy.", &[])).size(12).style(text::secondary),
+        ]
+        .spacing(8);
+        for provider in client::KeyProvider::ALL {
+            let (name, key, refused) = match provider {
+                client::KeyProvider::ElevenLabs => ("ElevenLabs".to_owned(), &keys.elevenlabs, tr("ElevenLabs refused your own key. Replies in its voices stay silent until you set another one.", &[])),
+                client::KeyProvider::Volc => (tr("Volcano Engine", &[]), &keys.volc, tr("Volcano Engine refused your own key. Replies in its voices stay silent until you set another one.", &[])),
+            };
+            let entry = if key.set {
+                row![
+                    text(tr("Set", &[])).style(text::secondary),
+                    button(text(tr("Clear", &[]))).style(button::secondary).on_press(Message::ClearOwnKey(provider)),
+                ]
+            } else {
+                let draft = &self.own_key_drafts[provider as usize];
+                row![
+                    text_input(&tr("Your own key", &[]), draft)
+                        .secure(true)
+                        .on_input(move |draft| Message::OwnKeyDraft(provider, draft))
+                        .on_submit(Message::SaveOwnKey(provider))
+                        .width(260),
+                    button(text(tr("Save", &[]))).on_press_maybe((!draft.trim().is_empty()).then_some(Message::SaveOwnKey(provider))),
+                ]
+            };
+            section = section.push(
+                row![text(name).width(140)]
+                    .push(entry.spacing(8).align_y(iced::Alignment::Center))
+                    .push(button(text(tr("Get a key", &[]))).style(button::text).on_press(Message::OpenOwnKeyPage(provider)))
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+            );
+            if key.refused {
+                section = section.push(text(refused).size(12).style(text::danger));
+            }
+        }
+        section.into()
+    }
+
+    /// The VibeBuddy account (ADR-0018): the daemon keeps the session; this only opens the browser to sign in.
+    fn vibebuddy_account(&self) -> Element<'_, Message> {
         let Some(status) = &self.status else {
             return text(tr("The daemon isn't running. Restart it on the Advanced tab.", &[])).size(13).into();
         };
@@ -1942,7 +2421,18 @@ impl App {
             .spacing(8)
             .into()
         };
-        column![text(who), actions].spacing(12).into()
+        let today = match (account.refused.as_deref(), &account.today) {
+            (Some("global_cap"), _) => Some(text(tr("Voice is paused for everyone today. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
+            (Some(_), _) => Some(text(tr("Today's voice is used up. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
+            (None, Some(usage)) => Some(text(tr("Voice today: %lld of %lld", &[&usage.commands, &usage.commands_limit])).size(13).style(text::secondary)),
+            (None, None) => None,
+        };
+        let plan = account.plan.as_ref().map(|plan| {
+            let name = if plan.paid() { tr("Paid plan", &[]) } else { tr("Free", &[]) };
+            row![text(tr("Plan", &[])).width(140), text(name)].spacing(12)
+        });
+        let month = account.plan.as_ref().and_then(|plan| plan.month_line()).map(|line| text(line).size(13).style(text::secondary));
+        column![text(who)].push(plan).push(month).push(today).push(actions).spacing(12).into()
     }
 
     fn advanced(&self) -> Element<'_, Message> {
@@ -2049,6 +2539,10 @@ const CODEX_INSTALL_PAGE: &str = "https://learn.chatgpt.com/docs/codex/cli";
 const CLAUDE_INSTALL_PAGE: &str = "https://code.claude.com/docs/en/setup";
 /// The Claude Console, where the user makes the Anthropic API key Claude Code answers voice commands with.
 const ANTHROPIC_CONSOLE: &str = "https://platform.claude.com/";
+/// Where the user makes their own key for spoken replies in ElevenLabs' voices.
+const ELEVENLABS_KEYS: &str = "https://elevenlabs.io/app/settings/api-keys";
+/// Volcano Engine's speech console, where the user makes their own key for the Doubao voices.
+const VOLC_CONSOLE: &str = "https://console.volcengine.com/speech/";
 const NEW_ISSUE: &str = "https://github.com/second-state/vibebuddy/issues/new";
 
 /// The id under which the box wears the user's own Character.

@@ -144,6 +144,9 @@ struct DaemonClient {
 
     func signOut() async throws { try await accountCall("/v1/account/sign-out", method: "POST") }
 
+    /// Has the daemon read today's voice use from the service; it comes back in the status.
+    func refreshAccount() async throws { try await accountCall("/v1/account/refresh", method: "POST") }
+
     /// Deletes the account on the service; when the service doesn't, the daemon stays signed in.
     func deleteAccount() async throws { try await accountCall("/v1/account", method: "DELETE") }
 
@@ -154,6 +157,54 @@ struct DaemonClient {
         let (data, response) = try await URLSession.shared.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+    }
+
+    /// Sets the user's own key for a provider of spoken replies, `elevenlabs` or `volc` (nil clears it). The daemon
+    /// never sends it back; the status says it is set.
+    func setVoiceKey(_ provider: String, _ key: String?) async throws {
+        let body = try JSONSerialization.data(withJSONObject: [provider: key.map { $0 as Any } ?? NSNull()])
+        var request = request("/v1/voice-keys", method: "PUT", body: body, contentType: "application/json")
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+    }
+
+    /// The voices a made Character can speak with.
+    func characterVoices() async throws -> [CharacterVoice] {
+        try await get("/v1/voices")
+    }
+
+    /// The Characters made on this computer.
+    func madeCharacters() async throws -> [MadeCharacter] {
+        try await get("/v1/characters")
+    }
+
+    /// A preset's lines, which a made Character starts from.
+    func presetLines(_ id: String) async throws -> [CharacterLine] {
+        try await get("/v1/characters/presets/\(id)/lines")
+    }
+
+    /// Starts making a Character's line audio, or resumes one stopped (`request.id`); `making` in the status follows it.
+    func makeCharacter(_ request: CharacterRequest) async throws -> MakingStatus {
+        let body = try JSONEncoder().encode(request)
+        let (code, data) = try await post("/v1/characters", body: body, contentType: "application/json")
+        guard code == 202 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+        return try StatusCoding.decoder().decode(MakingStatus.self, from: data)
+    }
+
+    /// Deletes a Character made here; the daemon refuses while it is being made.
+    func deleteCharacter(_ id: String) async throws {
+        let (data, response) = try await URLSession.shared.data(for: request("/v1/characters/\(id)", method: "DELETE"))
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+    }
+
+    private func get<T: Decodable>(_ path: String) async throws -> T {
+        let (data, response) = try await URLSession.shared.data(for: request(path))
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+        return try StatusCoding.decoder().decode(T.self, from: data)
     }
 
     func resident() async throws -> ResidentInfo {
