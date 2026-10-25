@@ -397,6 +397,8 @@
 "Look" = "形象";
 "Use %@'s look" = "用%@的形象";
 "Remove this line" = "删掉这句";
+"Hear this voice" = "试听这个声音";
+"Stop" = "停止";
 "{address} is where the buddy says what it calls you; each line with it is made once with each form of address." = "{address} 是说出对你的称呼的位置；带它的台词会按每种称呼各做一遍。";
 "Make" = "创建";
 "Couldn't read the lines of %@: %@" = "读不到%@的台词：%@";

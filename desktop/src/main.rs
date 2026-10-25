@@ -24,7 +24,7 @@ mod tray;
 
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{button, checkbox, column, container, image, pick_list, progress_bar, row, scrollable, slider, space, text, text_input, toggler};
+use iced::widget::{button, checkbox, column, container, image, pick_list, progress_bar, radio, row, scrollable, slider, space, text, text_input, toggler};
 use iced::{Element, Font, Length, Subscription, Task, Theme, window};
 
 use i18n::{UiLanguage, tr};
@@ -842,6 +842,7 @@ impl App {
             Message::CopyPrompt => return iced::clipboard::write(CUSTOM_PROMPT.to_owned()),
             Message::MakeCharacter(open) => {
                 self.make = None;
+                self.stop_preview();
                 let Some(base) = self.voices.first().map(Lender::of).filter(|_| open) else { return Task::none() };
                 self.make = Some(MakeForm {
                     base,
@@ -933,6 +934,7 @@ impl App {
                 return Task::perform(client::make_character(request), Message::MakeStarted);
             }
             Message::MakeStarted(Ok(started)) => {
+                self.stop_preview();
                 // The user's look stays with the Character's packs, so it can be written again later.
                 if let Some((look, _)) = self.make.take().and_then(|form| form.look)
                     && let Some(dir) = making::directory(&started.id)
@@ -1171,6 +1173,13 @@ impl App {
             Task::none()
         };
         Task::batch([Task::perform(client::made_characters(), Message::MadeCharacters), voices])
+    }
+
+    /// Stops a preview playing here, as the form whose voices it was played from closes.
+    fn stop_preview(&mut self) {
+        if let Some((_, stop)) = self.previewing.take() {
+            stop.notify_one();
+        }
     }
 
     /// The language a made Character speaks: its voice's, else its base preset's.
@@ -1674,6 +1683,17 @@ impl App {
             let note = text(ready.explanation(&provider)).size(13);
             if ready.can_start() { note.style(text::secondary) } else { note.style(text::danger) }
         });
+        // Rows rather than a list that drops down, so each voice has ▶: the preview of the preset it comes from, when
+        // this App has it.
+        let busy = self.status.as_ref().and_then(|status| status.operation.as_ref()).is_some_and(status::Operation::running);
+        let selected = voices.iter().position(|voice| Some(voice) == form.voice.as_ref());
+        let mut voice_rows = column![].spacing(4);
+        for (index, voice) in voices.into_iter().enumerate() {
+            let preview = making::preview_of(&voice.id);
+            let preview = if preview == ROBOT { Some(ROBOT) } else { self.voices.iter().find(|shipped| shipped.id == preview).map(|shipped| shipped.id) };
+            let choice = radio(voice.to_string(), index, selected, move |_| Message::MakeVoice(voice));
+            voice_rows = voice_rows.push(row![].push(preview.map(|id| self.preview_button(id, busy))).push(choice).spacing(8).align_y(iced::Alignment::Center));
+        }
         let mut lines = column![].spacing(6);
         for occasion in &form.occasions {
             lines = lines.push(text(making::occasion_name(occasion)).size(14));
@@ -1703,7 +1723,7 @@ impl App {
             row![text(tr("Name", &[])), text_input(&tr("Name", &[]), &form.name).on_input(Message::MakeName).width(320)]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
-            row![text(tr("Voice", &[])), pick_list(voices, form.voice.clone(), Message::MakeVoice)].spacing(8).align_y(iced::Alignment::Center),
+            row![text(tr("Voice", &[])), voice_rows].spacing(8),
         ]
         .push(readiness)
         .push(look)

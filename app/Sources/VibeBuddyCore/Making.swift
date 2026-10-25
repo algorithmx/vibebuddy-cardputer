@@ -18,6 +18,10 @@ public struct CharacterVoice: Codable, Equatable, Identifiable, Sendable {
 
     public var voiceLanguage: VoiceLanguage? { VoiceLanguage(rawValue: language) }
 
+    /// The Character whose preview is said in this voice: voices.tsv lists each preset's voice under the preset's id,
+    /// and Jessica's is the robot's, the built-in lines.
+    public var previewID: String { id == "jessica" ? "robot" : id }
+
     /// The provider as the UI names it.
     public var providerName: String {
         provider == "volc" ? String(localized: "Volcano Engine") : "ElevenLabs"
