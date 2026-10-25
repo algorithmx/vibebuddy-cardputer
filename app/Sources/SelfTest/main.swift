@@ -96,6 +96,11 @@ do {
     {"available":true,"signed_in":true,"email":null,"github_id":583231,"github_login":"octocat"}
     """.utf8))
     check(account == AccountStatus(available: true, signedIn: true, githubID: 583231, githubLogin: "octocat"), "account decodes")
+    check(status.voiceKeys == nil, "an older daemon: no own keys")
+    let keys = try StatusCoding.decoder().decode(VoiceKeysStatus.self, from: Data("""
+    {"elevenlabs":{"set":true,"refused":true},"volc":{"set":false,"refused":false}}
+    """.utf8))
+    check(keys == VoiceKeysStatus(elevenlabs: .init(set: true, refused: true), volc: .init(set: false)), "own keys decode")
     let used = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
     {"available":true,"signed_in":true,"github_id":1,"today":{"day":"2026-10-24","commands":7,"commands_limit":100},"refused":"allowance"}
     """.utf8))
