@@ -175,14 +175,6 @@ struct DaemonClient {
         try await get("/v1/voices")
     }
 
-    /// One line in a voice, a WAV file to hear before picking it.
-    func voiceSample(_ id: String) async throws -> Data {
-        let (data, response) = try await URLSession.shared.data(for: request("/v1/voices/\(id)/sample"))
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
-        return data
-    }
-
     /// The Characters made on this computer.
     func madeCharacters() async throws -> [MadeCharacter] {
         try await get("/v1/characters")

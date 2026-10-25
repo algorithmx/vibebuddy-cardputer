@@ -94,40 +94,6 @@ pub fn preset_lines(id: &str) -> Option<Vec<Line>> {
     )
 }
 
-/// Each preset's pack (`characters/<id>/pack.bin`), to hear its voice before picking it.
-const PRESET_PACKS: &[(&str, &[u8])] = &[
-    ("ada", include_bytes!("../../characters/ada/pack.bin")),
-    ("dave", include_bytes!("../../characters/dave/pack.bin")),
-    ("hank", include_bytes!("../../characters/hank/pack.bin")),
-    ("kai", include_bytes!("../../characters/kai/pack.bin")),
-    ("luna", include_bytes!("../../characters/luna/pack.bin")),
-    ("mei", include_bytes!("../../characters/mei/pack.bin")),
-    ("wanwanxiaohe", include_bytes!("../../characters/wanwanxiaohe/pack.bin")),
-];
-/// Jessica speaks no preset: the robot says the firmware's built-in lines (`voices/jessica`), 24 kHz stereo PCM.
-const JESSICA_DONE: &[u8] = include_bytes!("../../voices/jessica/done.pcm");
-
-/// One line in voice `id` as a WAV file, to hear it before picking it: the first `done` line without `{address}` of
-/// the preset the voice comes from (voices.tsv has each preset's voice under its id), 16 kHz mono as its pack holds
-/// it; for Jessica, the built-in `done` line, 24 kHz stereo. None for anything not in voices.tsv.
-pub fn voice_sample(id: &str) -> Option<Vec<u8>> {
-    use vibebuddy_firmware_core::adpcm::Decoder;
-    use vibebuddy_firmware_core::character_pack;
-    if id == "jessica" {
-        return Some(crate::voice::wav_at(&pcm(JESSICA_DONE), 24_000, 2));
-    }
-    let (_, pack) = PRESET_PACKS.iter().find(|(preset, _)| *preset == id)?;
-    let parsed = character_pack::parse(pack, pack.len())?;
-    // make-character.sh names the lines with {address} 0-<row> and the others 1-<hash>, so they come first in a pool.
-    let with_address = preset_lines(id)?.iter().filter(|line| line.occasion == "done" && line.text.contains("{address}")).count();
-    let line = parsed.pool(Occasion::Done).get(with_address)?;
-    let bytes = pack.get(line.offset as usize..(line.offset + line.bytes()) as usize)?;
-    let mut decoder = Decoder::default();
-    let samples: Vec<i16> =
-        bytes.iter().flat_map(|byte| [byte & 15, byte >> 4]).take(line.samples as usize).map(|nibble| decoder.decode(nibble)).collect();
-    Some(crate::voice::wav_at(&samples, SAMPLE_RATE, 1))
-}
-
 /// A TSV's rows, without blank ones and `#` comments.
 fn rows(tsv: &str) -> impl Iterator<Item = Vec<&str>> {
     tsv.lines().filter(|line| !line.trim().is_empty() && !line.starts_with('#')).map(|line| line.split('\t').collect())
@@ -1041,31 +1007,5 @@ mod tests {
         assert!(new_id("小何").unwrap().starts_with("character-"));
         assert_eq!(new_id("A very long name for a Character indeed").unwrap().len(), 31);
         let _ = std::fs::remove_dir_all(scratch);
-    }
-
-    #[test]
-    fn every_voice_has_a_sample_to_hear_and_nothing_else_does() {
-        for voice in voices() {
-            let wav = voice_sample(&voice.id).unwrap_or_else(|| panic!("{} has no sample", voice.id));
-            let u16_at = |at: usize| u16::from_le_bytes([wav[at], wav[at + 1]]);
-            let u32_at = |at: usize| u32::from_le_bytes(wav[at..at + 4].try_into().unwrap());
-            assert_eq!((&wav[..4], &wav[8..16], &wav[36..40]), (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..]), "{}", voice.id);
-            assert_eq!((u32_at(4) as usize, u32_at(40) as usize), (wav.len() - 8, wav.len() - 44), "{}", voice.id);
-            // Jessica's is the firmware's built-in line; every other comes out of its preset's pack.
-            let format = if voice.id == "jessica" { (24_000, 2) } else { (16_000, 1) };
-            assert_eq!((u16_at(20), u32_at(24), u16_at(22), u16_at(34)), (1, format.0, format.1, 16), "{}", voice.id);
-            let seconds = (wav.len() - 44) as f64 / f64::from(format.0 * 2 * u32::from(format.1));
-            assert!((0.5..4.0).contains(&seconds), "{}: {seconds} s", voice.id);
-            let samples: Vec<i16> = wav[44..].as_chunks::<2>().0.iter().map(|pair| i16::from_le_bytes(*pair)).collect();
-            assert!(samples.iter().any(|sample| sample.unsigned_abs() > 16_000), "{}: not silence", voice.id);
-        }
-        // The line picked is found by counting lines.tsv's, so each pack must hold the lines lines.tsv has now.
-        for (id, pack) in PRESET_PACKS {
-            let done = preset_lines(id).unwrap().iter().filter(|line| line.occasion == "done").count();
-            assert_eq!(character_pack::parse(pack, pack.len()).unwrap().pool(Occasion::Done).len(), done, "{id}");
-        }
-        for id in ["robot", "nobody", "", "../ada", "ADA"] {
-            assert!(voice_sample(id).is_none(), "{id}");
-        }
     }
 }

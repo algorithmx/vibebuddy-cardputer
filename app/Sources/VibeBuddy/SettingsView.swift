@@ -1261,7 +1261,6 @@ struct MakeCharacterSheet: View {
     @State private var look: Data?
     @State private var problem: String?
     @State private var starting = false
-    @StateObject private var samples = VoiceSamplePlayer()
 
     private var baseName: String { VoiceCatalogEntry.all.first { $0.id == base }?.name ?? base }
     private var chosenVoice: CharacterVoice? { model.characterVoice(voice) }
@@ -1281,7 +1280,7 @@ struct MakeCharacterSheet: View {
                     ForEach(Resources.bundledVoices) { entry in Text(entry.name).tag(entry.id) }
                 } label: { Text("Start from") }
                 TextField(text: $name, prompt: Text("Name")) { Text("Name") }
-                // Rows rather than a menu, so each voice has its play button: one line of the preset it comes from.
+                // Rows rather than a menu, so each voice has its play button: the preview of the preset it comes from.
                 LabeledContent {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(CharacterVoice.sorted(model.characterVoices, preferring: VoiceCatalogEntry.language(ofVoice: base))) { option in
@@ -1296,11 +1295,15 @@ struct MakeCharacterSheet: View {
                                 .buttonStyle(.plain)
                                 .accessibilityAddTraits(voice == option.id ? .isSelected : [])
                                 Spacer()
-                                Button { samples.toggle(option.id, client: model.client) } label: {
-                                    Image(systemName: samples.playing == option.id ? "stop.circle" : "play.circle")
+                                if Resources.voicePack(option.previewID) != nil {
+                                    let playing = model.previewingVoice == option.previewID
+                                    Button { model.togglePreview(option.previewID) } label: {
+                                        Image(systemName: playing ? "stop.circle" : "play.circle")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .disabled(model.operationRunning)
+                                    .help(playing ? Text("Stop") : Text("Hear this voice"))
                                 }
-                                .buttonStyle(.borderless)
-                                .help(samples.playing == option.id ? Text("Stop") : Text("Hear this voice"))
                             }
                         }
                     }
@@ -1351,7 +1354,7 @@ struct MakeCharacterSheet: View {
         .padding(20)
         .frame(width: 640, height: 680)
         .onAppear { if model.characterVoices.isEmpty { model.refreshMadeCharacters() } }
-        .onDisappear { samples.stop() }
+        .onDisappear { if model.previewingVoice != nil { model.preview.stop() } }
         .task(id: base) { await load() }
     }
 

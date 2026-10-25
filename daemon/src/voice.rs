@@ -150,11 +150,6 @@ fn assemble(lines: &BTreeMap<u32, Vec<i16>>, samples: usize) -> (Vec<i16>, Vec<u
 
 /// A 24 kHz 16-bit mono WAV file.
 pub fn wav(samples: &[i16]) -> Vec<u8> {
-    wav_at(samples, SAMPLE_RATE, 1)
-}
-
-/// A 16-bit WAV file at `rate`, its `channels` interleaved in `samples`.
-pub fn wav_at(samples: &[i16], rate: u32, channels: u16) -> Vec<u8> {
     let data = (samples.len() * 2) as u32;
     let mut out = Vec::with_capacity(44 + data as usize);
     out.extend_from_slice(b"RIFF");
@@ -162,10 +157,10 @@ pub fn wav_at(samples: &[i16], rate: u32, channels: u16) -> Vec<u8> {
     out.extend_from_slice(b"WAVEfmt ");
     out.extend_from_slice(&16u32.to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&rate.to_le_bytes());
-    out.extend_from_slice(&(rate * 2 * u32::from(channels)).to_le_bytes());
-    out.extend_from_slice(&(2 * channels).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
     out.extend_from_slice(&16u16.to_le_bytes());
     out.extend_from_slice(b"data");
     out.extend_from_slice(&data.to_le_bytes());

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 
-pub const RATE: usize = 24_000;
+const RATE: usize = 24_000;
 const STEPS: [i32; 89] = [
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
     130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060,
@@ -95,25 +95,14 @@ fn decode(bytes: &[u8], samples: usize) -> Vec<u8> {
     pcm
 }
 
-/// A WAV file as the daemon writes one (a voice's sample): its 16-bit PCM, sample rate and channels. None for
-/// anything else.
-pub fn wav(file: &[u8]) -> Option<(Vec<u8>, u32, u16)> {
-    let header = file.get(..44)?;
-    if &header[..4] != b"RIFF" || &header[8..16] != b"WAVEfmt " || &header[36..40] != b"data" || u16_at(header, 34) != 16 {
-        return None;
-    }
-    Some((file[44..].to_vec(), u32_at(header, 24) as u32, u16_at(header, 22) as u16))
-}
-
-/// Plays 16-bit PCM at `rate` with `channels` (a preview's: [`RATE`], 2) until it ends or `stop` is notified.
-pub async fn play(pcm: Vec<u8>, rate: u32, channels: u16, stop: Arc<Notify>) -> Result<(), String> {
-    let players = [
-        format!("pw-play --rate {rate} --channels {channels} --format s16 -"),
-        format!("paplay --raw --rate={rate} --channels={channels} --format=s16le"),
-        format!("aplay -q -t raw -f S16_LE -r {rate} -c {channels}"),
+/// Plays `pcm` until it ends or `stop` is notified.
+pub async fn play(pcm: Vec<u8>, stop: Arc<Notify>) -> Result<(), String> {
+    let players: [&[&str]; 3] = [
+        &["pw-play", "--rate", "24000", "--channels", "2", "--format", "s16", "-"],
+        &["paplay", "--raw", "--rate=24000", "--channels=2", "--format=s16le"],
+        &["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", "24000", "-c", "2"],
     ];
-    for player in &players {
-        let player: Vec<&str> = player.split(' ').collect();
+    for player in players {
         let spawned = tokio::process::Command::new(player[0])
             .args(&player[1..])
             .stdin(std::process::Stdio::piped())
@@ -170,12 +159,18 @@ mod tests {
     }
 
     #[test]
-    fn a_wav_file_gives_its_pcm_rate_and_channels() {
-        let mut file = b"RIFF\x28\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\x04\0\0\0".to_vec();
-        file.extend([1, 0, 255, 255]);
-        assert_eq!(wav(&file), Some((vec![1, 0, 255, 255], 16_000, 1)));
-        assert_eq!(wav(b"RIFF"), None);
-        assert_eq!(wav(&[0u8; 64]), None);
+    fn every_voice_a_character_is_made_with_has_a_preview() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let voices = std::fs::read_to_string(repo.join("characters/voices.tsv")).unwrap();
+        let ids: Vec<&str> = voices.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| line.split('\t').next()).collect();
+        assert!(ids.len() >= 8);
+        for id in ids {
+            match crate::making::preview_of(id) {
+                // The robot's pack is built from the built-in lines when installing.
+                "robot" => assert!(repo.join("voices/jessica/done.pcm").is_file(), "{id}"),
+                preset => assert!(pcm(&std::fs::read(repo.join(format!("characters/{preset}/pack.bin"))).unwrap()).is_some(), "{id}"),
+            }
+        }
     }
 
     #[test]

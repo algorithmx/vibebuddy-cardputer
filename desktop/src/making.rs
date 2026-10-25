@@ -31,6 +31,12 @@ impl std::fmt::Display for Voice {
     }
 }
 
+/// The Character whose preview is said in voice `id`: voices.tsv lists each preset's voice under the preset's id, and
+/// Jessica's is the robot's, the built-in lines.
+pub fn preview_of(id: &str) -> &str {
+    if id == "jessica" { "robot" } else { id }
+}
+
 /// Voices in `language` first, the daemon's order otherwise kept.
 pub fn sorted(voices: &[Voice], language: Option<&str>) -> Vec<Voice> {
     let (mut first, rest): (Vec<Voice>, Vec<Voice>) = voices.iter().cloned().partition(|voice| Some(voice.language.as_str()) == language);

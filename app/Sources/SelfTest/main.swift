@@ -300,6 +300,24 @@ for id in ["ada", "wanwanxiaohe"] {
     }
 }
 
+// Each voice a made Character can speak with has a preview in the app, for the voice picker's play button: its preset's
+// pack, or for Jessica the robot's, which build-app.sh packs from voices/jessica.
+if let tsv = try? String(contentsOfFile: "characters/voices.tsv", encoding: .utf8) {
+    let ids = tsv.split(separator: "\n").filter { !$0.hasPrefix("#") && !$0.isEmpty }.map { String($0.split(separator: "\t")[0]) }
+    check(ids.count >= 8, "voices.tsv read")
+    for id in ids {
+        let voice = CharacterVoice(id: id, provider: "", voice: "", language: "", gender: "", name: "")
+        if voice.previewID == "robot" {
+            check(FileManager.default.fileExists(atPath: "voices/jessica/done.pcm"), "\(id): the robot's lines")
+        } else {
+            let pack = (try? Data(contentsOf: URL(fileURLWithPath: "characters/\(voice.previewID)/pack.bin"))).flatMap(VoicePack.init(data:))
+            check(pack.map { !$0.previewPCM().isEmpty } ?? false, "\(id): a preset preview")
+        }
+    }
+} else {
+    check(false, "voices.tsv read")
+}
+
 // A form of address: the variant's lines replace the first lines of each pool, the rest stay.
 if let base = VoicePack(data: character), let pools = base.pools {
     check(pools.count == 12 && pools[0].count == 1 && pools[1].count == 1 && pools[1][0].samples == 3, "pools read back")

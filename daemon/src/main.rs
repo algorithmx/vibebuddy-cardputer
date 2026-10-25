@@ -729,7 +729,6 @@ fn app(state: AppState) -> Router {
         .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
         .route("/v1/voice-keys", axum::routing::put(put_voice_keys))
         .route("/v1/voices", get(get_voices))
-        .route("/v1/voices/{id}/sample", get(get_voice_sample))
         .route("/v1/characters", get(get_characters).post(post_character))
         .route("/v1/characters/presets/{id}/lines", get(get_preset_lines))
         .route("/v1/characters/{id}", axum::routing::delete(delete_character))
@@ -1763,15 +1762,6 @@ async fn get_voices() -> Json<Vec<making::Voice>> {
     Json(making::voices())
 }
 
-/// One line in a voice, as a WAV file to hear before picking it; 404 for anything not in `characters/voices.tsv`.
-async fn get_voice_sample(axum::extract::Path(id): axum::extract::Path<String>) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    match making::voice_sample(&id) {
-        Some(wav) => ([(axum::http::header::CONTENT_TYPE, "audio/wav")], wav).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(ApiResponse { accepted: false, message: format!("{id} is not a voice") })).into_response(),
-    }
-}
-
 /// The Characters made here, for the App to list beside the presets.
 async fn get_characters(State(state): State<AppState>) -> Json<Vec<making::MadeCharacter>> {
     Json(state.making.list())
@@ -2271,9 +2261,6 @@ mod tests {
     #[tokio::test]
     async fn voices_are_listed_and_only_a_character_in_one_of_them_starts() {
         assert!(get_voices().await.0.iter().any(|voice| voice.id == "wanwanxiaohe" && voice.provider == "volc"));
-        let sample = get_voice_sample(axum::extract::Path("ada".to_owned())).await;
-        assert_eq!((sample.status(), sample.headers()[axum::http::header::CONTENT_TYPE].to_str().unwrap()), (StatusCode::OK, "audio/wav"));
-        assert_eq!(get_voice_sample(axum::extract::Path("nobody".to_owned())).await.status(), StatusCode::NOT_FOUND);
         let dir = voice_keys::tests::scratch("making-main");
         let mut state = test_state(Arc::new(RecordingTransport::default()));
         state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
