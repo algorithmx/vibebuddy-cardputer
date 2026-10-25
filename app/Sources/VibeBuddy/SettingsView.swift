@@ -573,6 +573,9 @@ struct DeviceView: View {
                         }
                     }
                 }
+                if !connected, let refusal = relayRefusal {
+                    Text(refusal).font(.caption).foregroundStyle(.secondary)
+                }
                 // Not while a flash waits for a replug: that row says not to hold K0 this time.
                 if let pin = model.status?.device.pin {
                     PinNotice(pin: pin)
@@ -651,6 +654,17 @@ struct DeviceView: View {
     }
 
     private var connected: Bool { model.status?.device.connected ?? false }
+
+    /// Why the Relay won't carry the link, shown while the box is away (ADR-0020).
+    private var relayRefusal: String? {
+        switch model.status?.device.relayRefused {
+        case nil: nil
+        case "signed_out": String(localized: "Sign in to use the Relay.")
+        case "plan": String(localized: "The Relay needs the Paid plan.")
+        default: String(localized: "The Relay can't check the account right now. VibeBuddy tries again later.")
+        }
+    }
+
     /// Firmware that reports `TRANSFER 1` is updated over whatever carries the link (ADR-0016); older firmware is
     /// flashed over the cable only, and over Wi-Fi or the Relay the daemon refuses it.
     private var canFlash: Bool { connected && (model.status?.device.network != true || model.status?.device.transfer == true) }
@@ -834,6 +848,18 @@ struct AccountView: View {
             } else if let account, account.available {
                 if account.signedIn {
                     Text(signedInText)
+                    if let plan = account.plan {
+                        LabeledContent("Plan", value: plan.paid ? String(localized: "Paid plan") : String(localized: "Free"))
+                        if plan.paid, let used = plan.characters, let limit = plan.charactersLimit, let end = plan.periodEnd {
+                            Text("This month: \(used.formatted()) of \(limit.formatted()) characters · renews \(end.formatted(.dateTime.day().month(.abbreviated)))")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if let refusal {
+                        Text(refusal).foregroundStyle(.orange)
+                    } else if let today = account.today {
+                        Text("Voice today: \(today.commands) of \(today.commandsLimit)").foregroundStyle(.secondary)
+                    }
                     HStack {
                         Button("Sign out") { signOut() }
                         Button("Delete account…") { confirmDelete() }
@@ -868,6 +894,17 @@ struct AccountView: View {
         }
         .formStyle(.grouped)
         .onChange(of: account?.signedIn) { waiting = false }
+        // Reading the day's use and the plan costs a request to the service, so only when the tab is shown.
+        .task { if account?.signedIn == true { try? await model.client.refreshAccount() } }
+    }
+
+    /// Why voice is refused today, if it is.
+    private var refusal: String? {
+        switch account?.refused {
+        case nil: nil
+        case "global_cap": String(localized: "Voice is paused for everyone today. It comes back at midnight UTC.")
+        default: String(localized: "Today's voice is used up. It comes back at midnight UTC.")
+        }
     }
 
     /// The status stream then shows the key as set or not; true when the daemon took it.

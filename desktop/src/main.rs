@@ -593,6 +593,10 @@ impl App {
                     self.conversation_seen = None;
                     return Task::done(Message::PollConversation);
                 }
+                // Reading the day's use costs a request to the service, so only when the tab opens; the status brings it.
+                if tab == Tab::Account && self.status.as_ref().is_some_and(|status| status.account.signed_in) {
+                    return Task::perform(client::refresh_account(), |_| Message::AccountDone(Ok(())));
+                }
             }
             Message::Resident(Ok(enabled)) => {
                 self.resident = enabled;
@@ -2028,8 +2032,10 @@ impl App {
                 .spacing(12)
             }
         });
+        let refusal = device.filter(|_| !online).and_then(status::Device::relay_refusal).map(|refusal| text(refusal).size(13));
         column![row![text(tr("Link", &[])).width(140), text(link)].spacing(12)]
             .push(busy_row)
+            .push(refusal)
             .push(pin)
             .push(choice)
             .push(not_found)
@@ -2415,7 +2421,18 @@ impl App {
             .spacing(8)
             .into()
         };
-        column![text(who), actions].spacing(12).into()
+        let today = match (account.refused.as_deref(), &account.today) {
+            (Some("global_cap"), _) => Some(text(tr("Voice is paused for everyone today. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
+            (Some(_), _) => Some(text(tr("Today's voice is used up. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
+            (None, Some(usage)) => Some(text(tr("Voice today: %lld of %lld", &[&usage.commands, &usage.commands_limit])).size(13).style(text::secondary)),
+            (None, None) => None,
+        };
+        let plan = account.plan.as_ref().map(|plan| {
+            let name = if plan.paid() { tr("Paid plan", &[]) } else { tr("Free", &[]) };
+            row![text(tr("Plan", &[])).width(140), text(name)].spacing(12)
+        });
+        let month = account.plan.as_ref().and_then(|plan| plan.month_line()).map(|line| text(line).size(13).style(text::secondary));
+        column![text(who)].push(plan).push(month).push(today).push(actions).spacing(12).into()
     }
 
     fn advanced(&self) -> Element<'_, Message> {

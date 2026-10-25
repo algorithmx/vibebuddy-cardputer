@@ -55,9 +55,39 @@ public struct AccountStatus: Codable, Equatable {
     public var githubID: Int?
     /// Looked up on GitHub when signing in; nil if that lookup failed.
     public var githubLogin: String?
-    enum CodingKeys: String, CodingKey { case available, signedIn = "signed_in", email, githubID = "github_id", githubLogin = "github_login" }
-    public init(available: Bool, signedIn: Bool, email: String? = nil, githubID: Int? = nil, githubLogin: String? = nil) {
+    /// Voice used in the current UTC day, when the daemon knows; absent from daemons before it.
+    public var today: AccountUsage?
+    /// Why the service refused voice today: `allowance` or `global_cap`.
+    public var refused: String?
+    /// The account's plan (ADR-0020), when the daemon knows.
+    public var plan: AccountPlan?
+    enum CodingKeys: String, CodingKey { case available, signedIn = "signed_in", email, githubID = "github_id", githubLogin = "github_login", today, refused, plan }
+    public init(available: Bool, signedIn: Bool, email: String? = nil, githubID: Int? = nil, githubLogin: String? = nil, today: AccountUsage? = nil, refused: String? = nil, plan: AccountPlan? = nil) {
         self.available = available; self.signedIn = signedIn; self.email = email; self.githubID = githubID; self.githubLogin = githubLogin
+        self.today = today; self.refused = refused; self.plan = plan
+    }
+}
+
+/// `free`, or `paid` with the billing period's end and its monthly allowance, in characters of our voices.
+public struct AccountPlan: Codable, Equatable {
+    public var name: String
+    public var periodEnd: Date?
+    public var characters: Int?
+    public var charactersLimit: Int?
+    enum CodingKeys: String, CodingKey { case name, periodEnd = "period_end", characters, charactersLimit = "characters_limit" }
+    public init(name: String, periodEnd: Date? = nil, characters: Int? = nil, charactersLimit: Int? = nil) {
+        self.name = name; self.periodEnd = periodEnd; self.characters = characters; self.charactersLimit = charactersLimit
+    }
+    public var paid: Bool { name == "paid" }
+}
+
+public struct AccountUsage: Codable, Equatable {
+    public var day: String
+    public var commands: Int
+    public var commandsLimit: Int
+    enum CodingKeys: String, CodingKey { case day, commands, commandsLimit = "commands_limit" }
+    public init(day: String, commands: Int, commandsLimit: Int) {
+        self.day = day; self.commands = commands; self.commandsLimit = commandsLimit
     }
 }
 
@@ -150,7 +180,9 @@ public struct DeviceState: Codable, Equatable {
     public var wifiSeen: [SeenNetwork]?
     /// The firmware takes updates over any link (ADR-0016): no cable, no download mode. Absent from older daemons.
     public var transfer: Bool?
-    enum CodingKeys: String, CodingKey { case transfer, wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiError = "wifi_error", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
+    /// Why the Relay won't carry the link (ADR-0020): `signed_out`, `plan` or `unavailable`. Absent from older daemons.
+    public var relayRefused: String?
+    enum CodingKeys: String, CodingKey { case transfer, relayRefused = "relay_refused", wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiError = "wifi_error", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
     public init(connected: Bool, port: String? = nil, bridge: Bool = false, mode: String? = nil, firmwareBuild: String? = nil, firmwareVersion: String? = nil, voice: String? = nil, volume: Int? = nil, foreignFirmware: Bool? = nil) {
         self.connected = connected; self.port = port; self.bridge = bridge; self.mode = mode; self.firmwareBuild = firmwareBuild; self.firmwareVersion = firmwareVersion; self.voice = voice; self.volume = volume
         self.foreignFirmware = foreignFirmware

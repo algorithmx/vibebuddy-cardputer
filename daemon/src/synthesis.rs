@@ -80,6 +80,9 @@ impl VoiceService {
             }
             return Err(format!("the voice service answered {status}: {}", answer.trim()));
         }
+        if let Some(session) = &self.session {
+            session.note_reply(text);
+        }
         forward(response.into_body().into_reader(), &host, on_audio)
     }
 }
