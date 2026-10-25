@@ -835,7 +835,7 @@ struct AccountView: View {
                 if account.signedIn {
                     Text(signedInText)
                     if let plan = account.plan {
-                        Text(plan.paid ? "Paid plan" : "Free")
+                        LabeledContent("Plan", value: plan.paid ? String(localized: "Paid plan") : String(localized: "Free"))
                         if plan.paid, let used = plan.characters, let limit = plan.charactersLimit, let end = plan.periodEnd {
                             Text("This month: \(used.formatted()) of \(limit.formatted()) characters · renews \(end.formatted(.dateTime.day().month(.abbreviated)))")
                                 .foregroundStyle(.secondary)
