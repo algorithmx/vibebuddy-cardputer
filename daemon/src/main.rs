@@ -174,7 +174,8 @@ impl AppState {
     }
 
     async fn snapshot(&self) -> Status {
-        let device = self.device.lock().await.clone();
+        let mut device = self.device.lock().await.clone();
+        device.relay_refused = self.relay.as_ref().and_then(relay::RelayConfig::refused);
         let updates = self.updates.lock().await.status(&device, self.update_checks_enabled().await);
         Status {
             daemon: DaemonInfo {
@@ -241,6 +242,11 @@ async fn main() {
         }
         None => None,
     };
+    let account = Arc::new(account::Account::new(
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        config::config_dir().as_deref(),
+        bind_address.port(),
+    ));
     let mut serial_config = SerialConfig::from_env(known_box_file());
     let mut relay_config = None;
     // Paired, the box can also be reached over the local network when it isn't on the cable (ADR-0012).
@@ -252,7 +258,7 @@ async fn main() {
             discovery: lan::Discovery::default(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
-        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release());
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release()).with_account(account.clone());
         serial_config = serial_config.with_relay(relay.clone());
         relay_config = Some(relay);
     }
@@ -280,11 +286,7 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
-    state.account = Arc::new(account::Account::new(
-        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
-        config::config_dir().as_deref(),
-        bind_address.port(),
-    ));
+    state.account = account;
     state.state_dir = config::state_dir();
     if let Some(dir) = &state.state_dir {
         state.written = Arc::new(Mutex::new(persona::Written::load(&dir.join(persona::RECORD_FILE))));
@@ -522,6 +524,24 @@ fn follow_account(state: &AppState) {
             offer_voice_again(&follower).await;
         }
     });
+    // Today's usage and refusals are only shown.
+    let mut usage = state.account.watch_usage();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while usage.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
+    // So is why the Relay turned this computer away.
+    if let Some(relay) = &state.relay {
+        let mut refusal = relay.watch_refusal();
+        let follower = state.clone();
+        tokio::spawn(async move {
+            while refusal.changed().await.is_ok() {
+                follower.notify_status();
+            }
+        });
+    }
 }
 
 /// A provider refusing or taking an own key happens on a reply's thread; the status stream hears of it here.
@@ -714,6 +734,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/account/sign-in", post(post_sign_in))
         .route("/v1/account/callback", get(get_account_callback))
         .route("/v1/account/sign-out", post(post_sign_out))
+        .route("/v1/account/refresh", post(post_account_refresh))
         .with_state(state)
 }
 
@@ -1802,6 +1823,15 @@ async fn post_sign_out(State(state): State<AppState>) -> (StatusCode, Json<ApiRe
     state.notify_status();
     match result {
         Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "signed out".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+/// Reads today's voice use and the plan from the service, for the App's Account tab; the status stream carries them.
+async fn post_account_refresh(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    match tokio::task::spawn_blocking(move || account.refresh_usage()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))) {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "refreshed".to_owned() })),
         Err(error) => account_refusal(&error),
     }
 }

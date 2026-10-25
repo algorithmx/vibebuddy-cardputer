@@ -83,6 +83,10 @@ do {
     {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
     """.utf8))
     check(busy.busy == BoxBusy(owner: "omarchy", reason: "linked"), "busy decodes")
+    let refused = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
+    {"connected":false,"bridge":false,"relay_refused":"plan"}
+    """.utf8))
+    check(refused.relayRefused == "plan" && busy.relayRefused == nil, "the Relay's refusal decodes")
     let seen = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
     {"connected":true,"bridge":false,"wifi_seen":[{"ssid":"ByteTrade","rssi":-49}]}
     """.utf8))
@@ -97,6 +101,18 @@ do {
     {"elevenlabs":{"set":true,"refused":true},"volc":{"set":false,"refused":false}}
     """.utf8))
     check(keys == VoiceKeysStatus(elevenlabs: .init(set: true, refused: true), volc: .init(set: false)), "own keys decode")
+    let used = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"github_id":1,"today":{"day":"2026-10-24","commands":7,"commands_limit":100},"refused":"allowance"}
+    """.utf8))
+    check(used.today == AccountUsage(day: "2026-10-24", commands: 7, commandsLimit: 100) && used.refused == "allowance", "today's voice use decodes")
+    let free = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"plan":{"name":"free"}}
+    """.utf8))
+    check(free.plan == AccountPlan(name: "free") && free.plan?.paid == false, "the Free plan decodes")
+    let paid = try StatusCoding.decoder().decode(AccountPlan.self, from: Data("""
+    {"name":"paid","period_end":"2026-11-24T00:00:00.000Z","characters":12300,"characters_limit":100000}
+    """.utf8))
+    check(paid.paid && paid.periodEnd == Date(timeIntervalSince1970: 1_795_478_400) && paid.characters == 12300 && paid.charactersLimit == 100_000, "the Paid plan decodes")
 } catch {
     check(false, "status decoding threw: \(error)")
 }
