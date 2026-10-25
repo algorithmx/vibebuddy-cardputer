@@ -276,6 +276,17 @@ pub async fn character_voices() -> Result<Vec<crate::making::Voice>, String> {
     get_json("/v1/voices").await
 }
 
+/// One line in a voice, a WAV file to hear before picking it.
+pub async fn voice_sample(id: String) -> Result<Vec<u8>, String> {
+    let response =
+        reqwest::Client::new().get(format!("{BASE}/v1/voices/{id}/sample")).timeout(Duration::from_secs(10)).send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("the daemon answered {status}"));
+    }
+    Ok(response.bytes().await.map_err(|error| error.to_string())?.to_vec())
+}
+
 /// The Characters made on this computer.
 pub async fn made_characters() -> Result<Vec<crate::making::MadeCharacter>, String> {
     get_json("/v1/characters").await

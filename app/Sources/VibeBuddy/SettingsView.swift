@@ -1261,6 +1261,7 @@ struct MakeCharacterSheet: View {
     @State private var look: Data?
     @State private var problem: String?
     @State private var starting = false
+    @StateObject private var samples = VoiceSamplePlayer()
 
     private var baseName: String { VoiceCatalogEntry.all.first { $0.id == base }?.name ?? base }
     private var chosenVoice: CharacterVoice? { model.characterVoice(voice) }
@@ -1280,9 +1281,28 @@ struct MakeCharacterSheet: View {
                     ForEach(Resources.bundledVoices) { entry in Text(entry.name).tag(entry.id) }
                 } label: { Text("Start from") }
                 TextField(text: $name, prompt: Text("Name")) { Text("Name") }
-                Picker(selection: $voice) {
-                    ForEach(CharacterVoice.sorted(model.characterVoices, preferring: VoiceCatalogEntry.language(ofVoice: base))) { voice in
-                        Text(verbatim: "\(voice.name) · \(voice.providerName)").tag(voice.id)
+                // Rows rather than a menu, so each voice has its play button: one line of the preset it comes from.
+                LabeledContent {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(CharacterVoice.sorted(model.characterVoices, preferring: VoiceCatalogEntry.language(ofVoice: base))) { option in
+                            HStack {
+                                Button { voice = option.id } label: {
+                                    Label {
+                                        Text(verbatim: "\(option.name) · \(option.providerName)")
+                                    } icon: {
+                                        Image(systemName: voice == option.id ? "largecircle.fill.circle" : "circle")
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityAddTraits(voice == option.id ? .isSelected : [])
+                                Spacer()
+                                Button { samples.toggle(option.id, client: model.client) } label: {
+                                    Image(systemName: samples.playing == option.id ? "stop.circle" : "play.circle")
+                                }
+                                .buttonStyle(.borderless)
+                                .help(samples.playing == option.id ? Text("Stop") : Text("Hear this voice"))
+                            }
+                        }
                     }
                 } label: { Text("Voice") }
                 if let readiness, let chosenVoice {
@@ -1331,6 +1351,7 @@ struct MakeCharacterSheet: View {
         .padding(20)
         .frame(width: 640, height: 680)
         .onAppear { if model.characterVoices.isEmpty { model.refreshMadeCharacters() } }
+        .onDisappear { samples.stop() }
         .task(id: base) { await load() }
     }
 

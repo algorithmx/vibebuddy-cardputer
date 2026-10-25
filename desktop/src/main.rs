@@ -24,7 +24,7 @@ mod tray;
 
 use std::time::{Duration, SystemTime};
 
-use iced::widget::{button, checkbox, column, container, image, pick_list, progress_bar, row, scrollable, slider, space, text, text_input, toggler};
+use iced::widget::{button, checkbox, column, container, image, pick_list, progress_bar, radio, row, scrollable, slider, space, text, text_input, toggler};
 use iced::{Element, Font, Length, Subscription, Task, Theme, window};
 
 use i18n::{UiLanguage, tr};
@@ -172,6 +172,8 @@ enum Message {
     CheckFromMenu,
     /// Play a Character's preview lines here, or stop the one playing.
     TogglePreview(&'static str),
+    /// Play a voice's sample (`GET /v1/voices/<id>/sample`) while making a Character, or stop the one playing.
+    ToggleSample(String),
     PreviewDone(String, Result<(), String>),
     /// Whether the daemon runs the resident session, asked each time it comes up.
     Resident(Result<bool, String>),
@@ -842,6 +844,7 @@ impl App {
             Message::CopyPrompt => return iced::clipboard::write(CUSTOM_PROMPT.to_owned()),
             Message::MakeCharacter(open) => {
                 self.make = None;
+                self.stop_sample();
                 let Some(base) = self.voices.first().map(Lender::of).filter(|_| open) else { return Task::none() };
                 self.make = Some(MakeForm {
                     base,
@@ -933,6 +936,7 @@ impl App {
                 return Task::perform(client::make_character(request), Message::MakeStarted);
             }
             Message::MakeStarted(Ok(started)) => {
+                self.stop_sample();
                 // The user's look stays with the Character's packs, so it can be written again later.
                 if let Some((look, _)) = self.make.take().and_then(|form| form.look)
                     && let Some(dir) = making::directory(&started.id)
@@ -1044,21 +1048,24 @@ impl App {
                 }
             }
             Message::TogglePreview(id) => {
-                let playing = self.previewing.take();
-                if let Some((_, stop)) = &playing {
-                    stop.notify_one();
-                }
-                if playing.is_some_and(|(playing, _)| playing == id) {
-                    return Task::none();
-                }
-                let stop = std::sync::Arc::new(tokio::sync::Notify::new());
-                self.previewing = Some((id.to_owned(), stop.clone()));
+                let Some(stop) = self.take_turn_playing(id) else { return Task::none() };
                 let play = async move {
                     let pack = assets::read_pack(id).await?;
                     let pcm = preview::pcm(&pack).ok_or_else(|| format!("{id} has no lines to preview"))?;
-                    preview::play(pcm, stop).await
+                    preview::play(pcm, preview::RATE as u32, 2, stop).await
                 };
                 return Task::perform(play, move |result| Message::PreviewDone(id.to_owned(), result));
+            }
+            Message::ToggleSample(voice) => {
+                // Apart from the Characters' previews, which share ids with the voices.
+                let key = format!("voice:{voice}");
+                let Some(stop) = self.take_turn_playing(&key) else { return Task::none() };
+                let play = async move {
+                    let file = client::voice_sample(voice).await?;
+                    let (pcm, rate, channels) = preview::wav(&file).ok_or("the daemon's sample isn't a WAV file")?;
+                    preview::play(pcm, rate, channels, stop).await
+                };
+                return Task::perform(play, move |result| Message::PreviewDone(key, result));
             }
             Message::PreviewDone(id, result) => {
                 if self.previewing.as_ref().is_some_and(|(playing, _)| *playing == id) {
@@ -1171,6 +1178,27 @@ impl App {
             Task::none()
         };
         Task::batch([Task::perform(client::made_characters(), Message::MadeCharacters), voices])
+    }
+
+    /// Stops what plays here; unless that was `key`, `key` plays next, until the stop returned is notified.
+    fn take_turn_playing(&mut self, key: &str) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        let playing = self.previewing.take();
+        if let Some((_, stop)) = &playing {
+            stop.notify_one();
+        }
+        if playing.is_some_and(|(playing, _)| playing == key) {
+            return None;
+        }
+        let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+        self.previewing = Some((key.to_owned(), stop.clone()));
+        Some(stop)
+    }
+
+    /// Stops a voice's sample, as the form it was picked in closes.
+    fn stop_sample(&mut self) {
+        if let Some((_, stop)) = self.previewing.take_if(|(key, _)| key.starts_with("voice:")) {
+            stop.notify_one();
+        }
     }
 
     /// The language a made Character speaks: its voice's, else its base preset's.
@@ -1674,6 +1702,16 @@ impl App {
             let note = text(ready.explanation(&provider)).size(13);
             if ready.can_start() { note.style(text::secondary) } else { note.style(text::danger) }
         });
+        // Rows rather than a list that drops down, so each voice has ▶: one line of the preset it comes from.
+        let selected = voices.iter().position(|voice| Some(voice) == form.voice.as_ref());
+        let mut voice_rows = column![].spacing(4);
+        for (index, voice) in voices.into_iter().enumerate() {
+            let playing = self.previewing.as_ref().is_some_and(|(playing, _)| *playing == format!("voice:{}", voice.id));
+            let sample = button(text(if playing { "■" } else { "▶" })).style(button::secondary).on_press(Message::ToggleSample(voice.id.clone()));
+            voice_rows = voice_rows.push(
+                row![sample, radio(voice.to_string(), index, selected, move |_| Message::MakeVoice(voice))].spacing(8).align_y(iced::Alignment::Center),
+            );
+        }
         let mut lines = column![].spacing(6);
         for occasion in &form.occasions {
             lines = lines.push(text(making::occasion_name(occasion)).size(14));
@@ -1703,7 +1741,7 @@ impl App {
             row![text(tr("Name", &[])), text_input(&tr("Name", &[]), &form.name).on_input(Message::MakeName).width(320)]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
-            row![text(tr("Voice", &[])), pick_list(voices, form.voice.clone(), Message::MakeVoice)].spacing(8).align_y(iced::Alignment::Center),
+            row![text(tr("Voice", &[])), voice_rows].spacing(8),
         ]
         .push(readiness)
         .push(look)
