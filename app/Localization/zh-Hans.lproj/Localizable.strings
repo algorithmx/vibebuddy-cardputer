@@ -430,3 +430,9 @@
 "Evening greeting" = "晚上问候";
 "Long session" = "长时间工作";
 "Welcome back" = "欢迎回来";
+"Delete…" = "删除…";
+"Delete" = "删除";
+"Delete “%@”? This can't be undone." = "删除「%@」？删除后无法恢复。";
+"Its lines made in its voice go with it; making it again would make them again." = "用它的声音做好的台词会一起删掉；再创建一次就得重新做。";
+"It's on the box: put another character on the box to delete this one." = "它正在盒子上：先给盒子换个角色，才能删除它。";
+"Couldn't delete “%@”: %@" = "删除「%@」失败：%@";

@@ -297,6 +297,11 @@ pub async fn make_character(request: crate::making::Request) -> Result<crate::ma
     Err(body["message"].as_str().map(str::to_owned).unwrap_or_else(|| format!("the daemon answered {status}")))
 }
 
+/// Deletes a Character made here; the daemon refuses while it is being made.
+pub async fn delete_character(id: String) -> Result<(), String> {
+    accepted(reqwest::Client::new().delete(format!("{BASE}/v1/characters/{id}"))).await
+}
+
 async fn get_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
     let response = reqwest::Client::new().get(format!("{BASE}{path}")).timeout(Duration::from_secs(10)).send().await.map_err(|error| error.to_string())?;
     let status = response.status();

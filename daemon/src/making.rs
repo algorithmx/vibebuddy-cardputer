@@ -229,6 +229,16 @@ pub enum StartError {
     Unavailable(String),
 }
 
+/// Why a made Character can't be deleted.
+#[derive(Debug, PartialEq)]
+pub enum DeleteError {
+    /// No Character of that id was made here (or the id isn't one).
+    NotFound,
+    /// Its job is running.
+    Busy,
+    Io(String),
+}
+
 /// What stopped a line.
 #[derive(Debug, PartialEq)]
 struct Stop {
@@ -324,6 +334,22 @@ impl Maker {
         made
     }
 
+    /// Deletes a Character made here, its packs, line audio, manifest and the App's look with it; not while its job runs.
+    pub fn delete(&self, id: &str) -> Result<(), DeleteError> {
+        let dir = self.dir.as_ref().filter(|_| valid_id(id)).map(|dir| dir.join(id)).ok_or(DeleteError::NotFound)?;
+        // Held while removing, so the job can't start again halfway.
+        let status = self.lock();
+        if status.as_ref().is_some_and(|status| status.state == "making" && status.id == id) {
+            return Err(DeleteError::Busy);
+        }
+        if !dir.join(MANIFEST).is_file() {
+            return Err(DeleteError::NotFound);
+        }
+        std::fs::remove_dir_all(&dir).map_err(|error| DeleteError::Io(format!("deleting {}: {error}", dir.display())))?;
+        info!(id, "deleted a made Character");
+        Ok(())
+    }
+
     /// Checks the request and starts making it on a thread of its own; answers the job's first status.
     pub fn start(self: &Arc<Self>, request: Request) -> Result<MakingStatus, StartError> {
         let (id, voice) = self.begin(&request)?;
@@ -333,7 +359,7 @@ impl Maker {
     }
 
     /// Checks the request, settles the Character's id and marks the job as making.
-    fn begin(&self, request: &Request) -> Result<(String, Voice), StartError> {
+    pub(crate) fn begin(&self, request: &Request) -> Result<(String, Voice), StartError> {
         let dir = self.dir.as_ref().ok_or_else(|| StartError::Unavailable("no config directory".to_owned()))?;
         let voice = check(request).map_err(StartError::Invalid)?;
         let id = match &request.id {
@@ -942,6 +968,30 @@ mod tests {
         let status = maker.status().unwrap();
         assert_eq!((status.state, status.reason), ("failed", Some("internal")));
         assert!(maker.begin(&request).is_ok(), "the next one can start");
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    #[test]
+    fn a_made_character_is_deleted_but_not_while_it_is_being_made_nor_outside_its_directory() {
+        let (maker, scratch) = maker("making-delete", None, &[], "http://127.0.0.1:9", "http://127.0.0.1:9");
+        let request = request("ada", vec![line("done", "Done.")]);
+        let (id, _) = maker.begin(&request).unwrap();
+        let dir = scratch.join("characters").join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MANIFEST), serde_json::to_string(&request).unwrap()).unwrap();
+        std::fs::write(dir.join("look.bin"), b"look").unwrap();
+        assert_eq!(maker.delete(&id), Err(DeleteError::Busy));
+        assert!(dir.is_dir());
+        maker.report(|status| status.state = "failed");
+        // Something next to the Characters, which a crafted id would reach.
+        std::fs::write(scratch.join(MANIFEST), "{}").unwrap();
+        for bad in ["..", "../characters", "a/b", "", "Night-Owl"] {
+            assert_eq!(maker.delete(bad), Err(DeleteError::NotFound), "{bad:?}");
+        }
+        assert!(scratch.join(MANIFEST).is_file() && scratch.join("characters").is_dir());
+        assert_eq!(maker.delete(&id), Ok(()));
+        assert!(!dir.exists() && maker.list().is_empty());
+        assert_eq!(maker.delete(&id), Err(DeleteError::NotFound));
         let _ = std::fs::remove_dir_all(scratch);
     }
 

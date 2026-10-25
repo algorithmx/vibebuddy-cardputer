@@ -190,6 +190,13 @@ struct DaemonClient {
         return try StatusCoding.decoder().decode(MakingStatus.self, from: data)
     }
 
+    /// Deletes a Character made here; the daemon refuses while it is being made.
+    func deleteCharacter(_ id: String) async throws {
+        let (data, response) = try await URLSession.shared.data(for: request("/v1/characters/\(id)", method: "DELETE"))
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw DaemonError(message: DaemonClient.message(in: data) ?? String(localized: "The daemon answered \(code)")) }
+    }
+
     private func get<T: Decodable>(_ path: String) async throws -> T {
         let (data, response) = try await URLSession.shared.data(for: request(path))
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0

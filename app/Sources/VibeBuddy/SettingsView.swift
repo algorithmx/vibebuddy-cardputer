@@ -1120,8 +1120,13 @@ struct MadeCharacterCard: View {
             VStack(alignment: .leading) {
                 Text(verbatim: made.name).font(.body.weight(.semibold))
                 Text(detail).font(.caption).foregroundStyle(.secondary)
+                if inUse {
+                    Text("It's on the box: put another character on the box to delete this one.").font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer()
+            Button("Delete…") { confirmDelete() }
+                .disabled(inUse || (making && model.status?.making?.id == made.id))
             if inUse {
                 Label("In use", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
             } else if made.complete {
@@ -1137,6 +1142,17 @@ struct MadeCharacterCard: View {
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(inUse ? Color.accentColor : .clear, lineWidth: 2))
+    }
+
+    private func confirmDelete() {
+        let alert = NSAlert()
+        alert.messageText = String(localized: "Delete “\(made.name)”? This can't be undone.")
+        alert.informativeText = String(localized: "Its lines made in its voice go with it; making it again would make them again.")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: String(localized: "Delete")).hasDestructiveAction = true
+        alert.addButton(withTitle: String(localized: "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        model.deleteMadeCharacter(made)
     }
 
     private var detail: String {

@@ -367,6 +367,14 @@ final class AppModel: ObservableObject {
         Task { if let problem = await makeCharacter(request, look: nil) { lastError = problem } }
     }
 
+    /// Deletes a made Character, its packs and look with it; the caller asks first.
+    func deleteMadeCharacter(_ made: MadeCharacter) {
+        Task {
+            do { try await client.deleteCharacter(made.id) } catch { lastError = String(localized: "Couldn't delete “\(made.name)”: \(error.localizedDescription)") }
+            refreshMadeCharacters()
+        }
+    }
+
     /// Writes a made Character to the box: the daemon's pack of its lines, said with the form of address picked for its
     /// language, wearing its look. Works on any plan: nothing is synthesized again.
     func writeMadeCharacter(_ made: MadeCharacter) {

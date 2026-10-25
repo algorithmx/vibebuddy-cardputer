@@ -151,6 +151,10 @@ enum Message {
     UseMade(String),
     /// Make the rest of a made Character whose job stopped, by id.
     ResumeMade(String),
+    /// Ask to delete a made Character (by id), or (None) don't; deleting waits for a second click.
+    AskDeleteMade(Option<String>),
+    DeleteMade(String),
+    MadeDeleted(Result<(), String>),
     AskFirmwareUpdate(bool),
     FlashFirmware,
     FlashFromFile,
@@ -262,6 +266,8 @@ struct App {
     character_voices: Vec<making::Voice>,
     /// The Make a Character form, while it shows in place of the Character tab.
     make: Option<MakeForm>,
+    /// The made Character waiting for a second click to be deleted, since it can't be undone.
+    confirm_delete_made: Option<String>,
     /// The firmware update waits for a second click, since the box restarts.
     confirm_firmware: bool,
     /// A firmware zip picked with Flash from file…, waiting for the user to confirm.
@@ -365,6 +371,7 @@ impl App {
             made_faces: Vec::new(),
             character_voices: Vec::new(),
             make: None,
+            confirm_delete_made: None,
             confirm_firmware: false,
             file_firmware: None,
             wifi_ssid: String::new(),
@@ -969,6 +976,17 @@ impl App {
                 };
                 return Task::perform(write, Message::Done);
             }
+            Message::AskDeleteMade(id) => self.confirm_delete_made = id,
+            Message::DeleteMade(id) => {
+                self.confirm_delete_made = None;
+                return Task::perform(client::delete_character(id), Message::MadeDeleted);
+            }
+            Message::MadeDeleted(result) => {
+                if let Err(error) = result {
+                    self.notice = Some(Err(error));
+                }
+                return self.refresh_made();
+            }
             Message::ResumeMade(id) => match making::manifest(&id) {
                 Ok(request) => return Task::perform(client::make_character(request), Message::MakeStarted),
                 Err(error) => self.notice = Some(Err(error)),
@@ -1546,10 +1564,25 @@ impl App {
                 tr("Not finished · made from %@ · voice: %@", &[&base, &voice])
             };
             let face = self.made_faces.iter().find(|(id, _)| *id == made.id).map(|(_, face)| image(face.clone()));
+            let deletable = !in_use && !job.is_some_and(|job| job.running() && job.id == made.id);
+            let delete: Element<'_, Message> = if self.confirm_delete_made.as_deref() == Some(made.id.as_str()) {
+                row![
+                    text(tr("Delete “%@”? This can't be undone.", &[&made.name])).size(13),
+                    button(text(tr("Delete", &[]))).style(button::danger).on_press(Message::DeleteMade(made.id.clone())),
+                    button(text(tr("Cancel", &[]))).style(button::secondary).on_press(Message::AskDeleteMade(None)),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                button(text(tr("Delete…", &[]))).style(button::secondary).on_press_maybe(deletable.then(|| Message::AskDeleteMade(Some(made.id.clone())))).into()
+            };
+            let hint = in_use.then(|| text(tr("It's on the box: put another character on the box to delete this one.", &[])).size(13));
             let card = row![]
                 .push(face)
-                .push(column![text(made.name.clone()), text(detail).size(13)])
+                .push(column![text(made.name.clone()), text(detail).size(13)].push(hint))
                 .push(space::horizontal())
+                .push(delete)
                 .push(action)
                 .spacing(12)
                 .align_y(iced::Alignment::Center);
