@@ -64,8 +64,20 @@ impl Flash for SharedFlash {
         with_flash(|flash| flash.read_nor(offset, bytes))
     }
 
+    /// Writes a flash page (256 bytes) at a time, each in its own critical section, for the same reason as `erase`:
+    /// a transfer chunk is 3 KB, and writing it whole kept the UART interrupt out long enough now and then for the
+    /// FIFO to overflow and damage the next chunk's line (seen over the bridge, 2026-10-26).
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), FlashError> {
-        with_flash(|flash| flash.write_nor(offset, bytes))
+        const PAGE: u32 = 256;
+        let mut at = offset;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let take = rest.len().min((PAGE - at % PAGE) as usize);
+            with_flash(|flash| flash.write_nor(at, &rest[..take]))?;
+            at += take as u32;
+            rest = &rest[take..];
+        }
+        Ok(())
     }
 
     /// Erases in 64 KB steps, each in its own critical section: erasing the whole voices partition
