@@ -39,7 +39,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // An installed copy with the old file name renames itself (or gives way to a new copy) and starts again.
         if BundleRename.migrateIfNeeded() { exit(0) }
         // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
-        if AppUI.atLaunch() == .korekore { KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts")) }
+        if AppUI.atLaunch() == .korekore {
+            KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts"))
+            NSApp.applicationIconImage = KorekoreAppIcon.image()
+        }
         DistributedNotificationCenter.default().addObserver(forName: SingleInstance.showSettings, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.showMainWindow() }
         }
