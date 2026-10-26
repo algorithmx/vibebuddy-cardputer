@@ -4,8 +4,9 @@
 //!
 //! - The user's own recognizer: any OpenAI-compatible transcription endpoint (`VIBEBUDDY_STT_BASE_URL`,
 //!   `VIBEBUDDY_STT_API_KEY`, `VIBEBUDDY_STT_MODEL`).
-//! - The voice service in `vibebuddy-cloud`, `POST {base}/v0/voice/transcribe`, at the base spoken replies use
-//!   ([`crate::synthesis::service_base`]): staging outside a release, none in a release until accounts come.
+//! - The voice service in `vibebuddy-cloud`, `POST {base}/v1/voice/transcribe` with the account's session (ADR-0018,
+//!   docs/api.md), at the base spoken replies use ([`crate::synthesis::service_base`]): staging outside a release,
+//!   none in a release until production opens.
 //! - Cloudflare Workers AI's Whisper (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_TOKEN`), for development; picked only
 //!   by name now that the voice service recognizes.
 //!
@@ -22,6 +23,8 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::{Value, json};
 use tracing::{info, warn};
+
+use crate::account::Account;
 
 /// Picks the backend: `service`, `cloudflare`, `openai` or `off`. Unset, the user's own recognizer if set, else the
 /// voice service.
@@ -51,10 +54,34 @@ pub struct Transcript {
     pub language: Option<String>,
 }
 
+/// Why a recording wasn't turned into text: `reason` is what the box is told in `voice.error` (docs/protocol.md).
+#[derive(Debug, PartialEq)]
+pub struct RecognitionError {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl From<String> for RecognitionError {
+    fn from(message: String) -> Self {
+        Self { reason: "unavailable", message }
+    }
+}
+
+impl std::fmt::Display for RecognitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.reason)
+    }
+}
+
 /// Turns one recording into text. Blocking: it is called on a blocking thread.
 pub trait Recognizer: Send + Sync {
     /// `wav` is a whole 16-bit PCM WAV file.
-    fn recognize(&self, wav: &[u8]) -> Result<Transcript, String>;
+    fn recognize(&self, wav: &[u8]) -> Result<Transcript, RecognitionError>;
+
+    /// Whether it can be asked now; the voice service needs the person signed in.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// An HTTP request, built apart from sending it so the tests can check it.
@@ -100,9 +127,9 @@ impl Cloudflare {
 }
 
 impl Recognizer for Cloudflare {
-    fn recognize(&self, wav: &[u8]) -> Result<Transcript, String> {
+    fn recognize(&self, wav: &[u8]) -> Result<Transcript, RecognitionError> {
         let (status, body) = send(self.request(wav))?;
-        Self::parse(status, &body)
+        Ok(Self::parse(status, &body)?)
     }
 }
 
@@ -110,16 +137,25 @@ impl Recognizer for Cloudflare {
 pub struct VoiceService {
     base_url: String,
     language: Option<String>,
+    /// The account whose session the call carries; None only in tests.
+    session: Option<Arc<Account>>,
 }
 
 impl VoiceService {
     fn request(&self, wav: &[u8]) -> HttpRequest {
         let query = self.language.as_ref().map(|language| format!("?language={language}")).unwrap_or_default();
         HttpRequest {
-            url: format!("{}/v0/voice/transcribe{query}", self.base_url.trim_end_matches('/')),
-            headers: vec![("Content-Type".to_owned(), "audio/wav".to_owned())],
+            url: format!("{}/v1/voice/transcribe{query}", self.base_url.trim_end_matches('/')),
+            headers: [("Content-Type".to_owned(), "audio/wav".to_owned())]
+                .into_iter()
+                .chain(self.token().map(|token| ("Authorization".to_owned(), format!("Bearer {token}"))))
+                .collect(),
             body: wav.to_vec(),
         }
+    }
+
+    fn token(&self) -> Option<String> {
+        self.session.as_ref().and_then(|session| session.token())
     }
 
     fn parse(status: u16, body: &str) -> Result<Transcript, String> {
@@ -135,10 +171,52 @@ impl VoiceService {
 }
 
 impl Recognizer for VoiceService {
-    fn recognize(&self, wav: &[u8]) -> Result<Transcript, String> {
+    fn recognize(&self, wav: &[u8]) -> Result<Transcript, RecognitionError> {
+        if self.session.is_some() && self.token().is_none() {
+            return Err(signed_out());
+        }
         let (status, body) = send(self.request(wav))?;
-        Self::parse(status, &body)
+        if let Some(refusal) = refusal(status, &body, self.session.as_deref()) {
+            return Err(refusal);
+        }
+        let transcript = Self::parse(status, &body)?;
+        if let Some(session) = &self.session {
+            session.note_command();
+        }
+        Ok(transcript)
     }
+
+    fn ready(&self) -> bool {
+        self.session.is_none() || self.token().is_some()
+    }
+}
+
+/// The service's refusals the box is told about by name: no session (401; the daemon then forgets it), and the daily
+/// allowance or the global cap (429, ADR-0018). The messages are what the box shows.
+pub fn refusal(status: u16, body: &str, session: Option<&Account>) -> Option<RecognitionError> {
+    match status {
+        401 => {
+            if let Some(session) = session {
+                session.forget();
+            }
+            Some(signed_out())
+        }
+        429 => {
+            let refusal = match serde_json::from_str::<Value>(body).ok().and_then(|value| value.get("reason")?.as_str().map(str::to_owned)).as_deref() {
+                Some("global_cap") => RecognitionError { reason: "global_cap", message: "Voice is paused for today".to_owned() },
+                _ => RecognitionError { reason: "allowance", message: "Today's voice is used up".to_owned() },
+            };
+            if let Some(session) = session {
+                session.note_refusal(refusal.reason);
+            }
+            Some(refusal)
+        }
+        _ => None,
+    }
+}
+
+fn signed_out() -> RecognitionError {
+    RecognitionError { reason: "signed_out", message: "Sign in on the computer".to_owned() }
 }
 
 /// An OpenAI-compatible `POST {base}/audio/transcriptions`: OpenAI itself, or a server the user runs.
@@ -185,12 +263,12 @@ impl OpenAiCompatible {
 }
 
 impl Recognizer for OpenAiCompatible {
-    fn recognize(&self, wav: &[u8]) -> Result<Transcript, String> {
+    fn recognize(&self, wav: &[u8]) -> Result<Transcript, RecognitionError> {
         let mut nonce = [0u8; 12];
         getrandom::fill(&mut nonce).map_err(|error| error.to_string())?;
         let boundary = format!("vibebuddy-{}", nonce.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
         let (status, body) = send(self.request(wav, &boundary))?;
-        Self::parse(status, &body)
+        Ok(Self::parse(status, &body)?)
     }
 }
 
@@ -224,8 +302,8 @@ fn send(request: HttpRequest) -> Result<(u16, String), String> {
     Ok((status, body))
 }
 
-/// The recognizer the environment and the settings files configure, if any.
-pub fn from_env() -> Option<Arc<dyn Recognizer>> {
+/// The recognizer the environment and the settings files configure, if any; the voice service calls with `session`.
+pub fn from_env(session: Option<Arc<Account>>) -> Option<Arc<dyn Recognizer>> {
     let own = crate::config::config_dir().map(|dir| read_settings(&dir.join(SETTINGS_FILE))).unwrap_or_default();
     let file = std::env::var_os(ENV_FILE_VARIABLE).map(|path| read_env_file(Path::new(&path))).unwrap_or_default();
     let service = crate::synthesis::service_base(
@@ -241,13 +319,14 @@ pub fn from_env() -> Option<Arc<dyn Recognizer>> {
                 .filter(|value| !value.trim().is_empty())
         },
         service,
+        session,
     )
 }
 
 type Named = (&'static str, Arc<dyn Recognizer>);
 
 /// `service` is the voice service's base URL, if there is one.
-fn configure(lookup: &dyn Fn(&str) -> Option<String>, service: Option<String>) -> Option<Arc<dyn Recognizer>> {
+fn configure(lookup: &dyn Fn(&str) -> Option<String>, service: Option<String>, session: Option<Arc<Account>>) -> Option<Arc<dyn Recognizer>> {
     let language = lookup(LANGUAGE_VARIABLE).filter(|language| language != "auto");
     let shown = language.clone().unwrap_or_else(|| "detected".to_owned());
     let own = || -> Option<Named> {
@@ -265,7 +344,7 @@ fn configure(lookup: &dyn Fn(&str) -> Option<String>, service: Option<String>) -
         Some(("Cloudflare Workers AI", Arc::new(backend)))
     };
     let service = || -> Option<Named> {
-        Some(("the voice service", Arc::new(VoiceService { base_url: service.clone()?, language: language.clone() })))
+        Some(("the voice service", Arc::new(VoiceService { base_url: service.clone()?, language: language.clone(), session: session.clone() })))
     };
     let backend = lookup(BACKEND_VARIABLE);
     let chosen = match backend.as_deref() {
@@ -399,35 +478,70 @@ mod tests {
     #[test]
     fn the_backend_is_chosen_by_name_or_by_which_settings_are_there() {
         let service = || Some("https://api-staging.korekore.ai".to_owned());
-        assert!(configure(&lookup(&[]), None).is_none(), "a release has no voice service yet");
-        assert!(configure(&lookup(&[]), service()).is_some(), "the voice service by default");
-        assert!(configure(&lookup(&[("CLOUDFLARE_ACCOUNT_ID", "a"), ("CLOUDFLARE_AI_TOKEN", "t")]), None).is_none(), "Cloudflare only by name");
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "cloudflare"), ("CLOUDFLARE_ACCOUNT_ID", "a")]), service()).is_none(), "a token is needed too");
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "cloudflare"), ("CLOUDFLARE_ACCOUNT_ID", "a"), ("CLOUDFLARE_AI_TOKEN", "t")]), None).is_some());
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT_BASE_URL", "http://localhost:8000/v1")]), None).is_some());
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "off")]), service()).is_none());
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "openai")]), service()).is_none());
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "service")]), None).is_none());
-        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "whisper.cpp")]), service()).is_none());
+        assert!(configure(&lookup(&[]), None, None).is_none(), "a release has no voice service yet");
+        assert!(configure(&lookup(&[]), service(), None).is_some(), "the voice service by default");
+        assert!(configure(&lookup(&[("CLOUDFLARE_ACCOUNT_ID", "a"), ("CLOUDFLARE_AI_TOKEN", "t")]), None, None).is_none(), "Cloudflare only by name");
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "cloudflare"), ("CLOUDFLARE_ACCOUNT_ID", "a")]), service(), None).is_none(), "a token is needed too");
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "cloudflare"), ("CLOUDFLARE_ACCOUNT_ID", "a"), ("CLOUDFLARE_AI_TOKEN", "t")]), None, None).is_some());
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT_BASE_URL", "http://localhost:8000/v1")]), None, None).is_some());
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "off")]), service(), None).is_none());
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "openai")]), service(), None).is_none());
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "service")]), None, None).is_none());
+        assert!(configure(&lookup(&[("VIBEBUDDY_STT", "whisper.cpp")]), service(), None).is_none());
     }
 
     #[test]
     fn the_users_own_recognizer_wins_over_the_voice_service() {
-        let both = configure(&lookup(&[("VIBEBUDDY_STT_BASE_URL", "http://127.0.0.1:9/v1")]), Some("http://127.0.0.1:8/".to_owned())).unwrap();
+        let both = configure(&lookup(&[("VIBEBUDDY_STT_BASE_URL", "http://127.0.0.1:9/v1")]), Some("http://127.0.0.1:8/".to_owned()), None).unwrap();
         // Nothing listens on ports 8 or 9, so the error names the endpoint that was chosen.
         let error = both.recognize(b"").unwrap_err();
-        assert!(error.contains("127.0.0.1:9"), "{error}");
+        assert!(error.message.contains("127.0.0.1:9"), "{error}");
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("vibebuddy-speech-{tag}-{}-{}", std::process::id(), rand_suffix()))
+    }
+
+    fn rand_suffix() -> u64 {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).unwrap();
+        u64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn the_voice_service_carries_the_session_and_needs_one() {
+        let session = Arc::new(crate::account::signed_in_for_tests(&scratch("session"), "tok_abc"));
+        let service = VoiceService { base_url: "http://127.0.0.1:9".to_owned(), language: None, session: Some(session.clone()) };
+        assert!(service.request(b"").headers.contains(&("Authorization".to_owned(), "Bearer tok_abc".to_owned())));
+        assert!(service.ready());
+
+        session.forget();
+        assert!(!service.ready());
+        // Nothing is sent without a session: port 9 has no listener, and the error would name it otherwise.
+        assert_eq!(service.recognize(b"").unwrap_err().reason, "signed_out");
+    }
+
+    #[test]
+    fn the_services_refusals_are_named_for_the_box() {
+        let session = crate::account::signed_in_for_tests(&scratch("refusal"), "tok");
+        assert_eq!(refusal(429, r#"{"reason":"allowance"}"#, Some(&session)).unwrap().reason, "allowance");
+        assert_eq!(refusal(429, r#"{"reason":"global_cap"}"#, Some(&session)).unwrap().reason, "global_cap");
+        assert_eq!(refusal(429, "too many", Some(&session)).unwrap().reason, "allowance");
+        assert_eq!(refusal(502, "recognition failed", Some(&session)), None);
+        assert!(session.token().is_some(), "only a 401 signs out");
+        assert_eq!(refusal(401, r#"{"error":"unauthorized"}"#, Some(&session)).unwrap().reason, "signed_out");
+        assert!(session.token().is_none(), "a 401 forgets the session");
     }
 
     #[test]
     fn the_voice_service_gets_the_wav_as_the_body_and_the_language_in_the_query() {
-        let service = VoiceService { base_url: "https://api-staging.korekore.ai/".to_owned(), language: Some("zh".to_owned()) };
+        let service = VoiceService { base_url: "https://api-staging.korekore.ai/".to_owned(), language: Some("zh".to_owned()), session: None };
         let request = service.request(b"RIFFwav");
-        assert_eq!(request.url, "https://api-staging.korekore.ai/v0/voice/transcribe?language=zh");
+        assert_eq!(request.url, "https://api-staging.korekore.ai/v1/voice/transcribe?language=zh");
         assert_eq!(request.headers, [("Content-Type".to_owned(), "audio/wav".to_owned())]);
         assert_eq!(request.body, b"RIFFwav");
         let detected = VoiceService { language: None, ..service };
-        assert_eq!(detected.request(b"").url, "https://api-staging.korekore.ai/v0/voice/transcribe");
+        assert_eq!(detected.request(b"").url, "https://api-staging.korekore.ai/v1/voice/transcribe");
 
         let heard = VoiceService::parse(200, r#"{"text":" 你好 ","language":"Chinese"}"#).unwrap();
         assert_eq!(heard, Transcript { text: "你好".to_owned(), language: Some("Chinese".to_owned()) });
