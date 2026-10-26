@@ -621,3 +621,5 @@
 "Its lines made in its voice go with it; making it again would make them again." = "用它的声音做好的台词会一起删掉；再创建一次就得重新做。";
 "It's on the box: put another character on the box to delete this one." = "它正在盒子上：先给盒子换个角色，才能删除它。";
 "Couldn't delete “%@”: %@" = "删除「%@」失败：%@";
+"Its own lines, in a voice you pick" = "自己的台词，配上你挑的声音";
+"Making “%@”…" = "正在创建「%@」…";

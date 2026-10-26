@@ -8,32 +8,50 @@ import VibeBuddyCore
 struct KorekoreCharacterPage: View {
     @ObservedObject var model: AppModel
     @State private var makingOwn = false
+    /// Bumped by Make your own look, so the page scrolls down to the card it opens below the grid.
+    @State private var showOwn = 0
+    @State private var makingCharacter = false
 
     private var connected: Bool { model.status?.device.connected ?? false }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                KorekoreVolumeCard(model: model)
-                if let operation = model.operation, operation.kind == .voicePack {
-                    writeProgress(operation)
-                }
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: 3), spacing: 12) {
-                    koreCard
-                    robotCard
-                    ForEach(Resources.bundledVoices) { entry in
-                        voiceCard(entry)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    KorekoreVolumeCard(model: model)
+                    if let operation = model.operation, operation.kind == .voicePack {
+                        writeProgress(operation)
                     }
-                    makeYourOwn
+                    if let making = model.status?.making {
+                        KorekoreMakingRow(model: model, making: making)
+                    }
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12, alignment: .top), count: 3), spacing: 12) {
+                        koreCard
+                        robotCard
+                        ForEach(Resources.bundledVoices) { entry in
+                            voiceCard(entry)
+                        }
+                        ForEach(model.madeCharacters) { made in
+                            KorekoreMadeCard(model: model, made: made)
+                        }
+                        makeYourOwn
+                        makeCharacter
+                    }
+                    .padding(.bottom, Theme.Sticker.sm)
+                    if makingOwn || model.status?.device.voice == CustomCharacterCard.id {
+                        KorekoreCustomLook(model: model).id("own")
+                    }
                 }
-                .padding(.bottom, Theme.Sticker.sm)
-                if makingOwn || model.status?.device.voice == CustomCharacterCard.id {
-                    KorekoreCustomLook(model: model)
-                }
+                .padding(.bottom, 8)
             }
-            .padding(.bottom, 8)
+            .scrollIndicators(.never)
+            .onChange(of: showOwn) {
+                // After the card is laid out, or there is nothing to scroll to yet.
+                DispatchQueue.main.async { withAnimation { proxy.scrollTo("own", anchor: .top) } }
+            }
         }
-        .scrollIndicators(.never)
+        .onAppear { model.refreshMadeCharacters() }
+        .sheet(isPresented: $makingCharacter) { KorekoreMakeSheet(model: model) }
     }
 
     private func writeProgress(_ operation: DeviceOperation) -> some View {
@@ -145,20 +163,36 @@ struct KorekoreCharacterPage: View {
     }
 
     private var makeYourOwn: some View {
-        Button { makingOwn.toggle() } label: {
-            VStack(spacing: 6) {
-                Text(verbatim: "+").font(.pixel(32)).foregroundStyle(Theme.Colors.korePinkText)
-                Text("Make your own look").font(.rounded(14))
-                Text("1–4 images, made pixel here").font(.rounded(12, weight: 400)).foregroundStyle(Theme.Colors.muted)
-            }
-            .foregroundStyle(Theme.Colors.ink)
-            .padding(9)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md)
-                .strokeBorder(Theme.Colors.ink, style: StrokeStyle(lineWidth: Theme.Stroke.base, dash: [6, 4])))
-            .contentShape(Rectangle())
+        Button {
+            makingOwn = true
+            showOwn += 1
+        } label: {
+            dashed(String(localized: "Make your own look"), String(localized: "1–4 images, made pixel here"))
         }
         .buttonStyle(.plain)
+    }
+
+    private var makeCharacter: some View {
+        Button { makingCharacter = true } label: {
+            dashed(String(localized: "Make a Character"), String(localized: "Its own lines, in a voice you pick"))
+        }
+        .buttonStyle(.plain)
+        .disabled(model.status == nil || model.status?.making?.running == true)
+    }
+
+    /// The dashed card that starts something new.
+    private func dashed(_ title: String, _ detail: String) -> some View {
+        VStack(spacing: 6) {
+            Text(verbatim: "+").font(.pixel(32)).foregroundStyle(Theme.Colors.korePinkText)
+            Text(verbatim: title).font(.rounded(14))
+            Text(verbatim: detail).font(.rounded(12, weight: 400)).foregroundStyle(Theme.Colors.muted)
+        }
+        .foregroundStyle(Theme.Colors.ink)
+        .padding(9)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.md)
+            .strokeBorder(Theme.Colors.ink, style: StrokeStyle(lineWidth: Theme.Stroke.base, dash: [6, 4])))
+        .contentShape(Rectangle())
     }
 }
 
