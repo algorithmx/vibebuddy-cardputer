@@ -28,6 +28,12 @@ enum Resources {
     /// The Claude Console, where the user makes the Anthropic API key Claude Code answers voice commands with.
     static let anthropicConsole = URL(string: "https://platform.claude.com/")!
 
+    /// Where the user makes their own key for spoken replies in ElevenLabs' voices.
+    static let elevenLabsKeys = URL(string: "https://elevenlabs.io/app/settings/api-keys")!
+
+    /// Volcano Engine's speech console, where the user makes their own key for the Doubao voices.
+    static let volcConsole = URL(string: "https://console.volcengine.com/speech/")!
+
     static var macOSDirectory: URL {
         Bundle.main.executableURL!.deletingLastPathComponent()
     }
@@ -75,6 +81,12 @@ enum Resources {
     /// Fixed location under Application Support: the hook binary, config and logs all live nearby.
     static var applicationSupport: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/VibeBuddy")
+    }
+
+    /// Where the daemon keeps a Character made here (`config_dir()/characters/<id>/`, docs/characters.md): its packs, its
+    /// manifest, and the look the user brought for it, which the App keeps there as `look.bin`.
+    static func madeCharacterDirectory(_ id: String) -> URL {
+        applicationSupport.appendingPathComponent("characters").appendingPathComponent(id)
     }
 
     static var installedHookBinary: URL { applicationSupport.appendingPathComponent("bin/vibebuddy-hook") }
