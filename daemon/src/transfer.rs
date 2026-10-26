@@ -60,11 +60,13 @@ pub fn begin_event(kind: &str, size: usize, sha256: &str) -> Event {
     event("xfer.begin", serde_json::json!({"kind": kind, "size": size, "sha256": sha256}))
 }
 
-pub fn chunk_event(offset: usize, piece: &[u8]) -> Event {
+/// `round` comes back in the box's `xfer.ack`: it tells answers to chunks sent again from those sent before.
+pub fn chunk_event(offset: usize, round: u64, piece: &[u8]) -> Event {
     event(
         "xfer.chunk",
         serde_json::json!({
             "offset": offset,
+            "round": round,
             "crc": crc32fast::hash(piece),
             "data": base64::engine::general_purpose::STANDARD.encode(piece),
         }),
@@ -129,8 +131,11 @@ async fn send_from_box(
     kind: &str,
     image: &[u8],
     sha256: &str,
+    round: &mut u64,
     progress: &impl Fn(f32),
 ) -> Result<(), Stop> {
+    // A new round for each start, so answers to chunks of an earlier one are told apart.
+    *round += 1;
     send(transport, begin_event(kind, image.len(), sha256)).await.map_err(|_| Stop::Resume)?;
     let mut acked = loop {
         match answer(bus, READY_TIMEOUT).await {
@@ -140,29 +145,30 @@ async fn send_from_box(
         }
     };
     let mut next = acked;
-    // Where chunks were last sent again from: once per gap, as every chunk still on its way acks the same offset.
-    let mut resent_from = None;
     let mut pace = tokio::time::interval(PACE);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while acked < image.len() {
         while next < image.len() && next < acked + WINDOW * CHUNK_BYTES {
             pace.tick().await;
             let end = (next + CHUNK_BYTES).min(image.len());
-            send(transport, chunk_event(next, &image[next..end])).await.map_err(|_| Stop::Resume)?;
+            send(transport, chunk_event(next, *round, &image[next..end])).await.map_err(|_| Stop::Resume)?;
             next = end;
         }
-        if let (name, Some(offset)) = answer(bus, STEP_TIMEOUT).await?
-            && name == "xfer.ack"
-        {
-            if offset > acked {
-                acked = offset;
-                progress(acked as f32 / image.len() as f32);
-            } else if offset == acked && next > acked && resent_from != Some(acked) {
-                // The box still wants this offset although later chunks went: one was lost on the way, a line damaged
-                // on the UART bridge say. Send again from there now, not after STEP_TIMEOUT and a resume.
-                next = acked;
-                resent_from = Some(acked);
-            }
+        let ack = answer_event(bus, STEP_TIMEOUT).await?;
+        let number = |key: &str| ack.extra.get(key).and_then(serde_json::Value::as_u64);
+        if ack.event != "xfer.ack" {
+            continue;
+        }
+        let Some(offset) = number("offset").map(|offset| offset as usize) else { continue };
+        if offset > acked {
+            acked = offset;
+            progress(acked as f32 / image.len() as f32);
+        } else if offset == acked && next > acked && number("round") == Some(*round) {
+            // The box still wants `acked` after a later chunk of this round: that one was lost on the way, a line
+            // damaged on the UART bridge say. Send again from there now, not after STEP_TIMEOUT and a resume. The
+            // other chunks of this round that were still on their way answer the same, but with the old round.
+            next = acked;
+            *round += 1;
         }
     }
     Ok(())
@@ -181,11 +187,17 @@ pub async fn send_image(
 ) -> Result<Event, String> {
     let sha256: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
     let mut resumes = 0;
+    let mut round = 0;
     loop {
-        let stop = match send_from_box(&transport, &mut bus, kind, &image, &sha256, &progress).await {
+        let stop = match send_from_box(&transport, &mut bus, kind, &image, &sha256, &mut round, &progress).await {
             Ok(()) => {
                 send(&transport, Event::named("xfer.end")).await?;
-                match answer_event(&mut bus, END_TIMEOUT).await {
+                // Answers to chunks sent twice may still be on their way.
+                let mut end = answer_event(&mut bus, END_TIMEOUT).await;
+                while matches!(&end, Ok(ack) if ack.event == "xfer.ack") {
+                    end = answer_event(&mut bus, END_TIMEOUT).await;
+                }
+                match end {
                     Ok(done) if done.event == "xfer.done" => return Ok(done),
                     Ok(other) => return Err(format!("unexpected {} at the end", other.event)),
                     // The box keeps what it has: asking again carries on, and ends again.
@@ -248,6 +260,11 @@ mod tests {
         damage_after: Option<usize>,
         forgotten: bool,
         forget_always: bool,
+        /// Chunks the box was sent, copies too.
+        chunks: usize,
+        /// Answers to chunks of the link before it moved, reaching the daemon right after `xfer.ready`; they carry an
+        /// old round.
+        stale_acks: usize,
     }
 
     impl Transport for FakeBox {
@@ -266,13 +283,20 @@ mod tests {
                 let _ = self.bus.send(DeviceMessage::Event(event));
             };
             let mut state = self.state.lock().unwrap();
-            let BoxState { next, written, drop_after, forget_after, damage_after, forgotten, forget_always } = &mut *state;
+            let BoxState { next, written, drop_after, forget_after, damage_after, forgotten, forget_always, chunks, stale_acks } = &mut *state;
             match value["event"].as_str().unwrap() {
                 "xfer.begin" => {
                     *forgotten = false;
                     reply("xfer.ready", Some(*next));
+                    for _ in 0..std::mem::take(stale_acks) {
+                        let mut event = Event::named("xfer.ack");
+                        event.extra.insert("offset".to_owned(), (*next).into());
+                        event.extra.insert("round".to_owned(), 0.into());
+                        let _ = self.bus.send(DeviceMessage::Event(event));
+                    }
                 }
                 "xfer.chunk" => {
+                    *chunks += 1;
                     if *forget_after == Some(0) {
                         *forget_after = None;
                         *forgotten = true;
@@ -310,7 +334,10 @@ mod tests {
                         written.extend_from_slice(&data);
                         *next += data.len();
                     }
-                    reply("xfer.ack", Some(*next));
+                    let mut event = Event::named("xfer.ack");
+                    event.extra.insert("offset".to_owned(), (*next).into());
+                    event.extra.insert("round".to_owned(), value["round"].clone());
+                    let _ = self.bus.send(DeviceMessage::Event(event));
                 }
                 "xfer.end" if *forgotten => sequence(),
                 "xfer.end" => reply("xfer.done", None),
@@ -379,6 +406,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_acks_and_a_damaged_chunk_send_little_twice() {
+        let image: Vec<u8> = (0..300_000).map(|index| (index * 5) as u8).collect();
+        let (bus, receiver) = broadcast::channel(4096);
+        let state = BoxState { damage_after: Some(40), stale_acks: WINDOW, ..BoxState::default() };
+        let fake = Arc::new(FakeBox { bus, state: Mutex::new(state) });
+        let result = send_image(fake.clone(), receiver, "firmware", image.clone(), |_| {}, || {}).await.map(|_| ());
+        let state = fake.state.lock().unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(state.written, image);
+        let needed = image.len().div_ceil(CHUNK_BYTES);
+        assert!(state.chunks <= needed + 2 * WINDOW, "{} chunks sent for {needed}", state.chunks);
+    }
+
+    #[tokio::test]
     async fn a_box_that_keeps_forgetting_says_so() {
         let image: Vec<u8> = (0..10_000).map(|index| index as u8).collect();
         let (result, _, resumed) = run(image, BoxState { forget_always: true, ..BoxState::default() }).await;
@@ -404,7 +445,7 @@ mod tests {
 
     #[test]
     fn a_full_chunk_fits_the_boxs_line_limit() {
-        let frame = chunk_event(4_000_000, &vec![0xAB; CHUNK_BYTES]).to_ndjson().unwrap();
+        let frame = chunk_event(4_000_000, u64::from(u32::MAX), &vec![0xAB; CHUNK_BYTES]).to_ndjson().unwrap();
         assert!(frame.len() <= 4608, "{} bytes", frame.len());
     }
 }

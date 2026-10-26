@@ -1613,8 +1613,8 @@ mod transfer {
         assert_eq!(reply(&send(&mut firmware, &mut board, &bad_crc)), ack(0));
         let bad_base64 = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, "!".repeat(136));
         assert_eq!(reply(&send(&mut firmware, &mut board, &bad_base64)), ack(0));
-        let good = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &image), base64(&image));
-        assert_eq!(reply(&send(&mut firmware, &mut board, &good)), ack(100));
+        let good = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"round":7,"crc":{},"data":"{}"}}"#, crc32(0, &image), base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &good)), serde_json::json!({"version": 1, "event": "xfer.ack", "offset": 100, "round": 7}), "the round comes back");
     }
 }
 /// Polls until `MIC END` and returns every line.

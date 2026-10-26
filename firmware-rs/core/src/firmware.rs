@@ -2176,7 +2176,14 @@ impl Firmware {
                 // Base64 the UART bridge damaged decodes to nothing, and the chunk is asked for again.
                 let length = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes).unwrap_or(0);
                 match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
-                    Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    // The computer's round goes back with the answer: it tells answers to chunks sent again apart.
+                    Ok(next) => match number(fields, "round") {
+                        Some(round) => {
+                            let line = text!(96, "{{\"version\":1,\"event\":\"xfer.ack\",\"offset\":{},\"round\":{}}}\n", next, round as u64);
+                            board.write(line.as_bytes());
+                        }
+                        None => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    },
                     Err(failure) => Self::transfer_error(board, failure),
                 }
             }
