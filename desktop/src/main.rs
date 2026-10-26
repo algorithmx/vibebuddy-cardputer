@@ -441,12 +441,11 @@ impl App {
         // Debug builds only: open the korekore UI on a given section or first-run step, for checking it on a desktop
         // without a pointer (VIBEBUDDY_KOREKORE_SECTION=device, VIBEBUDDY_KOREKORE_GUIDE=1).
         #[cfg(debug_assertions)]
-        if app.korekore {
-            if let Ok(name) = std::env::var("VIBEBUDDY_KOREKORE_SECTION") {
-                if let Some(section) = korekore::Section::ALL.into_iter().find(|section| format!("{section:?}").eq_ignore_ascii_case(&name)) {
-                    app.tab = section.tab();
-                }
-            }
+        if app.korekore
+            && let Ok(name) = std::env::var("VIBEBUDDY_KOREKORE_SECTION")
+            && let Some(section) = korekore::Section::ALL.into_iter().find(|section| format!("{section:?}").eq_ignore_ascii_case(&name))
+        {
+            app.tab = section.tab();
         }
         let restarted = std::env::args().any(|arg| arg == RESTARTED || arg == SETTINGS);
         let first = first_launch();
@@ -843,15 +842,21 @@ impl App {
             }
             Message::ChooseDrawings => return Task::perform(custom::choose_drawings(), Message::Drawings),
             Message::Drawings(Ok(None)) => {}
-            Message::Drawings(Ok(Some(drawings))) => match character::build_look(&drawings) {
-                Some(look) => {
-                    let frames = character::look_frames(&look).unwrap_or_default();
-                    self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
-                    self.custom_problem = None;
+            Message::Drawings(Ok(Some(drawings))) => {
+                match character::build_look(&drawings) {
+                    Some(look) => {
+                        let frames = character::look_frames(&look).unwrap_or_default();
+                        self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
+                        self.custom_problem = None;
+                    }
+                    None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
                 }
-                None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
-            },
-            Message::Drawings(Err(error)) => self.custom_problem = Some(error),
+                return self.show_custom_look();
+            }
+            Message::Drawings(Err(error)) => {
+                self.custom_problem = Some(error);
+                return self.show_custom_look();
+            }
             Message::PickLender(lender) => self.lender = Some(lender),
             Message::UseRobot => {
                 self.characters.robot_lender = None;
@@ -1202,6 +1207,11 @@ impl App {
 
     /// Pushes the menu and the face's color to the tray; a no-op until the tray is up.
     /// Asks for the Characters made here, and the voices once.
+    /// The korekore Character page opens the look's card below the grid; go down to it.
+    fn show_custom_look(&self) -> Task<Message> {
+        if self.korekore { iced::widget::operation::snap_to_end(korekore::pages::CHARACTER_PAGE) } else { Task::none() }
+    }
+
     fn refresh_made(&self) -> Task<Message> {
         let voices = if self.character_voices.is_empty() {
             Task::perform(client::character_voices(), Message::CharacterVoices)

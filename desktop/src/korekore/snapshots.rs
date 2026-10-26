@@ -71,6 +71,11 @@ const SAMPLE: &str = r#"{"daemon":{"build":"0.5.0 cc16829","revision":"firmware-
  "hooks":{"codex":"2026-10-21T16:40:00+08:00","claude":"2026-10-21T17:03:00+08:00"},
  "config":{"notify_link":true,"check_updates":true,"relay":false},
  "updates":{"enabled":true,"last_check":"2026-10-21T13:51:00+08:00"},
+ "account":{"available":true,"signed_in":true,"github_id":1,"github_login":"kore-sample",
+   "today":{"day":"2026-10-21","commands":12,"commands_limit":200},
+   "plan":{"name":"paid","period_end":"2026-11-24T00:00:00Z","characters":12300,"characters_limit":100000}},
+ "voice_keys":{"elevenlabs":{"set":true,"refused":false},"volc":{"set":false,"refused":false}},
+ "making":{"id":"made-1","name":"Night owl","state":"done","done":12,"total":12},
  "activities":[{"agent":"claude-code","title":"CC:Add Chinese to the box","state":"working"},
                {"agent":"codex","title":"CX:Fix voice reply","state":"working"},
                {"agent":"github-actions","title":"CI:App tests","state":"working"}]}"#;
@@ -111,9 +116,33 @@ fn draw_the_korekore_pages() {
         save(&format!("guide-{page}"), (954.0, 766.0), element);
     }
     app.guide = None;
+    app.made = vec![crate::making::MadeCharacter {
+        id: "made-1".to_owned(),
+        name: "Night owl".to_owned(),
+        base: "luna".to_owned(),
+        voice: "luna".to_owned(),
+        lines: 12,
+        complete: true,
+    }];
     for section in Section::ALL {
         app.tab = section.tab();
         let element: Element<'_, Message> = app.view(iced::window::Id::unique());
         save(&format!("page-{}", format!("{section:?}").to_lowercase()), (954.0, 766.0), element);
+    }
+    // Making a Character, which takes the Character page's place.
+    if let Some(base) = app.voices.first().map(crate::Lender::of) {
+        app.tab = Section::Character.tab();
+        app.make = Some(crate::MakeForm {
+            base,
+            name: "Night owl".to_owned(),
+            voice: None,
+            lines: vec![crate::making::Line { occasion: "done".to_owned(), text: "All done, {address}.".to_owned() }],
+            occasions: vec!["done".to_owned()],
+            look: None,
+            problem: None,
+            starting: false,
+        });
+        let element: Element<'_, Message> = app.view(iced::window::Id::unique());
+        save("page-make", (954.0, 766.0), element);
     }
 }

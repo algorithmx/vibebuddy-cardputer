@@ -5,9 +5,10 @@
 // The views that use all this come in the next steps.
 #![allow(dead_code)]
 
+mod account;
 mod controls;
 mod guide;
-mod pages;
+pub(crate) mod pages;
 pub mod picture;
 #[cfg(test)]
 mod snapshots;

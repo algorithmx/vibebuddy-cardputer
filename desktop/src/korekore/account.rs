@@ -1,0 +1,348 @@
+//! The account (ADR-0018), the user's own keys and making a Character (ADR-0020) in the korekore look. The design has
+//! no boards for them, so they use its cards, rows and pills; the state and messages are the current tabs' in main.rs.
+
+use iced::widget::{Space, button, column, container, image, row, text};
+use iced::{Alignment, Border, Element, Length, Padding};
+
+use super::controls::{Fill, bar, bold, card, card_with, divider, field, heading, note, picker, pill, rows, semibold, small, tag};
+use super::theme;
+use crate::i18n::tr;
+use crate::status;
+use crate::{Lender, MakeForm, Message, ROBOT, assets, client, making};
+
+impl crate::App {
+    // MARK: Account
+
+    /// At the top of the General page: who is signed in, the plan and today's use, then the own keys.
+    pub(super) fn kk_account(&self) -> Element<'_, Message> {
+        let title = |label: String| container(text(label).font(bold()).size(15).color(theme::INK)).padding(Padding::ZERO.left(4));
+        let keys = self.status.as_ref().and_then(|status| status.voice_keys.as_ref()).map(|keys| column![title(tr("Your own keys", &[])), self.kk_own_keys(keys)].spacing(14));
+        column![title(tr("Account", &[])), rows(self.kk_account_rows())].push(keys).spacing(14).into()
+    }
+
+    fn kk_account_rows(&self) -> Vec<Element<'_, Message>> {
+        fn line(content: Element<'_, Message>) -> Element<'_, Message> {
+            container(content).padding(Padding::from([12, 16])).width(Length::Fill).into()
+        }
+        let Some(status) = &self.status else {
+            return vec![line(note(tr("The daemon isn't running. Restart it on the Advanced tab.", &[])))];
+        };
+        let account = &status.account;
+        if !account.available {
+            return vec![line(note(tr("Signing in isn't available in this version of VibeBuddy.", &[])))];
+        }
+        if !account.signed_in {
+            return vec![line(
+                row![container(note(tr("Signing in opens your browser. Voice commands need an account.", &[]))).width(Length::Fill)]
+                    .push(self.signing_in.then(|| tag(tr("Waiting for the browser…", &[]), theme::WAIT_TEXT)))
+                    .push(pill(tr("Sign in", &[]), Fill::Sun, Some(Message::SignIn)))
+                    .spacing(12)
+                    .align_y(Alignment::Center)
+                    .into(),
+            )];
+        }
+        let who = match (&account.github_login, account.github_id) {
+            (Some(login), _) => tr("Signed in with GitHub as %@", &[login]),
+            (None, Some(id)) => tr("Signed in with GitHub (user %lld)", &[&id]),
+            (None, None) => tr("Signed in as %@", &[&account.email.as_deref().unwrap_or("—")]),
+        };
+        let mut items = vec![line(
+            row![
+                text(who).font(bold()).size(14).color(theme::INK).width(Length::Fill),
+                pill(tr("Sign out", &[]), Fill::Paper, Some(Message::SignOut)),
+                pill(tr("Delete account…", &[]), Fill::Paper, Some(Message::AskDeleteAccount(true))),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        )];
+        if self.confirm_delete_account {
+            items.push(divider());
+            items.push(line(
+                column![
+                    text(tr("Delete your VibeBuddy account?", &[])).font(bold()).size(16).color(theme::KORE_PINK_TEXT),
+                    note(tr("This deletes the account and everything kept about it, and signs out on every computer. It can't be undone.", &[])),
+                    row![
+                        Space::new().width(Length::Fill),
+                        pill(tr("Cancel", &[]), Fill::Paper, Some(Message::AskDeleteAccount(false))),
+                        pill(tr("Delete account", &[]), Fill::Pink, Some(Message::DeleteAccount)),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(10)
+                .into(),
+            ));
+        }
+        if let Some(plan) = &account.plan {
+            let (name, color) = if plan.paid() { (tr("Paid plan", &[]), theme::DONE_TEXT) } else { (tr("Free", &[]), theme::INK) };
+            items.push(divider());
+            items.push(line(row![text(tr("Plan", &[])).font(bold()).size(14).color(theme::INK).width(Length::Fill), tag(name, color)].align_y(Alignment::Center).into()));
+            if let Some(month) = plan.month_line() {
+                items.push(divider());
+                items.push(line(tag(month, theme::MUTED_2)));
+            }
+        }
+        let today = match (account.refused.as_deref(), &account.today) {
+            (Some("global_cap"), _) => Some(tag(tr("Voice is paused for everyone today. It comes back at midnight UTC.", &[]), theme::KORE_PINK_TEXT)),
+            (Some(_), _) => Some(tag(tr("Today's voice is used up. It comes back at midnight UTC.", &[]), theme::KORE_PINK_TEXT)),
+            (None, Some(usage)) => Some(tag(tr("Voice today: %lld of %lld", &[&usage.commands, &usage.commands_limit]), theme::MUTED_2)),
+            (None, None) => None,
+        };
+        if let Some(today) = today {
+            items.push(divider());
+            items.push(line(today));
+        }
+        items
+    }
+
+    /// Each key is typed once and never shown again: the daemon only says whether it has one.
+    fn kk_own_keys(&self, keys: &status::VoiceKeys) -> Element<'_, Message> {
+        let mut items: Vec<Element<'_, Message>> = vec![
+            container(note(tr("With your own key, spoken replies in that provider's voices go straight to it, billed to your account there, and never through VibeBuddy.", &[])))
+                .padding(Padding::from([12, 16]))
+                .into(),
+        ];
+        for provider in client::KeyProvider::ALL {
+            let (name, key, refused) = match provider {
+                client::KeyProvider::ElevenLabs => ("ElevenLabs".to_owned(), &keys.elevenlabs, tr("ElevenLabs refused your own key. Replies in its voices stay silent until you set another one.", &[])),
+                client::KeyProvider::Volc => (tr("Volcano Engine", &[]), &keys.volc, tr("Volcano Engine refused your own key. Replies in its voices stay silent until you set another one.", &[])),
+            };
+            let entry: Element<'_, Message> = if key.set {
+                row![tag(tr("Set", &[]), theme::DONE_TEXT), pill(tr("Clear", &[]), Fill::Paper, Some(Message::ClearOwnKey(provider)))].spacing(10).align_y(Alignment::Center).into()
+            } else {
+                let draft = &self.own_key_drafts[provider as usize];
+                row![
+                    field(&tr("Your own key", &[]), draft)
+                        .secure(true)
+                        .on_input(move |draft| Message::OwnKeyDraft(provider, draft))
+                        .on_submit(Message::SaveOwnKey(provider))
+                        .width(240),
+                    pill(tr("Save", &[]), Fill::Sun, (!draft.trim().is_empty()).then_some(Message::SaveOwnKey(provider))),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into()
+            };
+            let link = button(text(tr("Get a key", &[])).font(semibold()).size(12).color(theme::KORE_PINK_TEXT))
+                .padding(0)
+                .style(|_, _| button::Style::default())
+                .on_press(Message::OpenOwnKeyPage(provider));
+            items.push(divider());
+            items.push(
+                container(
+                    column![row![text(name).font(bold()).size(14).color(theme::INK).width(Length::Fill), entry, link].spacing(10).align_y(Alignment::Center)]
+                        .push(key.refused.then(|| tag(refused, theme::KORE_PINK_TEXT)))
+                        .spacing(6),
+                )
+                .padding(Padding::from([11, 16]))
+                .into(),
+            );
+        }
+        rows(items).into()
+    }
+
+    // MARK: Making a Character
+
+    /// A Character the user made, as a Character card with Use or Resume, and Delete.
+    pub(super) fn kk_made_card<'a>(&'a self, made: &'a making::MadeCharacter, job: Option<&'a making::Making>) -> Element<'a, Message> {
+        let online = self.online();
+        let busy = self.busy();
+        let in_use = self.status.as_ref().and_then(|status| status.device.voice.as_deref()) == Some(made.id.as_str());
+        let making_this = job.is_some_and(|job| job.running() && job.id == made.id);
+        let job_running = job.is_some_and(making::Making::running);
+        let action: Element<'_, Message> = if in_use {
+            tag(tr("In use", &[]), theme::KORE_PINK_TEXT)
+        } else if made.complete {
+            pill(tr("Use", &[]), Fill::Paper, (online && !busy).then_some(Message::UseMade(made.id.clone()))).into()
+        } else if making_this {
+            tag(tr("Making…", &[]), theme::WAIT_TEXT)
+        } else {
+            pill(tr("Resume", &[]), Fill::Paper, (!job_running).then_some(Message::ResumeMade(made.id.clone()))).into()
+        };
+        let base = assets::voice_name(&made.base);
+        let voice = self.character_voices.iter().find(|voice| voice.id == made.voice).map_or_else(|| made.voice.clone(), |voice| voice.name.clone());
+        let detail = if made.complete { tr("Made from %@ · voice: %@", &[&base, &voice]) } else { tr("Not finished · made from %@ · voice: %@", &[&base, &voice]) };
+        let face: Element<'_, Message> = match self.made_faces.iter().find(|(id, _)| *id == made.id) {
+            Some((_, face)) => image(face.clone()).filter_method(image::FilterMethod::Nearest).into(),
+            None => Space::new().into(),
+        };
+        let delete: Element<'_, Message> = if self.confirm_delete_made.as_deref() == Some(made.id.as_str()) {
+            column![
+                note(tr("Delete “%@”? This can't be undone.", &[&made.name])),
+                row![
+                    Space::new().width(Length::Fill),
+                    pill(tr("Cancel", &[]), Fill::Paper, Some(Message::AskDeleteMade(None))),
+                    pill(tr("Delete", &[]), Fill::Pink, Some(Message::DeleteMade(made.id.clone()))),
+                ]
+                .spacing(6),
+            ]
+            .spacing(6)
+            .into()
+        } else if in_use {
+            small(tr("It's on the box: put another character on the box to delete this one.", &[]))
+        } else {
+            row![Space::new().width(Length::Fill), pill(tr("Delete…", &[]), Fill::Paper, (!making_this).then(|| Message::AskDeleteMade(Some(made.id.clone()))))].into()
+        };
+        let content = column![
+            container(face).center_x(Length::Fill).align_y(Alignment::End).height(104).padding(Padding::ZERO.bottom(4)).style(|_| super::pages::stage(theme::BOX_CARD)),
+            row![text(made.name.clone()).font(bold()).size(16).width(Length::Fill), action].align_y(Alignment::Center),
+            small(detail),
+            delete,
+        ]
+        .spacing(6);
+        let (outline, stroke) = if in_use { (theme::KORE_PINK, theme::STROKE_BOLD) } else { (theme::INK, theme::STROKE_BASE) };
+        card_with(content, theme::PAPER, outline, stroke).padding(9).into()
+    }
+
+    /// The Character being made, or the last one: its progress, why it stopped, or that it is ready for the box.
+    pub(super) fn kk_making_row(&self, job: &making::Making) -> Option<Element<'_, Message>> {
+        let made = self.made.iter().find(|made| made.id == job.id);
+        if job.running() {
+            return Some(
+                card(
+                    column![
+                        row![heading(tr("Making “%@”…", &[&job.name])), Space::new().width(Length::Fill), tag(format!("{} / {}", job.done, job.total), theme::INK)],
+                        bar(job.progress(), theme::SUN),
+                    ]
+                    .spacing(8),
+                )
+                .into(),
+            );
+        }
+        let provider = made
+            .and_then(|made| self.character_voices.iter().find(|voice| voice.id == made.voice))
+            .map_or_else(|| tr("the voice's provider", &[]), making::Voice::provider_name);
+        if let Some(why) = job.explanation(&provider) {
+            let resume = made.map(|made| pill(tr("Resume", &[]), Fill::Sun, Some(Message::ResumeMade(made.id.clone()))));
+            return Some(
+                card_with(row![container(note(why)).width(Length::Fill)].push(resume).spacing(12).align_y(Alignment::Center), theme::CREAM, theme::KORE_PINK_TEXT, theme::STROKE_BASE)
+                    .into(),
+            );
+        }
+        let current = self.status.as_ref().and_then(|status| status.device.voice.as_deref());
+        let made = made.filter(|made| made.complete && current != Some(made.id.as_str()))?;
+        Some(
+            card_with(
+                row![
+                    tag(tr("“%@” is made.", &[&made.name]), theme::DONE_TEXT),
+                    Space::new().width(Length::Fill),
+                    pill(tr("Write to box", &[]), Fill::Pink, (self.online() && !self.busy()).then_some(Message::UseMade(made.id.clone()))),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+                theme::PAPER,
+                theme::DONE_TEXT,
+                theme::STROKE_BASE,
+            )
+            .into(),
+        )
+    }
+
+    /// The dashed card that opens the form.
+    pub(super) fn kk_make_character(&self) -> Element<'_, Message> {
+        let job_running = self.status.as_ref().and_then(|status| status.making.as_ref()).is_some_and(making::Making::running);
+        super::pages::dashed(tr("Make a Character", &[]), tr("Its own lines, in a voice you pick", &[]), (self.status.is_some() && !job_running).then_some(Message::MakeCharacter(true)))
+    }
+
+    /// Making a Character, in place of the Character page: start from a preset, change its lines (occasions stay, each
+    /// keeps a line), pick a voice and, optionally, bring a look; the daemon then makes the line audio.
+    pub(super) fn kk_make_form<'a>(&'a self, form: &'a MakeForm) -> Element<'a, Message> {
+        let bases: Vec<Lender> = self.voices.iter().map(Lender::of).collect();
+        let voices = making::sorted(&self.character_voices, assets::language_of(form.base.id).map(assets::Language::code));
+        let keys = self.status.as_ref().and_then(|status| status.voice_keys.as_ref());
+        let account = self.status.as_ref().map(|status| status.account.clone()).unwrap_or_default();
+        let readiness = form.voice.as_ref().map(|voice| (making::Readiness::of(voice, keys, &account), voice.provider_name()));
+        let job_running = self.status.as_ref().and_then(|status| status.making.as_ref()).is_some_and(making::Making::running);
+        let problem = form.problem.clone().or_else(|| if form.lines.is_empty() { None } else { making::problem(&form.name, &form.lines, &form.occasions) });
+        let can_make = !form.starting && !form.lines.is_empty() && problem.is_none() && readiness.as_ref().is_some_and(|(ready, _)| ready.can_start()) && !job_running;
+        let base_face = self.voices.iter().position(|voice| voice.id == form.base.id).and_then(|index| self.faces.get(index).cloned().flatten());
+        let face = form.look.as_ref().map(|(_, face)| face.clone()).or(base_face);
+        let readiness = readiness.map(|(ready, provider)| {
+            text(ready.explanation(&provider)).font(super::controls::regular()).size(13).color(if ready.can_start() { theme::MUTED } else { theme::KORE_PINK_TEXT })
+        });
+        let busy = self.busy();
+        let label = |words: String| text(words).font(bold()).size(14).color(theme::INK).width(120);
+        let line = |content: Element<'a, Message>| -> Element<'a, Message> { container(content).padding(Padding::from([10, 14])).width(Length::Fill).into() };
+        let look = row![label(tr("Look", &[]))]
+            .push(face.map(|face| container(image(face).filter_method(image::FilterMethod::Nearest)).padding(4).style(|_| super::pages::stage(theme::BOX_CARD))))
+            .push(pill(tr("Choose images…", &[]), Fill::Paper, Some(Message::MakeChooseDrawings)))
+            .push(form.look.is_some().then(|| pill(tr("Use %@'s look", &[&assets::voice_name(form.base.id)]), Fill::Paper, Some(Message::MakeBaseLook))))
+            .spacing(8)
+            .align_y(Alignment::Center);
+        let basics = rows([
+            line(row![label(tr("Start from", &[])), picker(bases, Some(form.base), Message::MakeBase)].spacing(8).align_y(Alignment::Center).into()),
+            divider(),
+            line(row![label(tr("Name", &[])), field(&tr("Name", &[]), &form.name).on_input(Message::MakeName).width(280)].spacing(8).align_y(Alignment::Center).into()),
+            divider(),
+            line(look.into()),
+        ]);
+        // A row per voice, so each has ▶: the preview of the preset it comes from, when this App has it.
+        let mut voice_rows: Vec<Element<'a, Message>> = Vec::new();
+        for (index, voice) in voices.into_iter().enumerate() {
+            let chosen = form.voice.as_ref() == Some(&voice);
+            let preview = making::preview_of(&voice.id);
+            let preview = if preview == ROBOT { Some(ROBOT) } else { self.voices.iter().find(|shipped| shipped.id == preview).map(|shipped| shipped.id) };
+            let playing = preview.is_some_and(|id| self.previewing.as_ref().is_some_and(|(playing, _)| playing == id));
+            let dot = container(Space::new().width(10).height(10)).padding(1).style(move |_| container::Style {
+                background: Some(if chosen { theme::KORE_PINK } else { theme::PAPER }.into()),
+                border: Border { color: theme::INK, width: theme::STROKE_BASE, radius: 8.0.into() },
+                ..container::Style::default()
+            });
+            let provider = voice.provider_name();
+            let pick = button(
+                row![dot, text(voice.name.clone()).font(bold()).size(14).color(theme::INK), tag(provider, theme::MUTED_2)].spacing(8).align_y(Alignment::Center),
+            )
+            .padding(0)
+            .style(|_, _| button::Style::default())
+            .on_press(Message::MakeVoice(voice));
+            if index > 0 {
+                voice_rows.push(divider());
+            }
+            voice_rows.push(line(
+                row![pick, Space::new().width(Length::Fill)]
+                    .push(preview.map(|id| pill(if playing { "■".to_owned() } else { "▶".to_owned() }, Fill::Paper, (!busy).then_some(Message::TogglePreview(id)))))
+                    .align_y(Alignment::Center)
+                    .into(),
+            ));
+        }
+        let mut page = column![
+            text(tr("Make a Character", &[])).font(bold()).size(18).color(theme::INK),
+            note(tr("Start from a character, change what it says, and pick a voice. VibeBuddy makes each line in that voice, then you can write it to the box.", &[])),
+            basics,
+            heading(tr("Voice", &[])),
+            rows(voice_rows),
+        ]
+        .push(readiness)
+        .spacing(14);
+        for occasion in &form.occasions {
+            let mut items: Vec<Element<'a, Message>> = Vec::new();
+            for (index, entry) in form.lines.iter().enumerate().filter(|(_, entry)| &entry.occasion == occasion) {
+                if !items.is_empty() {
+                    items.push(divider());
+                }
+                items.push(line(
+                    row![
+                        field("", &entry.text).on_input(move |text| Message::MakeLine(index, text)),
+                        pill("−".to_owned(), Fill::Paper, making::can_remove(index, &form.lines).then_some(Message::MakeRemoveLine(index))),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into(),
+                ));
+            }
+            page = page.push(heading(making::occasion_name(occasion))).push(rows(items));
+        }
+        page = page
+            .push(note(tr("{address} is where the buddy says what it calls you; each line with it is made once with each form of address.", &[])))
+            .push(problem.map(|problem| tag(problem, theme::KORE_PINK_TEXT)))
+            .push(
+                row![
+                    Space::new().width(Length::Fill),
+                    pill(tr("Cancel", &[]), Fill::Paper, Some(Message::MakeCharacter(false))),
+                    pill(tr("Make", &[]), Fill::Sun, can_make.then_some(Message::MakeStart)),
+                ]
+                .spacing(8),
+            );
+        super::pages::page(page)
+    }
+}

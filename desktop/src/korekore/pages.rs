@@ -17,9 +17,12 @@ use crate::status::{self, OperationKind, OperationState};
 use crate::{AddressChoice, BUILTIN, CUSTOM, Lender, Message, ROBOT, agents, assets, client, config_dir, short_time, wifi_failure};
 
 /// Leaves room for the scroll bar and the cards' shadows.
-fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+pub(super) fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     scrollable(container(content).padding(Padding::ZERO.right(14).bottom(8))).into()
 }
+
+/// The Character page's scroller, so the page can go down to the card Make your own look opens below the grid.
+pub(crate) const CHARACTER_PAGE: &str = "korekore-character";
 
 fn percent(progress: f32) -> String {
     format!("{:.0}%", progress * 100.0)
@@ -48,6 +51,9 @@ impl crate::App {
     // MARK: Character
 
     fn kk_character(&self) -> Element<'_, Message> {
+        if let Some(form) = &self.make {
+            return self.kk_make_form(form);
+        }
         let online = self.online();
         let busy = self.busy();
         let level = self.volume.or(self.status.as_ref().and_then(|status| status.device.volume)).unwrap_or(60);
@@ -119,7 +125,12 @@ impl crate::App {
                 Message::UseVoice(voice.id),
             ));
         }
+        let job = self.status.as_ref().and_then(|status| status.making.as_ref());
+        for made in &self.made {
+            cards.push(self.kk_made_card(made, job));
+        }
         cards.push(self.make_your_own());
+        cards.push(self.kk_make_character());
         let mut grid = column![].spacing(12);
         let mut cards = cards.into_iter().peekable();
         while cards.peek().is_some() {
@@ -154,13 +165,13 @@ impl crate::App {
         });
         let custom = (self.custom_look.is_some() || self.custom_problem.is_some() || current.as_deref() == Some(CUSTOM))
             .then(|| self.custom_look_card(current.as_deref() == Some(CUSTOM)));
-        page(
-            column![rows([volume_row.into(), address.into()])]
-                .push(progress)
-                .push(grid)
-                .push(custom)
-                .spacing(14),
-        )
+        let content = column![rows([volume_row.into(), address.into()])]
+            .push(progress)
+            .push(job.and_then(|job| self.kk_making_row(job)))
+            .push(grid)
+            .push(custom)
+            .spacing(14);
+        scrollable(container(content).padding(Padding::ZERO.right(14).bottom(8))).id(CHARACTER_PAGE).into()
     }
 
     pub(super) fn kore_card(&self) -> Element<'_, Message> {
@@ -213,27 +224,7 @@ impl crate::App {
     }
 
     fn make_your_own(&self) -> Element<'_, Message> {
-        button(
-            container(
-                column![
-                    text("+").font(PIXEL).size(32).color(theme::KORE_PINK_TEXT),
-                    text(tr("Make your own look", &[])).font(bold()).size(14).color(theme::INK),
-                    small(tr("1–4 images, made pixel here", &[])),
-                ]
-                .spacing(6)
-                .align_x(Alignment::Center),
-            )
-            .center_x(Length::Fill)
-            .center_y(Length::Fixed(160.0)),
-        )
-        .padding(9)
-        .width(Length::Fill)
-        .on_press(Message::ChooseDrawings)
-        .style(|_, _| iced::widget::button::Style {
-            border: Border { color: theme::INK, width: theme::STROKE_BASE, radius: theme::RADIUS_MD.into() },
-            ..iced::widget::button::Style::default()
-        })
-        .into()
+        dashed(tr("Make your own look", &[]), tr("1–4 images, made pixel here", &[]), Some(Message::ChooseDrawings))
     }
 
     fn custom_look_card(&self, in_use: bool) -> Element<'_, Message> {
@@ -617,8 +608,9 @@ impl crate::App {
                 heading(tr("The box", &[])),
                 column![small(tr("Link", &[])), text(link).font(PIXEL).size(13).color(theme::INK)].spacing(2),
                 column![small(tr("Firmware", &[])), firmware].spacing(2),
-                Space::new().height(Length::Fill),
             ]
+            .push(device.filter(|device| !device.connected).and_then(status::Device::relay_refusal).map(|why| text(why).font(regular()).size(12).color(theme::KORE_PINK_TEXT)))
+            .push(Space::new().height(Length::Fill))
             .push((outdated && online && !can_flash).then(|| note(tr("Plug in the cable to update the box's firmware.", &[]))))
             .push((outdated && can_flash).then(|| {
                 pill_sized(tr("Update to %@", &[&offer.map(|offer| offer.version.clone()).unwrap_or_default()]), Fill::Pink, 13.0, (!busy).then_some(Message::AskFirmwareUpdate(true)))
@@ -1016,6 +1008,8 @@ impl crate::App {
         page(
             column![]
                 .push(unsupported)
+                .push(self.kk_account())
+                .push(container(text(tr("This computer", &[])).font(bold()).size(15).color(theme::INK)).padding(Padding::ZERO.left(4)))
                 .push(settings)
                 .push(self.restart_offer.as_ref().map(|offer| self.restart_panel(offer)))
                 .push(container(text(tr("Updates", &[])).font(bold()).size(15).color(theme::INK)).padding(Padding::ZERO.left(4)))
@@ -1134,7 +1128,32 @@ impl crate::App {
     }
 }
 
-fn stage(fill: iced::Color) -> container::Style {
+/// The card that starts something new: a dashed-look outline, a pink +, a title and a line.
+pub(super) fn dashed<'a>(title: String, detail: String, on_press: Option<Message>) -> Element<'a, Message> {
+    button(
+        container(
+            column![
+                text("+").font(PIXEL).size(32).color(theme::KORE_PINK_TEXT),
+                text(title).font(bold()).size(14).color(theme::INK),
+                small(detail),
+            ]
+            .spacing(6)
+            .align_x(Alignment::Center),
+        )
+        .center_x(Length::Fill)
+        .center_y(Length::Fixed(160.0)),
+    )
+    .padding(9)
+    .width(Length::Fill)
+    .on_press_maybe(on_press)
+    .style(|_, _| iced::widget::button::Style {
+        border: Border { color: theme::INK, width: theme::STROKE_BASE, radius: theme::RADIUS_MD.into() },
+        ..iced::widget::button::Style::default()
+    })
+    .into()
+}
+
+pub(super) fn stage(fill: iced::Color) -> container::Style {
     container::Style {
         background: Some(fill.into()),
         border: Border { radius: theme::RADIUS_SM.into(), ..Border::default() },
