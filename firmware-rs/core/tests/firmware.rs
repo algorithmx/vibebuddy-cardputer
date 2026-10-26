@@ -8,7 +8,7 @@ use vibebuddy_firmware_core::audio::{Codec, Prompt, Sound};
 use vibebuddy_firmware_core::buttons::Levels;
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
-use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
+use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError, hold_line_byte};
 use vibebuddy_firmware_core::noise::Sealer;
 use vibebuddy_firmware_core::spoken_reply::{ReplyAudio, ReplyPlayer};
 use vibebuddy_firmware_core::storage::{Flash, FlashError};
@@ -1431,6 +1431,39 @@ mod transfer {
         assert_eq!(reply(&send(&mut firmware, &mut board, &line))["offset"], CHUNK_BYTES as u64);
     }
 
+    /// Over the UART bridge the main loop holds bytes until their line is whole. It once kept only 2048 of them and
+    /// lost the newline, so every chunk ran into the next and the box answered `input_too_large` (2026-10-26).
+    #[test]
+    fn a_full_chunk_over_the_uart_is_held_whole() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; CHUNK_BYTES * 2];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
+        begin_transfer(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len()));
+        let uart = |firmware: &mut Firmware, board: &mut FakeBoard, bytes: &[u8]| {
+            let mut held = Vec::new();
+            for &byte in bytes {
+                if hold_line_byte(&mut held, byte) {
+                    firmware.receive(board, &held);
+                    held.clear();
+                }
+            }
+            board.take_lines()
+        };
+        let too_long = format!("{}\n", "x".repeat(5000));
+        assert_eq!(uart(&mut firmware, &mut board, too_long.as_bytes()), ["ERROR input_too_large"]);
+        let mut lines = Vec::new();
+        for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
+            lines.extend_from_slice(
+                format!(r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#, index * CHUNK_BYTES, crc32(0, piece), base64(piece)).as_bytes(),
+            );
+            lines.push(b'\n');
+        }
+        let acks: Vec<Value> = uart(&mut firmware, &mut board, &lines).iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(acks.iter().map(|ack| ack["offset"].as_u64().unwrap()).collect::<Vec<_>>(), [CHUNK_BYTES as u64, 2 * CHUNK_BYTES as u64]);
+    }
+
     /// Sends a whole image of `kind` over xfer.*; returns what the box said to xfer.end.
     fn send_over_xfer(firmware: &mut Firmware, board: &mut FakeBoard, kind: &str, image: &[u8], sha: &str) -> Vec<String> {
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"{kind}","size":{},"sha256":"{sha}"}}"#, image.len());
@@ -1559,10 +1592,29 @@ mod transfer {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
         begin_transfer(&mut firmware, &mut board, &begin);
-        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&[0xE9; 100]));
-        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "crc"}));
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &[0x55; 100]), base64(&[0x55; 100]));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "bad_image"}));
         assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sequence");
         assert_eq!(board.restarts, 0);
+    }
+
+    /// The UART bridge changes bytes on the way: a chunk that fails its CRC, or whose base64 doesn't decode, is asked
+    /// for again with the offset the box still expects, and the transfer carries on.
+    #[test]
+    fn a_damaged_chunk_is_asked_for_again() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; 100];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let ack = |offset: u64| serde_json::json!({"version": 1, "event": "xfer.ack", "offset": offset});
+        let bad_crc = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_crc)), ack(0));
+        let bad_base64 = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, "!".repeat(136));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_base64)), ack(0));
+        let good = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"round":7,"crc":{},"data":"{}"}}"#, crc32(0, &image), base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &good)), serde_json::json!({"version": 1, "event": "xfer.ack", "offset": 100, "round": 7}), "the round comes back");
     }
 }
 /// Polls until `MIC END` and returns every line.
