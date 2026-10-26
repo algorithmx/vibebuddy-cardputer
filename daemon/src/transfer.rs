@@ -182,23 +182,23 @@ pub async fn send_image(
     let sha256: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
     let mut resumes = 0;
     loop {
-        match send_from_box(&transport, &mut bus, kind, &image, &sha256, &progress).await {
+        let stop = match send_from_box(&transport, &mut bus, kind, &image, &sha256, &progress).await {
             Ok(()) => {
                 send(&transport, Event::named("xfer.end")).await?;
                 match answer_event(&mut bus, END_TIMEOUT).await {
                     Ok(done) if done.event == "xfer.done" => return Ok(done),
                     Ok(other) => return Err(format!("unexpected {} at the end", other.event)),
                     // The box keeps what it has: asking again carries on, and ends again.
-                    Err(Stop::Resume | Stop::Lost) => {}
                     Err(Stop::Fail(why)) => return Err(why),
+                    Err(stop) => stop,
                 }
             }
             Err(Stop::Fail(why)) => return Err(why),
-            Err(Stop::Resume | Stop::Lost) => {}
-        }
+            Err(stop) => stop,
+        };
         resumes += 1;
         if resumes > RESUMES {
-            return Err("the link kept dropping".to_owned());
+            return Err(if stop == Stop::Lost { "the box kept losing its place in the image" } else { "the link kept dropping" }.to_owned());
         }
         resuming();
         // A link that moved is already back; one that dropped gets a while to come back.
@@ -247,6 +247,7 @@ mod tests {
         forget_after: Option<usize>,
         damage_after: Option<usize>,
         forgotten: bool,
+        forget_always: bool,
     }
 
     impl Transport for FakeBox {
@@ -265,7 +266,7 @@ mod tests {
                 let _ = self.bus.send(DeviceMessage::Event(event));
             };
             let mut state = self.state.lock().unwrap();
-            let BoxState { next, written, drop_after, forget_after, damage_after, forgotten } = &mut *state;
+            let BoxState { next, written, drop_after, forget_after, damage_after, forgotten, forget_always } = &mut *state;
             match value["event"].as_str().unwrap() {
                 "xfer.begin" => {
                     *forgotten = false;
@@ -278,7 +279,7 @@ mod tests {
                         *next = 0;
                         written.clear();
                     }
-                    if *forgotten {
+                    if *forgotten || *forget_always {
                         sequence();
                         return Ok(());
                     }
@@ -375,6 +376,14 @@ mod tests {
         assert_eq!(written, image);
         assert_eq!(resumed, 0, "sent again at once, not after STEP_TIMEOUT");
         assert!(started.elapsed() < STEP_TIMEOUT / 2);
+    }
+
+    #[tokio::test]
+    async fn a_box_that_keeps_forgetting_says_so() {
+        let image: Vec<u8> = (0..10_000).map(|index| index as u8).collect();
+        let (result, _, resumed) = run(image, BoxState { forget_always: true, ..BoxState::default() }).await;
+        assert_eq!(result, Err("the box kept losing its place in the image".to_owned()));
+        assert_eq!(resumed, RESUMES as usize);
     }
 
     #[tokio::test]
