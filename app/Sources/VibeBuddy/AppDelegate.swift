@@ -39,10 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // An installed copy with the old file name renames itself (or gives way to a new copy) and starts again.
         if BundleRename.migrateIfNeeded() { exit(0) }
         // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
-        if AppUI.atLaunch() == .korekore {
-            KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts"))
-            NSApp.applicationIconImage = KorekoreAppIcon.image()
-        }
+        if AppUI.atLaunch() == .korekore { KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts")) }
         DistributedNotificationCenter.default().addObserver(forName: SingleInstance.showSettings, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.showMainWindow() }
         }
@@ -106,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows a window with a Dock icon, so it can be found again; the icon goes when the last window closes.
     private func present(_ window: NSWindow) {
         NSApp.setActivationPolicy(.regular)
+        // The Dock tile takes the bundle's icon each time it appears, so the korekore one goes on after it.
+        if AppUI.atLaunch() == .korekore { NSApp.applicationIconImage = KorekoreAppIcon.image() }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
