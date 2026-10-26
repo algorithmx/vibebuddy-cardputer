@@ -165,7 +165,7 @@ public struct KorekoreMenuPanel: View {
 
 /// The menu bar item: Kore at 1×, in colour online, with a `sun` dot when an agent needs you, gray and asleep
 /// without a link (canvas: "Mac · Menu bar", bottom row).
-/// The Dock icon while the korekore UI is on: the General page's badge (Kore on `kore-pink` with an ink outline),
+/// The Dock icon while the korekore UI is on: the General page's badge shape (Kore with an ink outline), on `sun`,
 /// at the size of a macOS icon. The bundle's own icon stays the robot until the current UI goes (ADR-0021).
 public enum KorekoreAppIcon {
     public static func image() -> NSImage {
@@ -187,7 +187,7 @@ public enum KorekoreAppIcon {
             let rect = CGRect(x: (canvas - tile) / 2, y: (canvas - tile) / 2, width: tile, height: tile).insetBy(dx: stroke / 2, dy: stroke / 2)
             let path = CGPath(roundedRect: rect, cornerWidth: 185, cornerHeight: 185, transform: nil)
             context.addPath(path)
-            context.setFillColor(NSColor(Theme.Colors.korePink).cgColor)
+            context.setFillColor(NSColor(Theme.Colors.sun).cgColor)
             context.fillPath()
             context.addPath(path)
             context.setStrokeColor(NSColor(Theme.Colors.ink).cgColor)
