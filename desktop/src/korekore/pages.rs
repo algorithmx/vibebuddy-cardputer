@@ -17,9 +17,12 @@ use crate::status::{self, OperationKind, OperationState};
 use crate::{AddressChoice, BUILTIN, CUSTOM, Lender, Message, ROBOT, agents, assets, client, config_dir, short_time, wifi_failure};
 
 /// Leaves room for the scroll bar and the cards' shadows.
-fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+pub(super) fn page<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     scrollable(container(content).padding(Padding::ZERO.right(14).bottom(8))).into()
 }
+
+/// The Character page's scroller, so the page can go down to the card Make your own look opens below the grid.
+pub(crate) const CHARACTER_PAGE: &str = "korekore-character";
 
 fn percent(progress: f32) -> String {
     format!("{:.0}%", progress * 100.0)
@@ -37,17 +40,20 @@ impl crate::App {
         }
     }
 
-    fn online(&self) -> bool {
+    pub(super) fn online(&self) -> bool {
         self.status.as_ref().is_some_and(|status| status.device.connected)
     }
 
-    fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.status.as_ref().and_then(|status| status.operation.as_ref()).is_some_and(status::Operation::running)
     }
 
     // MARK: Character
 
     fn kk_character(&self) -> Element<'_, Message> {
+        if let Some(form) = &self.make {
+            return self.kk_make_form(form);
+        }
         let online = self.online();
         let busy = self.busy();
         let level = self.volume.or(self.status.as_ref().and_then(|status| status.device.volume)).unwrap_or(60);
@@ -119,7 +125,12 @@ impl crate::App {
                 Message::UseVoice(voice.id),
             ));
         }
+        let job = self.status.as_ref().and_then(|status| status.making.as_ref());
+        for made in &self.made {
+            cards.push(self.kk_made_card(made, job));
+        }
         cards.push(self.make_your_own());
+        cards.push(self.kk_make_character());
         let mut grid = column![].spacing(12);
         let mut cards = cards.into_iter().peekable();
         while cards.peek().is_some() {
@@ -154,16 +165,16 @@ impl crate::App {
         });
         let custom = (self.custom_look.is_some() || self.custom_problem.is_some() || current.as_deref() == Some(CUSTOM))
             .then(|| self.custom_look_card(current.as_deref() == Some(CUSTOM)));
-        page(
-            column![rows([volume_row.into(), address.into()])]
-                .push(progress)
-                .push(grid)
-                .push(custom)
-                .spacing(14),
-        )
+        let content = column![rows([volume_row.into(), address.into()])]
+            .push(progress)
+            .push(job.and_then(|job| self.kk_making_row(job)))
+            .push(grid)
+            .push(custom)
+            .spacing(14);
+        scrollable(container(content).padding(Padding::ZERO.right(14).bottom(8))).id(CHARACTER_PAGE).into()
     }
 
-    fn kore_card(&self) -> Element<'_, Message> {
+    pub(super) fn kore_card(&self) -> Element<'_, Message> {
         card(
             column![
                 container(sprite(&sprites::KORE_NORMAL, 4)).center_x(Length::Fill).center_y(Length::Fixed(104.0)).style(|_| stage(theme::INK)),
@@ -177,7 +188,7 @@ impl crate::App {
         .into()
     }
 
-    fn character_card(
+    pub(super) fn character_card(
         &self,
         name: String,
         summary: String,
@@ -213,27 +224,7 @@ impl crate::App {
     }
 
     fn make_your_own(&self) -> Element<'_, Message> {
-        button(
-            container(
-                column![
-                    text("+").font(PIXEL).size(32).color(theme::KORE_PINK_TEXT),
-                    text(tr("Make your own look", &[])).font(bold()).size(14).color(theme::INK),
-                    small(tr("1–4 images, made pixel here", &[])),
-                ]
-                .spacing(6)
-                .align_x(Alignment::Center),
-            )
-            .center_x(Length::Fill)
-            .center_y(Length::Fixed(160.0)),
-        )
-        .padding(9)
-        .width(Length::Fill)
-        .on_press(Message::ChooseDrawings)
-        .style(|_, _| iced::widget::button::Style {
-            border: Border { color: theme::INK, width: theme::STROKE_BASE, radius: theme::RADIUS_MD.into() },
-            ..iced::widget::button::Style::default()
-        })
-        .into()
+        dashed(tr("Make your own look", &[]), tr("1–4 images, made pixel here", &[]), Some(Message::ChooseDrawings))
     }
 
     fn custom_look_card(&self, in_use: bool) -> Element<'_, Message> {
@@ -566,10 +557,100 @@ impl crate::App {
         let offer = updates.and_then(|updates| updates.firmware.as_ref());
         let downloaded = updates.and_then(status::Updates::firmware_directory).is_some();
         let outdated = updates.is_some_and(status::Updates::firmware_update_available);
+        let finding = self.kk_finding();
+
+        // The box's screen as last captured, at one point per pixel in the design's 352 × 264 frame: any other scale
+        // makes the pixel art uneven. Before the first capture, the box redrawn from the status.
+        let screen: Element<'_, Message> = match &self.screenshot {
+            Some((_, handle)) => image(handle.clone()).filter_method(image::FilterMethod::Nearest).width(320).height(240).into(),
+            None => view::screen(&BoxPicture::derive(self.status.as_ref()), 1.0),
+        };
+        let screen = container(container(screen).center_x(352).center_y(264).style(|_| container::Style {
+            background: Some(theme::INK.into()),
+            border: Border { radius: (theme::RADIUS_MD - theme::STROKE_BOLD).into(), ..Border::default() },
+            ..container::Style::default()
+        }))
+        .padding(theme::STROKE_BOLD)
+        .style(|_| sticker(theme::INK, theme::RADIUS_MD, theme::STROKE_BOLD, theme::STICKER_SM));
+        let screen_actions = row![
+            pill(tr("Refresh", &[]), Fill::Paper, (online && !self.screenshot_busy && !busy).then_some(Message::TakeScreenshot)),
+            pill(tr("Save image", &[]), Fill::Paper, self.screenshot.is_some().then_some(Message::SaveScreenshot)),
+            Space::new().width(Length::Fill),
+        ]
+        .push(self.screenshot_busy.then(|| tag(tr("Refreshing…", &[]), theme::MUTED_2)))
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(358);
+        let link = match device {
+            None => tr("daemon isn't running", &[]),
+            Some(device) if !device.connected && !device.candidates.is_empty() => tr("Several devices found", &[]),
+            Some(device) if !device.connected => tr("Box not found", &[]),
+            Some(device) if device.relay => tr("Relay", &[]),
+            Some(device) => {
+                let port = device.port.as_deref().unwrap_or("?").trim_start_matches("/dev/");
+                if device.network { format!("{} · {port}", tr("Wi-Fi", &[])) } else { format!("USB · {port}") }
+            }
+        };
+        let version = device.and_then(|device| device.firmware_version.clone()).or_else(|| device.and_then(|device| device.firmware_label())).unwrap_or_else(|| "—".to_owned());
+        let firmware: Element<'_, Message> = match offer {
+            Some(offer) if outdated => row![
+                text(format!("{version} ")).font(PIXEL).size(13).color(theme::INK),
+                tag(tr("· %@ available", &[&offer.version]), theme::WAIT_TEXT)
+            ]
+            .into(),
+            _ if online && (offer.is_some() || updates.is_some_and(|updates| updates.last_check.is_some())) => {
+                row![text(format!("{version} ")).font(PIXEL).size(13).color(theme::INK), tag(tr("· up to date", &[]), theme::DONE_TEXT)].into()
+            }
+            _ => text(version).font(PIXEL).size(13).color(theme::INK).into(),
+        };
+        let the_box = card(
+            column![
+                heading(tr("The box", &[])),
+                column![small(tr("Link", &[])), text(link).font(PIXEL).size(13).color(theme::INK)].spacing(2),
+                column![small(tr("Firmware", &[])), firmware].spacing(2),
+            ]
+            .push(device.filter(|device| !device.connected).and_then(status::Device::relay_refusal).map(|why| text(why).font(regular()).size(12).color(theme::KORE_PINK_TEXT)))
+            .push(Space::new().height(Length::Fill))
+            .push((outdated && online && !can_flash).then(|| note(tr("Plug in the cable to update the box's firmware.", &[]))))
+            .push((outdated && can_flash).then(|| {
+                pill_sized(tr("Update to %@", &[&offer.map(|offer| offer.version.clone()).unwrap_or_default()]), Fill::Pink, 13.0, (!busy).then_some(Message::AskFirmwareUpdate(true)))
+                    .width(Length::Fill)
+            }))
+            .push(pill_sized(tr("Make the box blink", &[]), Fill::Sun, 13.0, (online && !busy).then_some(Message::Identify)).width(Length::Fill))
+            .push(pill_sized(tr("Flash from file…", &[]), Fill::Paper, 13.0, (can_flash && !busy).then_some(Message::FlashFromFile)).width(Length::Fill))
+            .spacing(10)
+            .height(Length::Fixed(290.0)),
+        );
+        let top = row![column![screen, screen_actions].spacing(8), the_box].spacing(14);
+        let firmware_state = self.firmware_state(can_flash, downloaded);
+        let networked = device.filter(|device| online && device.box_key.is_some()).map(|device| {
+            column![]
+                .push(device.network.then(|| {
+                    card_with(note(tr("Plug in the cable to change the box's network, update its firmware or see its paired computers.", &[])), theme::CREAM, theme::INK, theme::STROKE_BASE)
+                }))
+                .push(row![self.wifi_card(device), self.paired_card(device)].spacing(14))
+                .spacing(14)
+        });
+        page(
+            column![finding, top]
+                .push(self.confirm_panel())
+                .push(firmware_state)
+                .push(networked)
+                .spacing(14),
+        )
+    }
+
+    /// Where the box is and what it runs, when that needs saying: taken by another computer, a pin, several devices
+    /// or none, other firmware, an unsupported board. The Device page and the first-run guide both show it.
+    pub(super) fn kk_finding(&self) -> iced::widget::Column<'_, Message> {
+        let device = self.status.as_ref().map(|status| &status.device);
+        let online = self.online();
+        let busy = self.busy();
+        let updates = self.updates();
+        let downloaded = updates.and_then(status::Updates::firmware_directory).is_some();
         let other_firmware = online && device.is_some_and(|device| device.foreign_firmware && device.firmware_build.is_none());
         let operation = self.status.as_ref().and_then(|status| status.operation.as_ref());
         let replug = operation.is_some_and(|operation| operation.state == OperationState::Replug);
-
         let mut finding = column![].spacing(14);
         if let Some(owner_busy) = device.filter(|_| !online).and_then(|device| device.busy.as_ref()) {
             let owner = if owner_busy.owner.is_empty() { tr("another computer", &[]) } else { owner_busy.owner.clone() };
@@ -641,84 +722,7 @@ impl crate::App {
             ));
         }
 
-        // The box's screen as last captured, at one point per pixel in the design's 352 × 264 frame: any other scale
-        // makes the pixel art uneven. Before the first capture, the box redrawn from the status.
-        let screen: Element<'_, Message> = match &self.screenshot {
-            Some((_, handle)) => image(handle.clone()).filter_method(image::FilterMethod::Nearest).width(320).height(240).into(),
-            None => view::screen(&BoxPicture::derive(self.status.as_ref()), 1.0),
-        };
-        let screen = container(container(screen).center_x(352).center_y(264).style(|_| container::Style {
-            background: Some(theme::INK.into()),
-            border: Border { radius: (theme::RADIUS_MD - theme::STROKE_BOLD).into(), ..Border::default() },
-            ..container::Style::default()
-        }))
-        .padding(theme::STROKE_BOLD)
-        .style(|_| sticker(theme::INK, theme::RADIUS_MD, theme::STROKE_BOLD, theme::STICKER_SM));
-        let screen_actions = row![
-            pill(tr("Refresh", &[]), Fill::Paper, (online && !self.screenshot_busy && !busy).then_some(Message::TakeScreenshot)),
-            pill(tr("Save image", &[]), Fill::Paper, self.screenshot.is_some().then_some(Message::SaveScreenshot)),
-            Space::new().width(Length::Fill),
-        ]
-        .push(self.screenshot_busy.then(|| tag(tr("Refreshing…", &[]), theme::MUTED_2)))
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .width(358);
-        let link = match device {
-            None => tr("daemon isn't running", &[]),
-            Some(device) if !device.connected && !device.candidates.is_empty() => tr("Several devices found", &[]),
-            Some(device) if !device.connected => tr("Box not found", &[]),
-            Some(device) if device.relay => tr("Relay", &[]),
-            Some(device) => {
-                let port = device.port.as_deref().unwrap_or("?").trim_start_matches("/dev/");
-                if device.network { format!("{} · {port}", tr("Wi-Fi", &[])) } else { format!("USB · {port}") }
-            }
-        };
-        let version = device.and_then(|device| device.firmware_version.clone()).or_else(|| device.and_then(|device| device.firmware_label())).unwrap_or_else(|| "—".to_owned());
-        let firmware: Element<'_, Message> = match offer {
-            Some(offer) if outdated => row![
-                text(format!("{version} ")).font(PIXEL).size(13).color(theme::INK),
-                tag(tr("· %@ available", &[&offer.version]), theme::WAIT_TEXT)
-            ]
-            .into(),
-            _ if online && (offer.is_some() || updates.is_some_and(|updates| updates.last_check.is_some())) => {
-                row![text(format!("{version} ")).font(PIXEL).size(13).color(theme::INK), tag(tr("· up to date", &[]), theme::DONE_TEXT)].into()
-            }
-            _ => text(version).font(PIXEL).size(13).color(theme::INK).into(),
-        };
-        let the_box = card(
-            column![
-                heading(tr("The box", &[])),
-                column![small(tr("Link", &[])), text(link).font(PIXEL).size(13).color(theme::INK)].spacing(2),
-                column![small(tr("Firmware", &[])), firmware].spacing(2),
-                Space::new().height(Length::Fill),
-            ]
-            .push((outdated && online && !can_flash).then(|| note(tr("Plug in the cable to update the box's firmware.", &[]))))
-            .push((outdated && can_flash).then(|| {
-                pill_sized(tr("Update to %@", &[&offer.map(|offer| offer.version.clone()).unwrap_or_default()]), Fill::Pink, 13.0, (!busy).then_some(Message::AskFirmwareUpdate(true)))
-                    .width(Length::Fill)
-            }))
-            .push(pill_sized(tr("Make the box blink", &[]), Fill::Sun, 13.0, (online && !busy).then_some(Message::Identify)).width(Length::Fill))
-            .push(pill_sized(tr("Flash from file…", &[]), Fill::Paper, 13.0, (can_flash && !busy).then_some(Message::FlashFromFile)).width(Length::Fill))
-            .spacing(10)
-            .height(Length::Fixed(290.0)),
-        );
-        let top = row![column![screen, screen_actions].spacing(8), the_box].spacing(14);
-        let firmware_state = self.firmware_state(can_flash, downloaded);
-        let networked = device.filter(|device| online && device.box_key.is_some()).map(|device| {
-            column![]
-                .push(device.network.then(|| {
-                    card_with(note(tr("Plug in the cable to change the box's network, update its firmware or see its paired computers.", &[])), theme::CREAM, theme::INK, theme::STROKE_BASE)
-                }))
-                .push(row![self.wifi_card(device), self.paired_card(device)].spacing(14))
-                .spacing(14)
-        });
-        page(
-            column![finding, top]
-                .push(self.confirm_panel())
-                .push(firmware_state)
-                .push(networked)
-                .spacing(14),
-        )
+        finding
     }
 
     fn firmware_unavailable(&self) -> Element<'_, Message> {
@@ -740,7 +744,7 @@ impl crate::App {
     }
 
     /// Flashing asks once more, inline (canvas: the confirmations, "inline panels on Linux").
-    fn confirm_panel(&self) -> Option<Element<'_, Message>> {
+    pub(super) fn confirm_panel(&self) -> Option<Element<'_, Message>> {
         let device = self.status.as_ref().map(|status| &status.device);
         let busy = self.busy();
         let online = self.online();
@@ -866,7 +870,7 @@ impl crate::App {
         }
     }
 
-    fn wifi_card<'a>(&'a self, device: &'a status::Device) -> Element<'a, Message> {
+    pub(super) fn wifi_card<'a>(&'a self, device: &'a status::Device) -> Element<'a, Message> {
         let busy = self.busy();
         let line = |label: String, value: Element<'a, Message>| -> Element<'a, Message> {
             row![text(label).font(regular()).size(13).color(theme::MUTED), Space::new().width(Length::Fill), value].align_y(Alignment::Center).into()
@@ -1004,6 +1008,8 @@ impl crate::App {
         page(
             column![]
                 .push(unsupported)
+                .push(self.kk_account())
+                .push(container(text(tr("This computer", &[])).font(bold()).size(15).color(theme::INK)).padding(Padding::ZERO.left(4)))
                 .push(settings)
                 .push(self.restart_offer.as_ref().map(|offer| self.restart_panel(offer)))
                 .push(container(text(tr("Updates", &[])).font(bold()).size(15).color(theme::INK)).padding(Padding::ZERO.left(4)))
@@ -1122,7 +1128,32 @@ impl crate::App {
     }
 }
 
-fn stage(fill: iced::Color) -> container::Style {
+/// The card that starts something new: a dashed-look outline, a pink +, a title and a line.
+pub(super) fn dashed<'a>(title: String, detail: String, on_press: Option<Message>) -> Element<'a, Message> {
+    button(
+        container(
+            column![
+                text("+").font(PIXEL).size(32).color(theme::KORE_PINK_TEXT),
+                text(title).font(bold()).size(14).color(theme::INK),
+                small(detail),
+            ]
+            .spacing(6)
+            .align_x(Alignment::Center),
+        )
+        .center_x(Length::Fill)
+        .center_y(Length::Fixed(160.0)),
+    )
+    .padding(9)
+    .width(Length::Fill)
+    .on_press_maybe(on_press)
+    .style(|_, _| iced::widget::button::Style {
+        border: Border { color: theme::INK, width: theme::STROKE_BASE, radius: theme::RADIUS_MD.into() },
+        ..iced::widget::button::Style::default()
+    })
+    .into()
+}
+
+pub(super) fn stage(fill: iced::Color) -> container::Style {
     container::Style {
         background: Some(fill.into()),
         border: Border { radius: theme::RADIUS_SM.into(), ..Border::default() },

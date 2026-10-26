@@ -59,7 +59,14 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription);
-    if theme::stamp().is_some() {
+    if korekore::requested() {
+        // The korekore UI's fonts, there before any window opens (ADR-0021); its own face is the default. The
+        // current UI keeps the system's, or Omarchy's.
+        for font in korekore::FONTS {
+            app = app.font(font);
+        }
+        app = app.default_font(korekore::DEFAULT_FONT);
+    } else if theme::stamp().is_some() {
         app = app.default_font(Font::with_name(OMARCHY_FONT));
     }
     app.run()
@@ -431,14 +438,25 @@ impl App {
         app.custom_look = custom::custom_look_file()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|look| character::look_frames(&look).map(|frames| (look, frames.iter().map(|frame| handle(frame, 2)).collect())));
+        // Debug builds only: open the korekore UI on a given section or first-run step, for checking it on a desktop
+        // without a pointer (VIBEBUDDY_KOREKORE_SECTION=device, VIBEBUDDY_KOREKORE_GUIDE=1).
+        #[cfg(debug_assertions)]
+        if app.korekore
+            && let Ok(name) = std::env::var("VIBEBUDDY_KOREKORE_SECTION")
+            && let Some(section) = korekore::Section::ALL.into_iter().find(|section| format!("{section:?}").eq_ignore_ascii_case(&name))
+        {
+            app.tab = section.tab();
+        }
         let restarted = std::env::args().any(|arg| arg == RESTARTED || arg == SETTINGS);
         let first = first_launch();
         // The install script connected the agents and set up the start at login; the guide is for what it couldn't.
         app.guide = (first && cfg!(target_os = "linux")).then_some(0);
+        #[cfg(debug_assertions)]
+        if app.korekore {
+            app.guide = std::env::var("VIBEBUDDY_KOREKORE_GUIDE").ok().and_then(|page| page.parse().ok()).or(app.guide);
+        }
         let open = first || restarted || !cfg!(target_os = "linux");
         let task = if open { Task::done(Message::OpenSettings) } else { Task::none() };
-        // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
-        let task = if korekore::requested() { Task::batch([task, korekore::load_fonts()]) } else { task };
         (app, task)
     }
 
@@ -824,15 +842,21 @@ impl App {
             }
             Message::ChooseDrawings => return Task::perform(custom::choose_drawings(), Message::Drawings),
             Message::Drawings(Ok(None)) => {}
-            Message::Drawings(Ok(Some(drawings))) => match character::build_look(&drawings) {
-                Some(look) => {
-                    let frames = character::look_frames(&look).unwrap_or_default();
-                    self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
-                    self.custom_problem = None;
+            Message::Drawings(Ok(Some(drawings))) => {
+                match character::build_look(&drawings) {
+                    Some(look) => {
+                        let frames = character::look_frames(&look).unwrap_or_default();
+                        self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
+                        self.custom_problem = None;
+                    }
+                    None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
                 }
-                None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
-            },
-            Message::Drawings(Err(error)) => self.custom_problem = Some(error),
+                return self.show_custom_look();
+            }
+            Message::Drawings(Err(error)) => {
+                self.custom_problem = Some(error);
+                return self.show_custom_look();
+            }
             Message::PickLender(lender) => self.lender = Some(lender),
             Message::UseRobot => {
                 self.characters.robot_lender = None;
@@ -1183,6 +1207,11 @@ impl App {
 
     /// Pushes the menu and the face's color to the tray; a no-op until the tray is up.
     /// Asks for the Characters made here, and the voices once.
+    /// The korekore Character page opens the look's card below the grid; go down to it.
+    fn show_custom_look(&self) -> Task<Message> {
+        if self.korekore { iced::widget::operation::snap_to_end(korekore::pages::CHARACTER_PAGE) } else { Task::none() }
+    }
+
     fn refresh_made(&self) -> Task<Message> {
         let voices = if self.character_voices.is_empty() {
             Task::perform(client::character_voices(), Message::CharacterVoices)
@@ -1231,6 +1260,9 @@ impl App {
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
         if self.korekore {
+            if let Some(page) = self.guide {
+                return self.kk_guide(page);
+            }
             return self.korekore(korekore::Section::of(self.tab));
         }
         if let Some(page) = self.guide {
@@ -2738,7 +2770,8 @@ fn notify_new_firmware(status: &Status) {
     let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
     let _ = std::fs::write(&marker, &offer.version);
     let title = tr("Box firmware %@ is available", &[&offer.version]);
-    let body = tr("Open Settings → Device to update the box.", &[]);
+    // The korekore UI words it its own way (canvas: "SYSTEM NOTIFICATIONS").
+    let body = if korekore::requested() { tr("Update it from Settings › Device.", &[]) } else { tr("Open Settings → Device to update the box.", &[]) };
     if let Err(error) = launch("notify-send", &["--app-name=VibeBuddy".as_ref(), title.as_ref(), body.as_ref()]) {
         eprintln!("vibebuddy-desktop: {error}");
     }

@@ -165,6 +165,43 @@ public struct KorekoreMenuPanel: View {
 
 /// The menu bar item: Kore at 1×, in colour online, with a `sun` dot when an agent needs you, gray and asleep
 /// without a link (canvas: "Mac · Menu bar", bottom row).
+/// The Dock icon while the korekore UI is on: the General page's badge shape (Kore with an ink outline), on `sun`,
+/// at the size of a macOS icon. The bundle's own icon stays the robot until the current UI goes (ADR-0021).
+public enum KorekoreAppIcon {
+    public static func image() -> NSImage {
+        let kore = KorekoreSprites.all["kore-normal"]!
+        // A 1024 px canvas with the 824 px tile macOS icons use; Kore at a whole-pixel scale, about 70 % of the tile wide.
+        let canvas: CGFloat = 1024, tile: CGFloat = 824
+        let scale = Int(tile * 0.7) / kore.width
+        let pixels = kore.rgba(scale: scale)
+        return NSImage(size: NSSize(width: canvas, height: canvas), flipped: false) { _ in
+            guard let context = NSGraphicsContext.current?.cgContext,
+                  let provider = CGDataProvider(data: Data(pixels) as CFData),
+                  let sprite = CGImage(width: kore.width * scale, height: kore.height * scale, bitsPerComponent: 8, bitsPerPixel: 32,
+                                       bytesPerRow: kore.width * scale * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
+                                       decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+            else { return false }
+            // The badge's 2 pt outline on its 46 pt height, scaled to the tile.
+            let stroke = (tile * Theme.Stroke.base / 46).rounded()
+            let rect = CGRect(x: (canvas - tile) / 2, y: (canvas - tile) / 2, width: tile, height: tile).insetBy(dx: stroke / 2, dy: stroke / 2)
+            let path = CGPath(roundedRect: rect, cornerWidth: 185, cornerHeight: 185, transform: nil)
+            context.addPath(path)
+            context.setFillColor(NSColor(Theme.Colors.sun).cgColor)
+            context.fillPath()
+            context.addPath(path)
+            context.setStrokeColor(NSColor(Theme.Colors.ink).cgColor)
+            context.setLineWidth(stroke)
+            context.strokePath()
+            context.interpolationQuality = .none
+            let size = CGSize(width: kore.width * scale, height: kore.height * scale)
+            context.draw(sprite, in: CGRect(x: ((canvas - size.width) / 2).rounded(), y: ((canvas - size.height) / 2).rounded(),
+                                            width: size.width, height: size.height))
+            return true
+        }
+    }
+}
+
 public enum KorekoreMenuIcon {
     public static func image(for picture: BoxPicture) -> NSImage {
         let mood = picture.mood

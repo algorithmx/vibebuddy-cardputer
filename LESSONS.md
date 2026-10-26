@@ -299,6 +299,8 @@ Testing on the Omarchy box, `ssh box '...; pkill -f fake_daemon.py; ...'` killed
 
 Over SSH, match by something the shell's own command line can't contain: a PID kept from when you started the process (`cmd & PID=$!`, then `kill $PID`), an exact executable with `pkill -x` on the process name, or put the steps in a script file and run that. After a 255, check what state the box was left in before going on.
 
+It happened twice more, on 2026-10-24 and 2026-10-26. The second time the pattern was written `[t]arget/debug/...` so it couldn't match itself, but the same command also set `B=.../target/debug/vibebuddy-desktop` to launch the app, and that text matched. A bracket only hides the pattern, not every other place the path appears in the command. Anchor the pattern to the start of the process's own command line instead (`pkill -f '^/home/beclab/.../vibebuddy-desktop'`): the shell's command line starts with `bash -c`, so it can never match.
+
 ## Install from up-to-date main, not from whatever the worktree happens to hold
 
 On 2026-10-09 I had dragon run `just install` in a worktree branched before #99, which renamed the bundle to `VibeBuddy.app`. The worktree's `build-app.sh` still installed to `/Applications/Vibe Buddy.app`, so the new build landed next to the app in daily use instead of replacing it, and two copies fought over the box and port 7331.

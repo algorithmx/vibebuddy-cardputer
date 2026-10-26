@@ -5,8 +5,10 @@
 // The views that use all this come in the next steps.
 #![allow(dead_code)]
 
+mod account;
 mod controls;
-mod pages;
+mod guide;
+pub(crate) mod pages;
 pub mod picture;
 #[cfg(test)]
 mod snapshots;
@@ -14,7 +16,6 @@ pub mod sprites;
 pub mod theme;
 pub mod view;
 
-use iced::Task;
 use iced::widget::image;
 
 use crate::i18n::tr;
@@ -24,17 +25,16 @@ pub fn requested() -> bool {
     std::env::var("VIBEBUDDY_UI").is_ok_and(|ui| ui == "korekore")
 }
 
-/// The bundled fonts (fonts/korekore), registered with iced only when the korekore UI is on.
-const FONTS: [&[u8]; 4] = [
+/// The bundled fonts (fonts/korekore), registered with iced at start only when the korekore UI is on.
+pub const FONTS: [&[u8]; 4] = [
     include_bytes!("../../../fonts/korekore/MPLUSRounded1c-Regular.ttf"),
     include_bytes!("../../../fonts/korekore/MPLUSRounded1c-Bold.ttf"),
     include_bytes!("../../../fonts/korekore/MPLUSRounded1c-ExtraBold.ttf"),
     include_bytes!("../../../fonts/korekore/DotGothic16-Regular.ttf"),
 ];
 
-pub fn load_fonts<T: Send + 'static>() -> Task<T> {
-    Task::batch(FONTS.map(|font| iced::font::load(font).discard()))
-}
+/// Text that names no font: M PLUS Rounded 1c, regular.
+pub const DEFAULT_FONT: iced::Font = theme::typography::BODY.font;
 
 /// A palette-indexed sprite: one index per pixel, row by row; 0 is transparent and n is `palette[n - 1]`,
 /// as 0xRRGGBB.
