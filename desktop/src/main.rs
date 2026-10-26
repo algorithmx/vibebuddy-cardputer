@@ -222,7 +222,7 @@ enum Message {
     Done(Result<(), String>),
     Quit,
     /// A section picked in the korekore UI's sidebar (ADR-0021).
-    Korekore(korekore::view::Pick),
+    Korekore(korekore::Section),
 }
 
 #[cfg(target_os = "linux")]
@@ -328,9 +328,8 @@ struct App {
     /// VibeBuddy's Omarchy plugin is in the bar, showing the face; the tray icon would be a second one.
     #[cfg(target_os = "linux")]
     plugin: bool,
-    /// The korekore UI's section, when it was asked for at launch (`VIBEBUDDY_UI=korekore`, ADR-0021); None keeps
-    /// the current UI.
-    korekore: Option<korekore::Section>,
+    /// The korekore UI was asked for at launch (`VIBEBUDDY_UI=korekore`, ADR-0021); its sections are the tabs.
+    korekore: bool,
 }
 
 /// Making a Character: the preset it starts from, its lines as edited (occasions stay, each keeps a line), the voice,
@@ -361,7 +360,8 @@ impl App {
             theme: theme::load(),
             theme_stamp: theme::stamp(),
             settings: None,
-            tab: Tab::General,
+            // The korekore sidebar starts on Character, as the design does.
+            tab: if korekore::requested() { Tab::Sound } else { Tab::General },
             guide: None,
             volume: None,
             screenshot: None,
@@ -409,7 +409,7 @@ impl App {
             tray: None,
             #[cfg(target_os = "linux")]
             plugin: plugin_in_omarchy_bar(),
-            korekore: korekore::requested().then_some(korekore::Section::Character),
+            korekore: korekore::requested(),
         };
         // The first launch shows the window, so it's clear where the app went; later ones stay in the tray, unless a
         // language change restarted the app from its window. Without a tray (macOS builds, for development) the
@@ -561,7 +561,7 @@ impl App {
                 }
                 // The same as the Mac's: room for the whole Character tab, resizable down to the old size. The
                 // korekore window is the design's 960 × 772, down to 900 × 760.
-                let (size, min_size) = if self.korekore.is_some() {
+                let (size, min_size) = if self.korekore {
                     (iced::Size::new(960.0, 772.0), iced::Size::new(900.0, 760.0))
                 } else {
                     (iced::Size::new(760.0, 640.0), iced::Size::new(640.0, 480.0))
@@ -1175,7 +1175,8 @@ impl App {
                 }
             }
             Message::Quit => return iced::exit(),
-            Message::Korekore(korekore::view::Pick(section)) => self.korekore = Some(section),
+            // The korekore sections are the tabs, so what a tab does on opening happens here too.
+            Message::Korekore(section) => return Task::done(Message::Tab(section.tab())),
         }
         Task::none()
     }
@@ -1212,7 +1213,7 @@ impl App {
         #[cfg(target_os = "linux")]
         if let Some(TrayHandle(handle)) = self.tray.clone() {
             let menu = MenuState::derive(self.status.as_ref());
-            let kore = self.korekore.map(|_| korekore::picture::BoxPicture::derive(self.status.as_ref()));
+            let kore = self.korekore.then(|| korekore::picture::BoxPicture::derive(self.status.as_ref()));
             let [r, g, b, _] = self.theme.palette().text.into_rgba8();
             return Task::future(async move {
                 handle
@@ -1229,8 +1230,8 @@ impl App {
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
-        if let Some(section) = self.korekore {
-            return self.korekore(section);
+        if self.korekore {
+            return self.korekore(korekore::Section::of(self.tab));
         }
         if let Some(page) = self.guide {
             return self.guide(page);
@@ -1279,8 +1280,7 @@ impl App {
             .filter(|&section| section != korekore::Section::Conversation || self.resident)
             .collect();
         let picture = korekore::picture::BoxPicture::derive(self.status.as_ref());
-        korekore::view::settings(&picture, &sections, section, env!("CARGO_PKG_VERSION"), korekore::view::pending())
-            .map(Message::Korekore)
+        korekore::view::settings(&picture, &sections, section, env!("CARGO_PKG_VERSION"), Message::Korekore, self.korekore_page(section))
     }
 
     /// First run on Linux: what the install script couldn't do. It already connected the agents and set up the start

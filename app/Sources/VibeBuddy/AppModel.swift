@@ -126,6 +126,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+    /// Debug builds only: shows a sample status without a daemon, for the korekore page snapshots.
+    func showSample(_ status: Status) {
+        self.status = status
+        daemonAlive = true
+        refreshMenu()
+    }
+    #endif
+
     func refreshMadeCharacters() {
         Task {
             if let made = try? await client.madeCharacters() { madeCharacters = made }
