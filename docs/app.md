@@ -28,7 +28,7 @@ The app is VibeBuddy's graphical interface on the Mac: a menu bar icon plus a se
 
 It keeps using local HTTP on `127.0.0.1:7331`. New additions:
 
-- `GET /v1/status`: link, current mode, firmware and daemon build identifiers, today's stats, and the time of the most recent hook event.
+- `GET /v1/status`: link, current mode, firmware and daemon build identifiers, today's stats, the live Activities (`activities`: agent, task-card title, project, `working`/`needs_input`, newest first, as the resident session's `list_activities` gives them; the korekore sidebar draws the box from them), and the time of the most recent hook event.
 - `GET /v1/status/stream`: SSE, pushed whenever the status changes.
 - `GET /v1/resident` and `GET /v1/resident/history`: whether the resident session is on and ready (Codex installed and signed in, or Claude Code installed with the user's Anthropic API key), which Agent answers, a change marker for its history, and its last exchanges, for the Conversation tab; `PUT /v1/resident/brain` and `PUT`/`DELETE /v1/resident/anthropic-key` for its settings, which are kept out of `/v1/config` (the key is never sent back).
 - `POST /v1/account/sign-in`, `POST /v1/account/sign-out`, `POST /v1/account/refresh` (today's use and the plan) and `DELETE /v1/account` for the VibeBuddy account (ADR-0018). Signing in answers a URL for the App to open in the browser, which comes back to the daemon's own `/v1/account/callback`; the session is the daemon's (`config_dir()/account`) and never reaches the App, which learns of the result from `account` in the status stream.

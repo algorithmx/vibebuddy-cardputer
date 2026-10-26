@@ -10,6 +10,9 @@ public struct Status: Codable, Equatable {
     public var config: DaemonConfig
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     public var updates: UpdateStatus?
+    /// Every Activity, newest first, as the box's task cards show them; absent from older daemons.
+    public var activities: [ActivitySummary]?
+
     /// The person's VibeBuddy account (ADR-0018); absent from older daemons, which can't sign in.
     public var account: AccountStatus?
     /// Which of the user's own keys for spoken replies are set (ADR-0020); absent from older daemons.
@@ -18,9 +21,9 @@ public struct Status: Codable, Equatable {
     /// and from older daemons.
     public var making: MakingStatus?
 
-    enum CodingKeys: String, CodingKey { case daemon, device, today, hooks, operation, config, updates, account, voiceKeys = "voice_keys", making }
+    enum CodingKeys: String, CodingKey { case daemon, device, today, hooks, operation, config, updates, account, voiceKeys = "voice_keys", making, activities }
 
-    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil, account: AccountStatus? = nil, voiceKeys: VoiceKeysStatus? = nil, making: MakingStatus? = nil) {
+    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil, account: AccountStatus? = nil, voiceKeys: VoiceKeysStatus? = nil, making: MakingStatus? = nil, activities: [ActivitySummary]? = nil) {
         self.daemon = daemon
         self.device = device
         self.today = today
@@ -28,9 +31,28 @@ public struct Status: Codable, Equatable {
         self.operation = operation
         self.config = config
         self.updates = updates
+        self.activities = activities
         self.account = account
         self.voiceKeys = voiceKeys
         self.making = making
+    }
+}
+
+/// One Activity as the daemon summarises it (daemon/src/activity.rs `ActivitySummary`).
+public struct ActivitySummary: Codable, Equatable, Sendable {
+    /// `codex`, `claude-code`, `github-actions`, or the agent a CLI hook names (`opencode`, `copilot`, `pi`).
+    public var agent: String
+    /// The task card's title, with the prefix that tells agents apart (`CC:`, `CX:`…).
+    public var title: String
+    public var project: String?
+    /// `working` or `needs_input`.
+    public var state: String
+
+    public init(agent: String, title: String, project: String? = nil, state: String) {
+        self.agent = agent
+        self.title = title
+        self.project = project
+        self.state = state
     }
 }
 
