@@ -18,6 +18,8 @@ struct KorekoreGeneralPage: View {
                               color: Theme.Colors.ink)
                     }
                 }
+                KorekoreAccountCard(model: model)
+                Text("This Mac").font(.rounded(15)).padding(.leading, 4)
                 KRows {
                     KRow(String(localized: "Language")) {
                         // The dialog runs after this update rather than as a nested modal loop inside the menu's action.

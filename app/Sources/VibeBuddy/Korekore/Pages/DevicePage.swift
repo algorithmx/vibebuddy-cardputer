@@ -163,6 +163,9 @@ struct KorekoreDevicePage: View {
             VStack(alignment: .leading, spacing: 10) {
                 KHeading(String(localized: "The box"))
                 field(String(localized: "Link")) { Text(verbatim: linkText) }
+                if !connected, let relayRefusal {
+                    KNote(relayRefusal, color: Theme.Colors.korePinkText)
+                }
                 field(String(localized: "Firmware")) { firmwareLine }
                 Spacer(minLength: 8)
                 if model.firmwareUpdateAvailable, connected, !canFlash {
@@ -198,6 +201,16 @@ struct KorekoreDevicePage: View {
             Text(verbatim: "\(version) ") + Text(String(localized: "· up to date").uppercased()).foregroundColor(Theme.Colors.doneText)
         } else {
             Text(verbatim: version)
+        }
+    }
+
+    /// Why the Relay won't carry the link, shown while the box is away (ADR-0020).
+    private var relayRefusal: String? {
+        switch device?.relayRefused {
+        case nil: nil
+        case "signed_out": String(localized: "Sign in to use the Relay.")
+        case "plan": String(localized: "The Relay needs the Paid plan.")
+        default: String(localized: "The Relay can't check the account right now. VibeBuddy tries again later.")
         }
     }
 

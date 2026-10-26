@@ -103,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows a window with a Dock icon, so it can be found again; the icon goes when the last window closes.
     private func present(_ window: NSWindow) {
         NSApp.setActivationPolicy(.regular)
+        // The Dock tile takes the bundle's icon each time it appears, so the korekore one goes on after it.
+        if AppUI.atLaunch() == .korekore { NSApp.applicationIconImage = KorekoreAppIcon.image() }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
