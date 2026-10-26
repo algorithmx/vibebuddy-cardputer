@@ -10,6 +10,8 @@ The existing Character pack write (`voice.*`, `docs/protocol.md`) is stop and wa
 
 We decided that firmware images and Character packs travel the same way: a chunked, windowed, resumable transfer made of VibeBuddy Protocol lines, so it works identically over USB, the local network and the Relay, inside the link's Noise session off the cable (ADR-0015).
 
+Amended 2026-10-26 (#198): over the UART bridge a chunk does go missing without the link dropping, because the bridge damages a line now and then. A chunk that fails its `crc`, or whose base64 doesn't decode, no longer ends the transfer with `crc`: the box acknowledges the offset it still expects, as for a chunk at another offset. When that offset comes back again while later chunks went, the daemon sends again from there at once, not after a timeout and a resume.
+
 ## Decision
 
 **Who may send**

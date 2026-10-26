@@ -2173,11 +2173,8 @@ impl Firmware {
                     return self.after_transfer(board);
                 };
                 let mut bytes = alloc::vec![0u8; transfer::CHUNK_BYTES + 3];
-                let Some(length) = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes) else {
-                    self.transfer.cancel();
-                    Self::transfer_error(board, transfer::Error::BadMessage);
-                    return self.after_transfer(board);
-                };
+                // Base64 the UART bridge damaged decodes to nothing, and the chunk is asked for again.
+                let length = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes).unwrap_or(0);
                 match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
                     Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
                     Err(failure) => Self::transfer_error(board, failure),

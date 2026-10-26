@@ -1592,10 +1592,29 @@ mod transfer {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
         begin_transfer(&mut firmware, &mut board, &begin);
-        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&[0xE9; 100]));
-        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "crc"}));
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &[0x55; 100]), base64(&[0x55; 100]));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "bad_image"}));
         assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sequence");
         assert_eq!(board.restarts, 0);
+    }
+
+    /// The UART bridge changes bytes on the way: a chunk that fails its CRC, or whose base64 doesn't decode, is asked
+    /// for again with the offset the box still expects, and the transfer carries on.
+    #[test]
+    fn a_damaged_chunk_is_asked_for_again() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; 100];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let ack = |offset: u64| serde_json::json!({"version": 1, "event": "xfer.ack", "offset": offset});
+        let bad_crc = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_crc)), ack(0));
+        let bad_base64 = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, "!".repeat(136));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_base64)), ack(0));
+        let good = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &image), base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &good)), ack(100));
     }
 }
 /// Polls until `MIC END` and returns every line.
