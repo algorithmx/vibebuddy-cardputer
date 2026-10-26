@@ -2,7 +2,8 @@
 //! docs/protocol.md "Firmware and Character packs over the link"). The image goes as `xfer.chunk` lines of at most [`CHUNK_BYTES`], up to [`WINDOW`]
 //! of them unacknowledged; the box acknowledges each with the next offset it expects. When the link drops or
 //! moves (the Relay to the cable, say), the daemon waits for it to come back and asks again with `xfer.begin`,
-//! and the box answers with where it got to.
+//! and the box answers with where it got to. A box that forgot the transfer (it restarted) answers `sequence`, and
+//! the daemon asks again the same way.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,9 @@ const RESUMES: u32 = 10;
 enum Stop {
     /// The link dropped or moved, or the box went quiet: resume from where it got to.
     Resume,
+    /// The box answered `sequence`: it has no transfer, say after a restart. Ask again too; but answers like this
+    /// one that come before `xfer.ready` are for chunks sent before the `xfer.begin`, and change nothing.
+    Lost,
     /// The box refused, with its code; or something that resuming won't fix.
     Fail(String),
 }
@@ -95,6 +99,9 @@ async fn answer_event(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Dur
                 if code == "cancelled" {
                     return Err(Stop::Fail("cancelled on the box".to_owned()));
                 }
+                if code == "sequence" {
+                    return Err(Stop::Lost);
+                }
                 return Err(Stop::Fail(format!("the box refused the image: {code}")));
             }
             DeviceMessage::Event(event) if event.event.starts_with("xfer.") => return Ok(event),
@@ -126,10 +133,10 @@ async fn send_from_box(
 ) -> Result<(), Stop> {
     send(transport, begin_event(kind, image.len(), sha256)).await.map_err(|_| Stop::Resume)?;
     let mut acked = loop {
-        if let (name, Some(offset)) = answer(bus, READY_TIMEOUT).await?
-            && name == "xfer.ready"
-        {
-            break offset;
+        match answer(bus, READY_TIMEOUT).await {
+            Ok((name, Some(offset))) if name == "xfer.ready" => break offset,
+            Ok(_) | Err(Stop::Lost) => {}
+            Err(stop) => return Err(stop),
         }
     };
     let mut next = acked;
@@ -173,12 +180,12 @@ pub async fn send_image(
                     Ok(done) if done.event == "xfer.done" => return Ok(done),
                     Ok(other) => return Err(format!("unexpected {} at the end", other.event)),
                     // The box keeps what it has: asking again carries on, and ends again.
-                    Err(Stop::Resume) => {}
+                    Err(Stop::Resume | Stop::Lost) => {}
                     Err(Stop::Fail(why)) => return Err(why),
                 }
             }
             Err(Stop::Fail(why)) => return Err(why),
-            Err(Stop::Resume) => {}
+            Err(Stop::Resume | Stop::Lost) => {}
         }
         resumes += 1;
         if resumes > RESUMES {
@@ -215,9 +222,20 @@ mod tests {
 
     /// Plays the box: takes chunks in order, acknowledges each with the next offset, and on xfer.begin
     /// answers where it got to. `drop_after` chunks in, it drops the link once and loses what was in flight.
+    /// `forget_after` chunks in, it restarts once without the link noticing: it forgets the transfer and answers
+    /// `sequence` until the next xfer.begin.
     struct FakeBox {
         bus: broadcast::Sender<DeviceMessage>,
-        state: Mutex<(usize, Vec<u8>, Option<usize>)>,
+        state: Mutex<BoxState>,
+    }
+
+    #[derive(Default)]
+    struct BoxState {
+        next: usize,
+        written: Vec<u8>,
+        drop_after: Option<usize>,
+        forget_after: Option<usize>,
+        forgotten: bool,
     }
 
     impl Transport for FakeBox {
@@ -230,11 +248,32 @@ mod tests {
                 }
                 let _ = self.bus.send(DeviceMessage::Event(event));
             };
+            let sequence = || {
+                let mut event = Event::named("xfer.error");
+                event.extra.insert("code".to_owned(), "sequence".into());
+                let _ = self.bus.send(DeviceMessage::Event(event));
+            };
             let mut state = self.state.lock().unwrap();
-            let (next, written, drop_after) = &mut *state;
+            let BoxState { next, written, drop_after, forget_after, forgotten } = &mut *state;
             match value["event"].as_str().unwrap() {
-                "xfer.begin" => reply("xfer.ready", Some(*next)),
+                "xfer.begin" => {
+                    *forgotten = false;
+                    reply("xfer.ready", Some(*next));
+                }
                 "xfer.chunk" => {
+                    if *forget_after == Some(0) {
+                        *forget_after = None;
+                        *forgotten = true;
+                        *next = 0;
+                        written.clear();
+                    }
+                    if *forgotten {
+                        sequence();
+                        return Ok(());
+                    }
+                    if let Some(count) = forget_after {
+                        *count -= 1;
+                    }
                     if *drop_after == Some(0) {
                         *drop_after = None;
                         let _ = self.bus.send(DeviceMessage::Disconnected);
@@ -253,6 +292,7 @@ mod tests {
                     }
                     reply("xfer.ack", Some(*next));
                 }
+                "xfer.end" if *forgotten => sequence(),
                 "xfer.end" => reply("xfer.done", None),
                 other => panic!("unexpected {other}"),
             }
@@ -260,13 +300,22 @@ mod tests {
         }
     }
 
-    async fn run(image: Vec<u8>, drop_after: Option<usize>) -> (Result<(), String>, Vec<u8>, usize) {
+    async fn run(image: Vec<u8>, state: BoxState) -> (Result<(), String>, Vec<u8>, usize) {
         let (bus, receiver) = broadcast::channel(1024);
-        let fake = Arc::new(FakeBox { bus, state: Mutex::new((0, Vec::new(), drop_after)) });
+        run_on(image, state, bus, receiver).await
+    }
+
+    async fn run_on(
+        image: Vec<u8>,
+        state: BoxState,
+        bus: broadcast::Sender<DeviceMessage>,
+        receiver: broadcast::Receiver<DeviceMessage>,
+    ) -> (Result<(), String>, Vec<u8>, usize) {
+        let fake = Arc::new(FakeBox { bus, state: Mutex::new(state) });
         let resumed = Arc::new(Mutex::new(0));
         let counter = resumed.clone();
         let result = send_image(fake.clone(), receiver, "firmware", image, |_| {}, move || *counter.lock().unwrap() += 1).await.map(|_| ());
-        let written = std::mem::take(&mut fake.state.lock().unwrap().1);
+        let written = std::mem::take(&mut fake.state.lock().unwrap().written);
         let resumed = *resumed.lock().unwrap();
         (result, written, resumed)
     }
@@ -274,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn the_whole_image_arrives_in_order() {
         let image: Vec<u8> = (0..20_000).map(|index| (index * 31) as u8).collect();
-        let (result, written, resumed) = run(image.clone(), None).await;
+        let (result, written, resumed) = run(image.clone(), BoxState::default()).await;
         assert_eq!(result, Ok(()));
         assert_eq!(written, image);
         assert_eq!(resumed, 0);
@@ -283,10 +332,35 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_link_resumes_where_the_box_got_to() {
         let image: Vec<u8> = (0..30_000).map(|index| (index * 17) as u8).collect();
-        let (result, written, resumed) = run(image.clone(), Some(3)).await;
+        let (result, written, resumed) = run(image.clone(), BoxState { drop_after: Some(3), ..BoxState::default() }).await;
         assert_eq!(result, Ok(()));
         assert_eq!(written, image, "nothing written twice, nothing missing");
         assert_eq!(resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_box_that_forgot_the_transfer_starts_over() {
+        let image: Vec<u8> = (0..30_000).map(|index| (index * 13) as u8).collect();
+        let (result, written, resumed) = run(image.clone(), BoxState { forget_after: Some(3), ..BoxState::default() }).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(written, image);
+        assert_eq!(resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_sequence_errors_dont_fail_the_next_transfer() {
+        let image: Vec<u8> = (0..20_000).map(|index| (index * 7) as u8).collect();
+        let (bus, receiver) = broadcast::channel(1024);
+        // Chunks of an earlier transfer, still reaching a box that has forgotten it.
+        for _ in 0..WINDOW {
+            let mut event = Event::named("xfer.error");
+            event.extra.insert("code".to_owned(), "sequence".into());
+            bus.send(DeviceMessage::Event(event)).unwrap();
+        }
+        let (result, written, resumed) = run_on(image.clone(), BoxState::default(), bus, receiver).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(written, image);
+        assert_eq!(resumed, 0);
     }
 
     #[test]
