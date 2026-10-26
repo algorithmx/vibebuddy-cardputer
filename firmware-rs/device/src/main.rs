@@ -554,10 +554,7 @@ async fn main(spawner: Spawner) -> ! {
                 break;
             }
             for &byte in &input[..count] {
-                if uart_line.len() < 2048 {
-                    uart_line.push(byte);
-                }
-                if byte == b'\n' {
+                if vibebuddy_firmware_core::firmware::hold_line_byte(&mut uart_line, byte) {
                     firmware.receive(&mut board, &uart_line);
                     uart_line.clear();
                 }

@@ -33,7 +33,6 @@ pub enum Error {
     /// A kind this firmware can't take, or a box without the OTA layout.
     Unsupported,
     TooBig,
-    Crc,
     Sha256,
     /// Not an ESP32-S3 app image.
     BadImage,
@@ -50,7 +49,6 @@ impl Error {
         match self {
             Self::Unsupported => "unsupported",
             Self::TooBig => "too_big",
-            Self::Crc => "crc",
             Self::Sha256 => "sha256",
             Self::BadImage => "bad_image",
             Self::Flash => "flash",
@@ -210,8 +208,13 @@ impl Transfer {
         if offset != image.next {
             return Ok(image.next);
         }
-        if data.is_empty() || data.len() > CHUNK_BYTES || crc32(0, data) != crc {
-            return Err(if data.len() > CHUNK_BYTES { Error::TooBig } else { Error::Crc });
+        if data.len() > CHUNK_BYTES {
+            return Err(Error::TooBig);
+        }
+        // The UART bridge changes a byte now and then without changing the length: a chunk that doesn't match its CRC
+        // is asked for again, as one that went missing is.
+        if data.is_empty() || crc32(0, data) != crc {
+            return Ok(image.next);
         }
         let end = offset + data.len() as u32;
         if end > image.size {
@@ -409,7 +412,8 @@ mod tests {
 
         let image = test_image(4_000);
         start(&mut transfer, &mut flash, &image, sha(&image));
-        assert_eq!(transfer.chunk(&mut flash, 0, &image[..CHUNK_BYTES], 1), Err(Error::Crc));
+        assert_eq!(transfer.chunk(&mut flash, 0, &image[..CHUNK_BYTES], 1), Ok(0), "a damaged chunk is asked for again");
+        assert!(transfer.active());
 
         start(&mut transfer, &mut flash, &image, [0; 32]);
         send(&mut transfer, &mut flash, &image, 0);

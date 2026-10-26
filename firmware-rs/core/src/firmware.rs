@@ -367,6 +367,16 @@ fn occasion_label(occasion: Occasion) -> &'static str {
     }
 }
 
+/// Holds a byte from the UART until its line is whole, for [`Firmware::receive`]; true once `byte` ended the line.
+/// It keeps as much as `receive` takes, so a transfer chunk gets through whole and an overlong line still arrives as
+/// overlong. The newline always goes in: without it the line would run into the next.
+pub fn hold_line_byte(line: &mut Vec<u8>, byte: u8) -> bool {
+    if byte == b'\n' || line.len() < LINE_BUFFER_BYTES {
+        line.push(byte);
+    }
+    byte == b'\n'
+}
+
 impl Firmware {
     pub fn new(seed: u32, now_ms: u32, build: &[u8], version: &str) -> Self {
         Self {
@@ -2163,13 +2173,17 @@ impl Firmware {
                     return self.after_transfer(board);
                 };
                 let mut bytes = alloc::vec![0u8; transfer::CHUNK_BYTES + 3];
-                let Some(length) = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes) else {
-                    self.transfer.cancel();
-                    Self::transfer_error(board, transfer::Error::BadMessage);
-                    return self.after_transfer(board);
-                };
+                // Base64 the UART bridge damaged decodes to nothing, and the chunk is asked for again.
+                let length = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes).unwrap_or(0);
                 match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
-                    Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    // The computer's round goes back with the answer: it tells answers to chunks sent again apart.
+                    Ok(next) => match number(fields, "round") {
+                        Some(round) => {
+                            let line = text!(96, "{{\"version\":1,\"event\":\"xfer.ack\",\"offset\":{},\"round\":{}}}\n", next, round as u64);
+                            board.write(line.as_bytes());
+                        }
+                        None => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    },
                     Err(failure) => Self::transfer_error(board, failure),
                 }
             }
