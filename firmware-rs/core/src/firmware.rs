@@ -367,6 +367,16 @@ fn occasion_label(occasion: Occasion) -> &'static str {
     }
 }
 
+/// Holds a byte from the UART until its line is whole, for [`Firmware::receive`]; true once `byte` ended the line.
+/// It keeps as much as `receive` takes, so a transfer chunk gets through whole and an overlong line still arrives as
+/// overlong. The newline always goes in: without it the line would run into the next.
+pub fn hold_line_byte(line: &mut Vec<u8>, byte: u8) -> bool {
+    if byte == b'\n' || line.len() < LINE_BUFFER_BYTES {
+        line.push(byte);
+    }
+    byte == b'\n'
+}
+
 impl Firmware {
     pub fn new(seed: u32, now_ms: u32, build: &[u8], version: &str) -> Self {
         Self {
