@@ -1,4 +1,4 @@
-//! Voice commands from a box linked over USB or the local network (ADR-0017; docs/protocol.md, "Voice commands
+//! Voice commands from a box linked over USB, the local network or the Relay (ADR-0017, ADR-0018; docs/protocol.md, "Voice commands
 //! (experimental)").
 //!
 //! The box records while K0 is held and sends the audio as `VOICE` diagnostic lines: 24 kHz mono IMA ADPCM, each
@@ -313,10 +313,10 @@ impl Voice {
         Self { synthesizer, ..self }
     }
 
-    /// Voice is offered when speech recognition is configured and the resident session is on and ready: the user's
-    /// Codex is installed and logged in.
+    /// Voice is offered when speech recognition can be asked (the voice service needs the person signed in to their
+    /// account, ADR-0018) and the resident session is on and ready: the user's Codex is installed and logged in.
     pub fn available(&self) -> bool {
-        self.recognizer.is_some() && self.resident.as_ref().is_some_and(|resident| resident.ready())
+        self.recognizer.as_ref().is_some_and(|recognizer| recognizer.ready()) && self.resident.as_ref().is_some_and(|resident| resident.ready())
     }
 
     /// Takes one `VOICE` line from the box. A turn that ends starts a task, returned so tests can wait for it;
@@ -484,6 +484,9 @@ fn speak(
     }
     let voice = synthesis::voice_for(character);
     let voice = voice.as_str();
+    if !synthesizer.speaks(voice) {
+        return;
+    }
     let started = Instant::now();
     let (mut seq, mut bytes, mut first_byte_ms) = (0, 0, None);
     let result = synthesizer.synthesize(text, voice, &mut |piece| {
@@ -574,13 +577,13 @@ async fn answer_turn(
     let wav = wav(&audio);
     let heard = tokio::task::spawn_blocking(move || recognizer.recognize(&wav))
         .await
-        .unwrap_or_else(|error| Err(error.to_string()));
+        .unwrap_or_else(|error| Err(error.to_string().into()));
     let recognised_ms = started.elapsed().as_millis() as u64;
     let transcript = match heard {
         Ok(transcript) => transcript,
         Err(error) => {
             warn!(turn, %error, "speech recognition failed");
-            events.send(error_event(turn, "unavailable", &error));
+            events.send(error_event(turn, error.reason, &error.message));
             return;
         }
     };
@@ -805,11 +808,11 @@ pub mod tests {
     }
 
     impl Recognizer for FakeRecognizer {
-        fn recognize(&self, wav: &[u8]) -> Result<crate::speech::Transcript, String> {
+        fn recognize(&self, wav: &[u8]) -> Result<crate::speech::Transcript, crate::speech::RecognitionError> {
             self.heard.lock().unwrap().push(wav.to_vec());
             self.answer
                 .map(|text| crate::speech::Transcript { text: text.to_owned(), language: Some("en".to_owned()) })
-                .map_err(str::to_owned)
+                .map_err(|message| message.to_owned().into())
         }
     }
 
@@ -1188,7 +1191,7 @@ pub mod tests {
         let path = std::env::var("VIBEBUDDY_E2E_WAV").expect("VIBEBUDDY_E2E_WAV names a recording");
         let (left, rate) = left_channel(&std::fs::read(path).unwrap());
         assert_eq!(rate, SAMPLE_RATE, "the box records at 24 kHz");
-        let recognizer = crate::speech::from_env().expect("a speech recognizer is configured");
+        let recognizer = crate::speech::from_env(None).expect("a speech recognizer is configured");
         let dir = temp_dir("voice-e2e");
         let resident = Arc::new(Resident::new(true, &dir, crate::resident::Launcher::Codex, Arc::default()));
         let voice = Voice::new(Some(recognizer), Some(resident));
@@ -1226,7 +1229,7 @@ pub mod tests {
     #[ignore = "uses the network and the voice service"]
     fn e2e_spoken_replies_through_the_real_voice_service() {
         let out = std::path::PathBuf::from(std::env::var("VIBEBUDDY_E2E_OUT").expect("VIBEBUDDY_E2E_OUT names a directory"));
-        let synthesizer = synthesis::from_env().expect("a voice service");
+        let synthesizer = synthesis::from_env(None, Arc::new(crate::voice_keys::VoiceKeys::new(None)));
         for (name, character, text) in [
             ("zh", Some("wanwanxiaohe"), "两个智能体正在工作，有一个在等你回复。"),
             ("en", Some("ada"), "Two agents are working, and one of them is waiting for you."),

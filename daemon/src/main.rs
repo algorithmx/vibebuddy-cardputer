@@ -1,3 +1,4 @@
+mod account;
 mod activity;
 mod app_server;
 mod ci;
@@ -12,6 +13,7 @@ mod relay;
 mod resident;
 mod resident_claude;
 mod link_alert;
+mod making;
 mod occasions;
 mod persona;
 mod rom_flasher;
@@ -25,6 +27,7 @@ mod transfer;
 mod synthesis;
 mod updates;
 mod voice;
+mod voice_keys;
 mod voice_writer;
 
 use std::convert::Infallible;
@@ -111,6 +114,12 @@ struct AppState {
     /// What the App said about the Character pack it last wrote (who lends a custom one, the form of address),
     /// kept in [`persona::RECORD_FILE`] in the state directory.
     written: Arc<Mutex<persona::Written>>,
+    /// The person's VibeBuddy account (ADR-0018); unavailable in tests unless one sets it.
+    account: Arc<account::Account>,
+    /// The user's own keys for spoken replies (ADR-0020); none can be set in tests unless one sets it.
+    voice_keys: Arc<voice_keys::VoiceKeys>,
+    /// Making a Character's line audio (ADR-0020); nothing can be made in tests unless one sets it.
+    making: Arc<making::Maker>,
 }
 
 impl AppState {
@@ -126,6 +135,8 @@ impl AppState {
             .unwrap_or_default();
         let (device_bus, _) = broadcast::channel(1024);
         let (status_changed, _) = broadcast::channel(64);
+        let account = Arc::new(account::Account::new(None, None, 7331));
+        let voice_keys = Arc::new(voice_keys::VoiceKeys::new(None));
         Self {
             transport,
             activities: Arc::new(Mutex::new(activities)),
@@ -148,6 +159,9 @@ impl AppState {
             voice: Arc::new(voice::Voice::new(None, None)),
             noise_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             written: Arc::default(),
+            making: Arc::new(making::Maker::new(None, None, account.clone(), voice_keys.clone())),
+            account,
+            voice_keys,
         }
     }
 
@@ -160,7 +174,8 @@ impl AppState {
     }
 
     async fn snapshot(&self) -> Status {
-        let device = self.device.lock().await.clone();
+        let mut device = self.device.lock().await.clone();
+        device.relay_refused = self.relay.as_ref().and_then(relay::RelayConfig::refused);
         let updates = self.updates.lock().await.status(&device, self.update_checks_enabled().await);
         let (today, activities) = {
             let tracker = self.activities.lock().await;
@@ -179,6 +194,9 @@ impl AppState {
             operation: self.operation.lock().await.clone(),
             config: self.config.lock().await.clone(),
             updates,
+            account: self.account.status(),
+            voice_keys: self.voice_keys.status(),
+            making: self.making.status(),
         }
     }
 
@@ -229,6 +247,11 @@ async fn main() {
         }
         None => None,
     };
+    let account = Arc::new(account::Account::new(
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        config::config_dir().as_deref(),
+        bind_address.port(),
+    ));
     let mut serial_config = SerialConfig::from_env(known_box_file());
     let mut relay_config = None;
     // Paired, the box can also be reached over the local network when it isn't on the cable (ADR-0012).
@@ -240,7 +263,7 @@ async fn main() {
             discovery: lan::Discovery::default(),
         });
         // VIBEBUDDY_RELAY_URL points at another Relay, such as `ws://127.0.0.1:8787` under `wrangler dev`.
-        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release());
+        let relay = relay::RelayConfig::new(identity.clone(), std::env::var("VIBEBUDDY_RELAY_URL").ok(), relay::release()).with_account(account.clone());
         serial_config = serial_config.with_relay(relay.clone());
         relay_config = Some(relay);
     }
@@ -268,6 +291,7 @@ async fn main() {
     }
     state.identity = identity;
     state.relay = relay_config;
+    state.account = account;
     state.state_dir = config::state_dir();
     if let Some(dir) = &state.state_dir {
         state.written = Arc::new(Mutex::new(persona::Written::load(&dir.join(persona::RECORD_FILE))));
@@ -283,7 +307,20 @@ async fn main() {
             None => resident,
         })
     });
-    state.voice = Arc::new(voice::Voice::new(speech::from_env(), state.resident.clone()).with_synthesizer(synthesis::from_env()));
+    let session = Some(state.account.clone());
+    state.voice_keys = Arc::new(voice_keys::VoiceKeys::new(config::config_dir().as_deref()));
+    let synthesizer = synthesis::from_env(session.clone(), state.voice_keys.clone());
+    let made = config::config_dir().map(|dir| dir.join("characters"));
+    if let Some(made) = &made {
+        let _ = making::DIR.set(made.clone());
+    }
+    state.making = Arc::new(making::Maker::new(
+        made,
+        synthesis::service_base(env::var(synthesis::BASE_URL_VARIABLE).ok(), relay::release()),
+        state.account.clone(),
+        state.voice_keys.clone(),
+    ));
+    state.voice = Arc::new(voice::Voice::new(speech::from_env(session), state.resident.clone()).with_synthesizer(Some(synthesizer)));
     if let Some(resident) = state.resident.clone() {
         let wearing = wearing(&state).await;
         tokio::spawn(async move { resident.warm(&wearing).await });
@@ -308,6 +345,9 @@ async fn main() {
     if let Some(resident) = state.resident.clone().filter(|resident| resident.enabled()) {
         follow_resident_readiness(&state, resident);
     }
+    follow_account(&state);
+    follow_voice_keys(&state);
+    follow_making(&state);
     // On macOS the app reports a lost link; elsewhere there is no app, so the daemon does it.
     if !cfg!(target_os = "macos") {
         tokio::spawn(link_alert::watch(state.clone()));
@@ -426,28 +466,19 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
 }
 
 /// Voice commands (docs/protocol.md, "Voice commands"): offered on every report of the box's build, which follows
-/// hello on each new link and every reboot, and taken over native USB or the local network. The box sends no audio
-/// over the UART bridge, which is too slow for it, and over the Relay it will talk to the voice service itself, so
-/// voice isn't offered on either, and voice lines over the Relay are ignored.
+/// hello on each new link and every reboot, and taken over native USB, the local network and the Relay alike: the
+/// audio always comes over the link (ADR-0018). The box sends no audio over the UART bridge, which is too slow for
+/// it, so voice isn't offered there.
 async fn handle_voice_line(state: &AppState, line: &str) -> Option<tokio::task::JoinHandle<()>> {
-    let (over_relay, on_bridge) = {
-        let device = state.device.lock().await;
-        (device.relay, device.bridge)
-    };
+    let on_bridge = state.device.lock().await.bridge;
     if line.contains(serial_transport::BUILD_MARKER) && state.voice.available() {
-        if over_relay {
-            info!("voice commands not offered: the box is reached through the Relay");
-        } else if on_bridge {
+        if on_bridge {
             info!("voice commands not offered: the box is on the UART bridge, which can't carry its audio; use its native USB port");
         } else {
             send_event(state, voice::available_event(true));
         }
     }
     if !line.starts_with("VOICE ") {
-        return None;
-    }
-    if over_relay {
-        tracing::debug!("ignoring a voice line over the Relay");
         return None;
     }
     state.voice.handle_line(line, &state.transport, &wearing(state).await)
@@ -464,19 +495,71 @@ async fn wearing(state: &AppState) -> persona::Wearing {
     persona::Wearing::of(id, &*state.written.lock().await)
 }
 
-/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness flipped
+/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness or the account flipped
 /// (the user's Codex installed or gone, logged in or out). Told `false`, a long K0 gives up the Pomodoro phase as it
-/// did before voice. Never over the Relay or the UART bridge, where voice is never offered.
+/// did before voice. Never over the UART bridge, where voice is never offered.
 async fn offer_voice_again(state: &AppState) {
-    let (booted, over_relay, on_bridge) = {
+    let (booted, on_bridge) = {
         let device = state.device.lock().await;
-        (device.connected && device.firmware_build.is_some(), device.relay, device.bridge)
+        (device.connected && device.firmware_build.is_some(), device.bridge)
     };
-    if booted && !over_relay && !on_bridge {
+    if booted && !on_bridge {
         let on = state.voice.available();
-        info!(on, "the resident session's readiness changed; telling the box whether voice is on");
+        info!(on, "voice readiness changed; telling the box whether voice is on");
         send_event(state, voice::available_event(on));
     }
+}
+
+/// Signing in or out, here or by the service refusing the session, changes the status and whether voice works.
+fn follow_account(state: &AppState) {
+    let mut changes = state.account.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+            offer_voice_again(&follower).await;
+        }
+    });
+    // Today's usage and refusals are only shown.
+    let mut usage = state.account.watch_usage();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while usage.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
+    // So is why the Relay turned this computer away.
+    if let Some(relay) = &state.relay {
+        let mut refusal = relay.watch_refusal();
+        let follower = state.clone();
+        tokio::spawn(async move {
+            while refusal.changed().await.is_ok() {
+                follower.notify_status();
+            }
+        });
+    }
+}
+
+/// A provider refusing or taking an own key happens on a reply's thread; the status stream hears of it here.
+fn follow_voice_keys(state: &AppState) {
+    let mut changes = state.voice_keys.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
+}
+
+/// A Character being made reports each line on its own thread; the status stream hears of it here.
+fn follow_making(state: &AppState) {
+    let mut changes = state.making.watch();
+    let follower = state.clone();
+    tokio::spawn(async move {
+        while changes.changed().await.is_ok() {
+            follower.notify_status();
+        }
+    });
 }
 
 /// Checks the resident session's readiness every [`resident::READINESS_TTL`] and tells the box each time it flips.
@@ -640,6 +723,16 @@ fn app(state: AppState) -> Router {
         .route("/v1/resident/history", get(get_resident_history))
         .route("/v1/resident/brain", axum::routing::put(put_resident_brain))
         .route("/v1/resident/anthropic-key", axum::routing::put(put_anthropic_key).delete(delete_anthropic_key))
+        .route("/v1/voice-keys", axum::routing::put(put_voice_keys))
+        .route("/v1/voices", get(get_voices))
+        .route("/v1/characters", get(get_characters).post(post_character))
+        .route("/v1/characters/presets/{id}/lines", get(get_preset_lines))
+        .route("/v1/characters/{id}", axum::routing::delete(delete_character))
+        .route("/v1/account", axum::routing::delete(delete_account))
+        .route("/v1/account/sign-in", post(post_sign_in))
+        .route("/v1/account/callback", get(get_account_callback))
+        .route("/v1/account/sign-out", post(post_sign_out))
+        .route("/v1/account/refresh", post(post_account_refresh))
         .with_state(state)
 }
 
@@ -1641,6 +1734,148 @@ async fn set_anthropic_key(state: AppState, key: Option<String>) -> axum::respon
     get_resident(State(state)).await.into_response()
 }
 
+/// Sets or clears the user's own keys for spoken replies (ADR-0020): `{"elevenlabs"?, "volc"?}`, each a key, or null
+/// or "" to clear it; one left out stays. Answers which are set, as in the status; a key is never sent back or logged.
+async fn put_voice_keys(State(state): State<AppState>, Json(request): Json<serde_json::Map<String, serde_json::Value>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let refuse = |message: String| (StatusCode::BAD_REQUEST, Json(ApiResponse { accepted: false, message })).into_response();
+    let mut changes = Vec::new();
+    for (name, value) in request {
+        let Some(provider) = voice_keys::Provider::named(&name) else { return refuse(format!("{name} is not a provider: elevenlabs or volc")) };
+        match value {
+            serde_json::Value::Null => changes.push((provider, None)),
+            serde_json::Value::String(key) => changes.push((provider, Some(key))),
+            _ => return refuse(format!("{name} must be a key, or null to clear it")),
+        }
+    }
+    if let Err(error) = state.voice_keys.set(&changes) {
+        warn!(%error, "failed to save the own keys");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse { accepted: false, message: error.to_string() })).into_response();
+    }
+    Json(state.voice_keys.status()).into_response()
+}
+
+/// The voices a made Character can speak with: `characters/voices.tsv`.
+async fn get_voices() -> Json<Vec<making::Voice>> {
+    Json(making::voices())
+}
+
+/// The Characters made here, for the App to list beside the presets.
+async fn get_characters(State(state): State<AppState>) -> Json<Vec<making::MadeCharacter>> {
+    Json(state.making.list())
+}
+
+/// Deletes a Character made here: 404 for one not made here, 409 while it is being made.
+async fn delete_character(State(state): State<AppState>, axum::extract::Path(id): axum::extract::Path<String>) -> (StatusCode, Json<ApiResponse>) {
+    let (status, message) = match state.making.delete(&id) {
+        Ok(()) => return (StatusCode::OK, Json(ApiResponse { accepted: true, message: format!("deleted {id}") })),
+        Err(making::DeleteError::NotFound) => (StatusCode::NOT_FOUND, format!("{id} is not a Character made here")),
+        Err(making::DeleteError::Busy) => (StatusCode::CONFLICT, format!("{id} is being made")),
+        Err(making::DeleteError::Io(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(ApiResponse { accepted: false, message }))
+}
+
+/// A preset's lines, which a made Character starts from: `[{"occasion", "text"}]`; 404 for anything not a preset.
+async fn get_preset_lines(axum::extract::Path(id): axum::extract::Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match making::preset_lines(&id) {
+        Some(lines) => Json(lines).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(ApiResponse { accepted: false, message: format!("{id} is not a preset Character") })).into_response(),
+    }
+}
+
+/// Starts making a Character's line audio (`making` in the status follows it); 409 while another is being made.
+async fn post_character(State(state): State<AppState>, Json(request): Json<making::Request>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (status, message) = match state.making.start(request) {
+        Ok(making) => return (StatusCode::ACCEPTED, Json(making)).into_response(),
+        Err(making::StartError::Busy) => (StatusCode::CONFLICT, "another Character is being made".to_owned()),
+        Err(making::StartError::Invalid(message)) => (StatusCode::BAD_REQUEST, message),
+        Err(making::StartError::Unavailable(message)) => (StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (status, Json(ApiResponse { accepted: false, message })).into_response()
+}
+
+#[derive(Serialize)]
+struct SignInResponse {
+    url: String,
+}
+
+/// Starts signing in to the VibeBuddy account (ADR-0018): the App opens the URL in the browser, which comes back to
+/// [`get_account_callback`].
+async fn post_sign_in(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match state.account.start() {
+        Ok(url) => Json(SignInResponse { url }).into_response(),
+        Err(error) => account_refusal(&error).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+}
+
+async fn get_account_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CallbackQuery>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let account = state.account.clone();
+    let result = match (query.code, query.state) {
+        (Some(code), Some(sign_in)) => tokio::task::spawn_blocking(move || account.finish(&code, &sign_in))
+            .await
+            .unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))),
+        _ => Err(account::AccountError::UnknownSignIn),
+    };
+    if let Err(error) = &result {
+        warn!(%error, "signing in to the account failed");
+    }
+    state.notify_status();
+    let (status, page) = account::callback_page(&result);
+    (StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY), axum::response::Html(page))
+}
+
+async fn post_sign_out(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.sign_out()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "signed out".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+/// Reads today's voice use and the plan from the service, for the App's Account tab; the status stream carries them.
+async fn post_account_refresh(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    match tokio::task::spawn_blocking(move || account.refresh_usage()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string()))) {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "refreshed".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+async fn delete_account(State(state): State<AppState>) -> (StatusCode, Json<ApiResponse>) {
+    let account = state.account.clone();
+    let result = tokio::task::spawn_blocking(move || account.delete()).await.unwrap_or_else(|error| Err(account::AccountError::Service(error.to_string())));
+    state.notify_status();
+    match result {
+        Ok(()) => (StatusCode::OK, Json(ApiResponse { accepted: true, message: "account deleted".to_owned() })),
+        Err(error) => account_refusal(&error),
+    }
+}
+
+fn account_refusal(error: &account::AccountError) -> (StatusCode, Json<ApiResponse>) {
+    let status = match error {
+        account::AccountError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        account::AccountError::NotSignedIn => StatusCode::CONFLICT,
+        account::AccountError::UnknownSignIn => StatusCode::BAD_REQUEST,
+        account::AccountError::Service(_) => StatusCode::BAD_GATEWAY,
+    };
+    (status, Json(ApiResponse { accepted: false, message: error.to_string() }))
+}
+
 fn no_state_directory() -> axum::response::Response {
     use axum::response::IntoResponse;
     (StatusCode::SERVICE_UNAVAILABLE, Json(ApiResponse { accepted: false, message: "no state directory".to_owned() })).into_response()
@@ -1743,6 +1978,31 @@ mod tests {
             SessionTitles::disabled(),
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn the_account_routes_answer_without_a_service() {
+        let state = test_state(Arc::new(RecordingTransport::default()));
+        let response = post_sign_in(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _) = post_sign_out(State(state.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!state.snapshot().await.account.available);
+    }
+
+    #[tokio::test]
+    async fn a_callback_this_daemon_did_not_start_shows_a_refusal_page() {
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        let dir = std::env::temp_dir().join(format!("vibebuddy-callback-{}", std::process::id()));
+        state.account = Arc::new(account::Account::new(Some("http://127.0.0.1:9".to_owned()), Some(&dir), 7331));
+        let callback = |code: Option<&str>, sign_in: Option<&str>| {
+            get_account_callback(State(state.clone()), axum::extract::Query(CallbackQuery { code: code.map(Into::into), state: sign_in.map(Into::into) }))
+        };
+        let (status, page) = callback(Some("c"), Some("forged")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(page.0.contains("Not signed in"));
+        assert_eq!(callback(None, None).await.0, StatusCode::BAD_REQUEST);
+        assert!(!state.snapshot().await.account.signed_in);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1972,6 +2232,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn own_keys_are_set_and_cleared_and_never_sent_back() {
+        let dir = voice_keys::tests::scratch("main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.voice_keys = Arc::new(voice_keys::VoiceKeys::new(Some(&dir)));
+        let put = |body: serde_json::Value| put_voice_keys(State(state.clone()), Json(serde_json::from_value(body).unwrap()));
+
+        let response = put(serde_json::json!({"elevenlabs": "sk_eleven_secret", "volc": "volc_secret"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer, serde_json::json!({"elevenlabs": {"set": true, "refused": false}, "volc": {"set": true, "refused": false}}));
+        let status = serde_json::to_string(&state.snapshot().await).unwrap();
+        assert!(status.contains(r#""voice_keys":{"elevenlabs":{"set":true"#), "{status}");
+        assert!(!status.contains("secret") && !String::from_utf8_lossy(&body).contains("secret"));
+
+        let response = put(serde_json::json!({"volc": null})).await;
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!((answer["elevenlabs"]["set"].as_bool(), answer["volc"]["set"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(put(serde_json::json!({"openai": "k"})).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put(serde_json::json!({"volc": 1})).await.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn voices_are_listed_and_only_a_character_in_one_of_them_starts() {
+        assert!(get_voices().await.0.iter().any(|voice| voice.id == "wanwanxiaohe" && voice.provider == "volc"));
+        let dir = voice_keys::tests::scratch("making-main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
+        let post = |voice: &str| {
+            let body = serde_json::json!({"name": "Owl", "base": "ada", "voice": voice, "lines": [{"occasion": "done", "text": "Done."}]});
+            post_character(State(state.clone()), Json(serde_json::from_value(body).unwrap()))
+        };
+        assert_eq!(post("elevenlabs:somebody").await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(post("ada").await.status(), StatusCode::ACCEPTED);
+        let status = serde_json::to_string(&state.snapshot().await).unwrap();
+        assert!(status.contains(r#""making":{"id":"owl-"#), "{status}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_made_character_is_deleted_through_the_api_but_not_while_it_is_made() {
+        let dir = voice_keys::tests::scratch("making-delete-main");
+        let mut state = test_state(Arc::new(RecordingTransport::default()));
+        state.making = Arc::new(making::Maker::new(Some(dir.clone()), None, state.account.clone(), state.voice_keys.clone()));
+        let body = serde_json::json!({"name": "Owl", "base": "ada", "voice": "ada", "lines": [{"occasion": "done", "text": "Done."}]});
+        let started = post_character(State(state.clone()), Json(serde_json::from_value(body.clone()).unwrap())).await;
+        let bytes = http_body_util::BodyExt::collect(started.into_body()).await.unwrap().to_bytes();
+        let id = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"].as_str().unwrap().to_owned();
+        let delete = |id: &str| delete_character(State(state.clone()), axum::extract::Path(id.to_owned()));
+        // No service: the job fails at once, leaving its manifest; wait for that.
+        for _ in 0..200 {
+            if state.making.status().is_some_and(|status| status.state != "making") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(dir.join(&id).join("manifest.json").is_file());
+        assert_eq!(delete("..").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete("nobody-00000000").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(delete(&id).await.0, StatusCode::OK);
+        assert!(!dir.join(&id).exists() && dir.is_dir());
+        assert_eq!(delete(&id).await.0, StatusCode::NOT_FOUND);
+        // One whose job runs (marked, not run) stays.
+        let (running, _) = state.making.begin(&serde_json::from_value(body).unwrap()).unwrap();
+        assert_eq!(delete(&running).await.0, StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_presets_lines_are_served_for_the_app_to_start_from() {
+        let get = |id: &str| get_preset_lines(axum::extract::Path(id.to_owned()));
+        let response = get("wanwanxiaohe").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let lines: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lines.len(), 55);
+        assert!(lines[0]["occasion"].is_string() && lines[0]["text"].is_string(), "{:?}", lines[0]);
+        assert_eq!(get("robot").await.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn the_app_version_leads_the_build_identity() {
         assert_eq!(
@@ -1985,13 +2328,13 @@ mod tests {
     struct SilentRecognizer;
 
     impl speech::Recognizer for SilentRecognizer {
-        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, String> {
+        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, speech::RecognitionError> {
             Ok(speech::Transcript::default())
         }
     }
 
     #[tokio::test]
-    async fn voice_is_offered_after_each_build_report_but_never_over_the_relay_or_the_uart_bridge() {
+    async fn voice_is_offered_after_each_build_report_over_every_link_but_the_uart_bridge() {
         let dir = std::env::temp_dir().join(format!("vibebuddy-voice-offer-{}", std::process::id()));
         let offers = |transport: &RecordingTransport| {
             transport.events().iter().filter(|event| event.event == "voice.available").map(|event| event.extra["on"].clone()).collect::<Vec<_>>()
@@ -2014,9 +2357,11 @@ mod tests {
             let expected = if enabled { vec![serde_json::json!(true); 3] } else { Vec::new() };
             assert_eq!(offers(&transport), expected);
 
+            // Over the Relay too: the audio comes over the link, which is end-to-end encrypted there (ADR-0018).
             publish_device_message(&state, DeviceMessage::ConnectedRelay { url: "wss://relay.example".to_owned() }).await;
             publish_device_message(&state, build()).await;
-            assert_eq!(offers(&transport), expected, "not over the Relay");
+            let expected = if enabled { vec![serde_json::json!(true); 4] } else { Vec::new() };
+            assert_eq!(offers(&transport), expected, "over the Relay");
             // The box sends no audio over the UART bridge.
             publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.wchusbserial1".to_owned(), bridge: true, usb_serial: None }).await;
             publish_device_message(&state, build()).await;

@@ -159,6 +159,21 @@ mod tests {
     }
 
     #[test]
+    fn every_voice_a_character_is_made_with_has_a_preview() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let voices = std::fs::read_to_string(repo.join("characters/voices.tsv")).unwrap();
+        let ids: Vec<&str> = voices.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| line.split('\t').next()).collect();
+        assert!(ids.len() >= 8);
+        for id in ids {
+            match crate::making::preview_of(id) {
+                // The robot's pack is built from the built-in lines when installing.
+                "robot" => assert!(repo.join("voices/jessica/done.pcm").is_file(), "{id}"),
+                preset => assert!(pcm(&std::fs::read(repo.join(format!("characters/{preset}/pack.bin"))).unwrap()).is_some(), "{id}"),
+            }
+        }
+    }
+
+    #[test]
     fn anything_else_has_none() {
         assert_eq!(pcm(b"not a pack"), None);
         assert_eq!(pcm(&[0u8; 2048]), None);

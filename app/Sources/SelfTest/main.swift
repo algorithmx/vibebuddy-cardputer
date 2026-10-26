@@ -83,10 +83,52 @@ do {
     {"connected":false,"bridge":false,"relay":false,"busy":{"owner":"omarchy","reason":"linked"}}
     """.utf8))
     check(busy.busy == BoxBusy(owner: "omarchy", reason: "linked"), "busy decodes")
+    let refused = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
+    {"connected":false,"bridge":false,"relay_refused":"plan"}
+    """.utf8))
+    check(refused.relayRefused == "plan" && busy.relayRefused == nil, "the Relay's refusal decodes")
     let seen = try StatusCoding.decoder().decode(DeviceState.self, from: Data("""
     {"connected":true,"bridge":false,"wifi_seen":[{"ssid":"ByteTrade","rssi":-49}]}
     """.utf8))
     check(seen.wifiSeen == [SeenNetwork(ssid: "ByteTrade", rssi: -49)], "scan results decode")
+    check(status.account == nil, "an older daemon: no account")
+    let account = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"email":null,"github_id":583231,"github_login":"octocat"}
+    """.utf8))
+    check(account == AccountStatus(available: true, signedIn: true, githubID: 583231, githubLogin: "octocat"), "account decodes")
+    check(status.voiceKeys == nil, "an older daemon: no own keys")
+    let keys = try StatusCoding.decoder().decode(VoiceKeysStatus.self, from: Data("""
+    {"elevenlabs":{"set":true,"refused":true},"volc":{"set":false,"refused":false}}
+    """.utf8))
+    check(keys == VoiceKeysStatus(elevenlabs: .init(set: true, refused: true), volc: .init(set: false)), "own keys decode")
+    check(status.making == nil, "an older daemon, or nothing made: no making")
+    let making = try StatusCoding.decoder().decode(MakingStatus.self, from: Data("""
+    {"id":"night-owl-1a2b3c4d","name":"Night Owl","state":"failed","done":2,"total":6,"reason":"plan","error":"making a Character with our voices needs the Paid plan"}
+    """.utf8))
+    check(making.failed && !making.running && making.reason == "plan" && making.progress == 2.0 / 6.0, "making decodes")
+    check(making.explanation(provider: "ElevenLabs")?.contains("Paid plan, or your own key for ElevenLabs") == true, "a plan refusal names the Paid plan and the provider")
+    let made = try StatusCoding.decoder().decode([MadeCharacter].self, from: Data(#"[{"id":"night-owl-1a2b3c4d","name":"Night Owl","base":"ada","voice":"luna","lines":55,"complete":false}]"#.utf8))
+    check(made == [MadeCharacter(id: "night-owl-1a2b3c4d", name: "Night Owl", base: "ada", voice: "luna", lines: 55, complete: false)], "made Characters decode")
+    let voices = try StatusCoding.decoder().decode([CharacterVoice].self, from: Data(#"[{"id":"ada","provider":"elevenlabs","voice":"tcSs","language":"en","gender":"female","name":"Ada"},{"id":"wanwanxiaohe","provider":"volc","voice":"zh_f","language":"zh","gender":"female","name":"Xiaohe"}]"#.utf8))
+    check(CharacterVoice.sorted(voices, preferring: .zh).map(\.id) == ["wanwanxiaohe", "ada"], "voices in the base's language first")
+    check(voices[1].providerName == "Volcano Engine" && voices[0].providerName == "ElevenLabs", "providers named")
+    let request = CharacterRequest(id: nil, name: "Owl", base: "ada", voice: "luna", lines: [CharacterLine(occasion: "done", text: "Done.")])
+    let sent = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
+    check(!sent.contains("\"id\"") && sent.contains(#""occasion":"done""#), "a new Character is sent without an id: \(sent)")
+    let manifest = try StatusCoding.decoder().decode(CharacterRequest.self, from: Data(#"{"name":"Owl","base":"ada","voice":"luna","lines":[{"occasion":"done","text":"Done."}]}"#.utf8))
+    check(manifest == request, "a manifest reads back as the request it was")
+    let used = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"github_id":1,"today":{"day":"2026-10-24","commands":7,"commands_limit":100},"refused":"allowance"}
+    """.utf8))
+    check(used.today == AccountUsage(day: "2026-10-24", commands: 7, commandsLimit: 100) && used.refused == "allowance", "today's voice use decodes")
+    let free = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
+    {"available":true,"signed_in":true,"plan":{"name":"free"}}
+    """.utf8))
+    check(free.plan == AccountPlan(name: "free") && free.plan?.paid == false, "the Free plan decodes")
+    let paid = try StatusCoding.decoder().decode(AccountPlan.self, from: Data("""
+    {"name":"paid","period_end":"2026-11-24T00:00:00.000Z","characters":12300,"characters_limit":100000}
+    """.utf8))
+    check(paid.paid && paid.periodEnd == Date(timeIntervalSince1970: 1_795_478_400) && paid.characters == 12300 && paid.charactersLimit == 100_000, "the Paid plan decodes")
 } catch {
     check(false, "status decoding threw: \(error)")
 }
@@ -258,6 +300,24 @@ for id in ["ada", "wanwanxiaohe"] {
     }
 }
 
+// Each voice a made Character can speak with has a preview in the app, for the voice picker's play button: its preset's
+// pack, or for Jessica the robot's, which build-app.sh packs from voices/jessica.
+if let tsv = try? String(contentsOfFile: "characters/voices.tsv", encoding: .utf8) {
+    let ids = tsv.split(separator: "\n").filter { !$0.hasPrefix("#") && !$0.isEmpty }.map { String($0.split(separator: "\t")[0]) }
+    check(ids.count >= 8, "voices.tsv read")
+    for id in ids {
+        let voice = CharacterVoice(id: id, provider: "", voice: "", language: "", gender: "", name: "")
+        if voice.previewID == "robot" {
+            check(FileManager.default.fileExists(atPath: "voices/jessica/done.pcm"), "\(id): the robot's lines")
+        } else {
+            let pack = (try? Data(contentsOf: URL(fileURLWithPath: "characters/\(voice.previewID)/pack.bin"))).flatMap(VoicePack.init(data:))
+            check(pack.map { !$0.previewPCM().isEmpty } ?? false, "\(id): a preset preview")
+        }
+    }
+} else {
+    check(false, "voices.tsv read")
+}
+
 // A form of address: the variant's lines replace the first lines of each pool, the rest stay.
 if let base = VoicePack(data: character), let pools = base.pools {
     check(pools.count == 12 && pools[0].count == 1 && pools[1].count == 1 && pools[1][0].samples == 3, "pools read back")
@@ -273,6 +333,42 @@ if let base = VoicePack(data: character), let pools = base.pools {
     }
 } else {
     check(false, "pools of a Character pack")
+}
+
+// Making a Character: the lines as edited, whether it can start, and the pack the App writes.
+let lines = [CharacterLine(occasion: "done", text: "Done, {address}."), CharacterLine(occasion: "done", text: "Nice."), CharacterLine(occasion: "failed", text: "Oops.")]
+check(CharacterDraft.problem(name: "Owl", lines: lines, occasions: ["done", "failed"]) == nil, "lines with {address} can be made")
+check(CharacterDraft.canRemove(0, from: lines) && !CharacterDraft.canRemove(2, from: lines) && !CharacterDraft.canRemove(3, from: lines), "the last line of an occasion stays")
+check(CharacterDraft.problem(name: "Owl", lines: Array(lines.prefix(2)), occasions: ["done", "failed"]) != nil, "an occasion without a line")
+check(CharacterDraft.problem(name: "  ", lines: lines, occasions: ["done"]) != nil, "no name")
+check(CharacterDraft.problem(name: String(repeating: "x", count: 65), lines: lines, occasions: ["done"]) != nil, "a name too long")
+for bad in [" ", "Two\nrows", "Hey {adress}.", String(repeating: "x", count: 1001)] {
+    let edited = [CharacterLine(occasion: "done", text: bad)] + lines
+    check(CharacterDraft.problem(name: "Owl", lines: edited, occasions: ["done", "failed"]) != nil, "a bad line: \(bad.prefix(20))")
+}
+check(CharacterDraft.problem(name: "Owl", lines: Array(repeating: lines[1], count: 111) + [lines[2]], occasions: ["done"]) != nil, "too many lines")
+let eleven = CharacterVoice(id: "luna", provider: "elevenlabs", voice: "g", language: "en", gender: "female", name: "Luna")
+let volc = CharacterVoice(id: "wanwanxiaohe", provider: "volc", voice: "z", language: "zh", gender: "female", name: "Xiaohe")
+let ownEleven = VoiceKeysStatus(elevenlabs: .init(set: true), volc: .init(set: true, refused: true))
+let signedIn = AccountStatus(available: true, signedIn: true)
+check(MakingReadiness.of(eleven, keys: ownEleven, account: nil) == .ownKey, "an own key for the voice's provider is enough")
+check(MakingReadiness.of(volc, keys: ownEleven, account: signedIn) == .paidPlan, "a refused key doesn't count: VibeBuddy's voices, on the Paid plan")
+check(MakingReadiness.of(volc, keys: nil, account: AccountStatus(available: true, signedIn: false)) == .signIn, "signed out and no key")
+check(MakingReadiness.of(eleven, keys: nil, account: nil) == .ownKeyOnly && !MakingReadiness.ownKeyOnly.canStart, "no service and no key")
+let madePools: [[(audio: Data, samples: Int)]] = [[(Data([1, 2]), 4), (Data([3]), 2)], [(Data([4]), 2)], []]
+if let pack = VoicePack.build(id: "night-owl-1a2b3c4d", pools: madePools, look: nil),
+   let variant = VoicePack.build(id: "night-owl-1a2b3c4d", pools: [[(Data([9, 9]), 3)], [], []], look: nil),
+   let look = try? LookBuilder.build([RGBAImage(width: 100, height: 100, pixels: drawing)]) {
+    let written = VoicePack.made(pack, variant: variant, look: look, id: "night-owl-1a2b3c4d").flatMap(VoicePack.init(data:))
+    check(written?.voiceID == "night-owl-1a2b3c4d" && written?.look == look && written?.data[4] == 2, "a made Character keeps its id and wears the look")
+    check(written?.pools?[0].map(\.audio) == [Data([9, 9]), Data([3])] && written?.pools?[1].first?.audio == Data([4]), "its form of address takes the plain line's place")
+    let plain = VoicePack.made(pack, variant: nil, look: nil, id: "night-owl-1a2b3c4d").flatMap(VoicePack.init(data:))
+    check(plain?.data == pack, "with no look and no form it is the daemon's pack as it is")
+    let renamed = VoicePack.made(pack, variant: nil, look: nil, id: "other-00000000").flatMap(VoicePack.init(data:))
+    check(renamed?.voiceID == "other-00000000", "the id written is the made Character's, whatever the pack said")
+    check(VoicePack.made(Data("not a pack".utf8), variant: nil, look: nil, id: "x") == nil, "not a pack")
+} else {
+    check(false, "a made Character's pack builds")
 }
 
 // 4. Voice catalog: every entry has a language, and the picker puts the UI language first.
