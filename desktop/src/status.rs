@@ -16,6 +16,8 @@ pub struct Status {
     pub config: Config,
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     pub updates: Option<Updates>,
+    /// Every Activity, newest first, as the box's task cards show them; empty from older daemons.
+    pub activities: Vec<Activity>,
     /// The VibeBuddy account this computer is signed in to (ADR-0018); older daemons don't say, which reads as not
     /// available.
     pub account: Account,
@@ -104,6 +106,19 @@ pub struct Usage {
     pub day: String,
     pub commands: u64,
     pub commands_limit: u64,
+}
+
+/// One Activity as the daemon summarises it (daemon/src/activity.rs `ActivitySummary`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Activity {
+    /// `codex`, `claude-code`, `github-actions`, or the agent a CLI hook names (`opencode`, `copilot`, `pi`).
+    pub agent: String,
+    /// The task card's title, with the prefix that tells agents apart (`CC:`, `CX:`…).
+    pub title: String,
+    pub project: Option<String>,
+    /// `working` or `needs_input`.
+    pub state: String,
 }
 
 /// The daemon's view of updates; which firmware to offer is its call, as on the Mac.
@@ -244,6 +259,8 @@ pub struct Device {
     pub box_key: Option<String>,
     /// The firmware takes updates over any link (ADR-0016): no cable, no download mode.
     pub transfer: bool,
+    /// The last image sent over the link didn't confirm itself, and the box went back (`FIRMWARE ROLLED BACK`).
+    pub rolled_back: bool,
     /// This computer's key, to tell it apart in `paired_computers`.
     pub computer_key: Option<String>,
     pub paired_computers: Vec<PairedComputer>,

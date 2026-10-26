@@ -16,6 +16,7 @@ mod i18n;
 mod making;
 #[cfg(target_os = "linux")]
 mod instance;
+mod korekore;
 mod preview;
 mod status;
 mod theme;
@@ -58,7 +59,14 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription);
-    if theme::stamp().is_some() {
+    if korekore::requested() {
+        // The korekore UI's fonts, there before any window opens (ADR-0021); its own face is the default. The
+        // current UI keeps the system's, or Omarchy's.
+        for font in korekore::FONTS {
+            app = app.font(font);
+        }
+        app = app.default_font(korekore::DEFAULT_FONT);
+    } else if theme::stamp().is_some() {
         app = app.default_font(Font::with_name(OMARCHY_FONT));
     }
     app.run()
@@ -220,6 +228,8 @@ enum Message {
     OwnKeySaved(client::KeyProvider, Result<(), String>),
     Done(Result<(), String>),
     Quit,
+    /// A section picked in the korekore UI's sidebar (ADR-0021).
+    Korekore(korekore::Section),
 }
 
 #[cfg(target_os = "linux")]
@@ -325,6 +335,8 @@ struct App {
     /// VibeBuddy's Omarchy plugin is in the bar, showing the face; the tray icon would be a second one.
     #[cfg(target_os = "linux")]
     plugin: bool,
+    /// The korekore UI was asked for at launch (`VIBEBUDDY_UI=korekore`, ADR-0021); its sections are the tabs.
+    korekore: bool,
 }
 
 /// Making a Character: the preset it starts from, its lines as edited (occasions stay, each keeps a line), the voice,
@@ -355,7 +367,8 @@ impl App {
             theme: theme::load(),
             theme_stamp: theme::stamp(),
             settings: None,
-            tab: Tab::General,
+            // The korekore sidebar starts on Character, as the design does.
+            tab: if korekore::requested() { Tab::Sound } else { Tab::General },
             guide: None,
             volume: None,
             screenshot: None,
@@ -403,6 +416,7 @@ impl App {
             tray: None,
             #[cfg(target_os = "linux")]
             plugin: plugin_in_omarchy_bar(),
+            korekore: korekore::requested(),
         };
         // The first launch shows the window, so it's clear where the app went; later ones stay in the tray, unless a
         // language change restarted the app from its window. Without a tray (macOS builds, for development) the
@@ -424,10 +438,23 @@ impl App {
         app.custom_look = custom::custom_look_file()
             .and_then(|path| std::fs::read(path).ok())
             .and_then(|look| character::look_frames(&look).map(|frames| (look, frames.iter().map(|frame| handle(frame, 2)).collect())));
+        // Debug builds only: open the korekore UI on a given section or first-run step, for checking it on a desktop
+        // without a pointer (VIBEBUDDY_KOREKORE_SECTION=device, VIBEBUDDY_KOREKORE_GUIDE=1).
+        #[cfg(debug_assertions)]
+        if app.korekore
+            && let Ok(name) = std::env::var("VIBEBUDDY_KOREKORE_SECTION")
+            && let Some(section) = korekore::Section::ALL.into_iter().find(|section| format!("{section:?}").eq_ignore_ascii_case(&name))
+        {
+            app.tab = section.tab();
+        }
         let restarted = std::env::args().any(|arg| arg == RESTARTED || arg == SETTINGS);
         let first = first_launch();
         // The install script connected the agents and set up the start at login; the guide is for what it couldn't.
         app.guide = (first && cfg!(target_os = "linux")).then_some(0);
+        #[cfg(debug_assertions)]
+        if app.korekore {
+            app.guide = std::env::var("VIBEBUDDY_KOREKORE_GUIDE").ok().and_then(|page| page.parse().ok()).or(app.guide);
+        }
         let open = first || restarted || !cfg!(target_os = "linux");
         let task = if open { Task::done(Message::OpenSettings) } else { Task::none() };
         (app, task)
@@ -550,10 +577,16 @@ impl App {
                 if let Some(id) = self.settings {
                     return window::gain_focus(id);
                 }
-                // The same as the Mac's: room for the whole Character tab, resizable down to the old size.
+                // The same as the Mac's: room for the whole Character tab, resizable down to the old size. The
+                // korekore window is the design's 960 × 772, down to 900 × 760.
+                let (size, min_size) = if self.korekore {
+                    (iced::Size::new(960.0, 772.0), iced::Size::new(900.0, 760.0))
+                } else {
+                    (iced::Size::new(760.0, 640.0), iced::Size::new(640.0, 480.0))
+                };
                 let (id, open) = window::open(window::Settings {
-                    size: iced::Size::new(760.0, 640.0),
-                    min_size: Some(iced::Size::new(640.0, 480.0)),
+                    size,
+                    min_size: Some(min_size),
                     #[cfg(target_os = "linux")]
                     platform_specific: window::settings::PlatformSpecific {
                         application_id: "vibebuddy".to_owned(),
@@ -809,15 +842,21 @@ impl App {
             }
             Message::ChooseDrawings => return Task::perform(custom::choose_drawings(), Message::Drawings),
             Message::Drawings(Ok(None)) => {}
-            Message::Drawings(Ok(Some(drawings))) => match character::build_look(&drawings) {
-                Some(look) => {
-                    let frames = character::look_frames(&look).unwrap_or_default();
-                    self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
-                    self.custom_problem = None;
+            Message::Drawings(Ok(Some(drawings))) => {
+                match character::build_look(&drawings) {
+                    Some(look) => {
+                        let frames = character::look_frames(&look).unwrap_or_default();
+                        self.custom_look = Some((look, frames.iter().map(|frame| handle(frame, 2)).collect()));
+                        self.custom_problem = None;
+                    }
+                    None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
                 }
-                None => self.custom_problem = Some(tr("No figure found: use a plain white or transparent background.", &[])),
-            },
-            Message::Drawings(Err(error)) => self.custom_problem = Some(error),
+                return self.show_custom_look();
+            }
+            Message::Drawings(Err(error)) => {
+                self.custom_problem = Some(error);
+                return self.show_custom_look();
+            }
             Message::PickLender(lender) => self.lender = Some(lender),
             Message::UseRobot => {
                 self.characters.robot_lender = None;
@@ -1160,12 +1199,19 @@ impl App {
                 }
             }
             Message::Quit => return iced::exit(),
+            // The korekore sections are the tabs, so what a tab does on opening happens here too.
+            Message::Korekore(section) => return Task::done(Message::Tab(section.tab())),
         }
         Task::none()
     }
 
     /// Pushes the menu and the face's color to the tray; a no-op until the tray is up.
     /// Asks for the Characters made here, and the voices once.
+    /// The korekore Character page opens the look's card below the grid; go down to it.
+    fn show_custom_look(&self) -> Task<Message> {
+        if self.korekore { iced::widget::operation::snap_to_end(korekore::pages::CHARACTER_PAGE) } else { Task::none() }
+    }
+
     fn refresh_made(&self) -> Task<Message> {
         let voices = if self.character_voices.is_empty() {
             Task::perform(client::character_voices(), Message::CharacterVoices)
@@ -1196,12 +1242,14 @@ impl App {
         #[cfg(target_os = "linux")]
         if let Some(TrayHandle(handle)) = self.tray.clone() {
             let menu = MenuState::derive(self.status.as_ref());
+            let kore = self.korekore.then(|| korekore::picture::BoxPicture::derive(self.status.as_ref()));
             let [r, g, b, _] = self.theme.palette().text.into_rgba8();
             return Task::future(async move {
                 handle
                     .update(move |tray| {
                         tray.menu = menu;
                         tray.color = [r, g, b];
+                        tray.kore = kore;
                     })
                     .await;
             })
@@ -1211,6 +1259,12 @@ impl App {
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
+        if self.korekore {
+            if let Some(page) = self.guide {
+                return self.kk_guide(page);
+            }
+            return self.korekore(korekore::Section::of(self.tab));
+        }
         if let Some(page) = self.guide {
             return self.guide(page);
         }
@@ -1248,6 +1302,17 @@ impl App {
             .spacing(16)
             .padding(20);
         container(content).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    /// The korekore settings window (ADR-0021); its pages come in the next steps.
+    fn korekore(&self, section: korekore::Section) -> Element<'_, Message> {
+        // Voice commands are experimental: no Conversation section while the daemon has them off.
+        let sections: Vec<korekore::Section> = korekore::Section::ALL
+            .into_iter()
+            .filter(|&section| section != korekore::Section::Conversation || self.resident)
+            .collect();
+        let picture = korekore::picture::BoxPicture::derive(self.status.as_ref());
+        korekore::view::settings(&picture, &sections, section, env!("CARGO_PKG_VERSION"), Message::Korekore, self.korekore_page(section))
     }
 
     /// First run on Linux: what the install script couldn't do. It already connected the agents and set up the start
@@ -2705,7 +2770,8 @@ fn notify_new_firmware(status: &Status) {
     let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
     let _ = std::fs::write(&marker, &offer.version);
     let title = tr("Box firmware %@ is available", &[&offer.version]);
-    let body = tr("Open Settings → Device to update the box.", &[]);
+    // The korekore UI words it its own way (canvas: "SYSTEM NOTIFICATIONS").
+    let body = if korekore::requested() { tr("Update it from Settings › Device.", &[]) } else { tr("Open Settings → Device to update the box.", &[]) };
     if let Err(error) = launch("notify-send", &["--app-name=VibeBuddy".as_ref(), title.as_ref(), body.as_ref()]) {
         eprintln!("vibebuddy-desktop: {error}");
     }
@@ -2833,7 +2899,8 @@ fn run_tray() -> impl futures::Stream<Item = Message> {
 
     iced::stream::channel(16, async |mut output| {
         let (events, mut clicks) = futures::channel::mpsc::unbounded();
-        let tray = tray::Tray { menu: MenuState::derive(None), color: [255, 255, 255], events };
+        let kore = korekore::requested().then(|| korekore::picture::BoxPicture::derive(None));
+        let tray = tray::Tray { menu: MenuState::derive(None), kore, color: [255, 255, 255], events };
         // At login the app can start before the shell's tray host is up; ksni then registers once it appears, and
         // again after the shell restarts. The app opens the window if it doesn't (`Message::TrayHost`).
         match tray.assume_sni_available(true).spawn().await {

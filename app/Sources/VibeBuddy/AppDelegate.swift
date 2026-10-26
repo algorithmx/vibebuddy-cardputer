@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import KorekoreUI
 import SwiftUI
 import VibeBuddyCore
 
@@ -7,6 +8,8 @@ import VibeBuddyCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = AppModel()
     private var statusItem: NSStatusItem!
+    /// The korekore UI's menu bar item and panel, in place of `statusItem` (ADR-0021).
+    private var korekoreItem: KorekoreStatusItem?
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private var subscriptions: Set<AnyCancellable> = []
@@ -14,11 +17,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationSignal: DispatchSourceSignal?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        #if DEBUG
+        // Debug builds only: draw every korekore page with sample data into a folder and quit, touching nothing else.
+        if let folder = ProcessInfo.processInfo.environment["VIBEBUDDY_KOREKORE_SNAPSHOTS"] {
+            KorekoreSnapshots.write(to: URL(fileURLWithPath: folder), model: model)
+            exit(0)
+        }
+        // Debug builds only: run against the daemon already running, as a guest, and draw the korekore windows with
+        // what it reports, then quit.
+        if let folder = ProcessInfo.processInfo.environment["VIBEBUDDY_KOREKORE_LIVE_SHOTS"] {
+            model.managesDaemon = false
+            KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts"))
+            model.start()
+            KorekoreSnapshots.live(to: URL(fileURLWithPath: folder), model: model)
+            return
+        }
+        #endif
         // A second copy of the app (another path, a dev build) would start a second daemon that fights over
         // the port and the serial port. Hand off to the running one and quit before starting anything.
         if SingleInstance.handOffToRunningCopy() { exit(0) }
         // An installed copy with the old file name renames itself (or gives way to a new copy) and starts again.
         if BundleRename.migrateIfNeeded() { exit(0) }
+        // The korekore UI's fonts, only when it was asked for (ADR-0021): the current UI keeps the system's.
+        if AppUI.atLaunch() == .korekore { KorekoreAssets.registerFonts(in: Resources.resourcesDirectory.appendingPathComponent("fonts")) }
         DistributedNotificationCenter.default().addObserver(forName: SingleInstance.showSettings, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.showMainWindow() }
         }
@@ -32,10 +53,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         source.resume()
         terminationSignal = source
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = PixelFace.image(eyesClosed: true)
-        statusItem.menu = NSMenu()
-        model.$menu.receive(on: RunLoop.main).sink { [weak self] menu in self?.render(menu) }.store(in: &subscriptions)
+        if AppUI.atLaunch() == .korekore {
+            korekoreItem = KorekoreStatusItem(model: model, actions: KorekoreMenuActions(
+                settings: { [weak self] in self?.showSettings() }, checkForUpdates: { [weak self] in self?.checkForUpdates() },
+                reportProblem: { [weak self] in self?.reportProblem() }, quit: { [weak self] in self?.quit() },
+                restartDaemon: { [weak self] in self?.restartDaemon() }))
+        } else {
+            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            statusItem.button?.image = PixelFace.image(eyesClosed: true)
+            statusItem.menu = NSMenu()
+            model.$menu.receive(on: RunLoop.main).sink { [weak self] menu in self?.render(menu) }.store(in: &subscriptions)
+        }
         model.$lastError.receive(on: RunLoop.main).compactMap { $0 }.sink { message in
             let alert = NSAlert()
             alert.messageText = "VibeBuddy"
@@ -75,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Shows a window with a Dock icon, so it can be found again; the icon goes when the last window closes.
     private func present(_ window: NSWindow) {
         NSApp.setActivationPolicy(.regular)
+        // The Dock tile takes the bundle's icon each time it appears, so the korekore one goes on after it.
+        if AppUI.atLaunch() == .korekore { NSApp.applicationIconImage = KorekoreAppIcon.image() }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -157,6 +187,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func reportProblem() { model.reportProblem() }
 
     @objc func showSettings() {
+        if settingsWindow == nil, AppUI.atLaunch() == .korekore {
+            let window = KorekoreSettingsWindow(rootView: KorekoreSettingsRoot(model: model))
+            window.center()
+            window.isReleasedWhenClosed = false
+            watchClose(window)
+            settingsWindow = window
+        }
         if settingsWindow == nil {
             // Roomy enough for the whole Character tab at first sight, and resizable down to the old size.
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 640), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -175,6 +212,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func showOnboarding() {
+        if onboardingWindow == nil, AppUI.atLaunch() == .korekore {
+            let window = KorekoreSettingsWindow.onboarding(rootView: KorekoreOnboarding(model: model, finish: { [weak self] in
+                UserDefaults.standard.set(true, forKey: "onboardingDone")
+                self?.onboardingWindow?.close()
+            }))
+            window.center()
+            window.isReleasedWhenClosed = false
+            watchClose(window)
+            onboardingWindow = window
+        }
         if onboardingWindow == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 540), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.title = String(localized: "Welcome to VibeBuddy")
@@ -296,13 +343,21 @@ enum LegacyLaunchAgent {
         let hasPlist = FileManager.default.fileExists(atPath: plist.path)
         let occupied = await portOccupied()
         guard hasPlist || occupied else { return }
-        let alert = NSAlert()
-        alert.messageText = hasPlist ? String(localized: "Found an old vibebuddyd background service") : String(localized: "A daemon is already running on port 7331")
-        alert.informativeText = String(localized: "VibeBuddy now manages its own daemon, and two daemons would fight over the serial port. Remove the old one and take over?")
-        alert.addButton(withTitle: String(localized: "Remove and take over"))
-        alert.addButton(withTitle: String(localized: "Later"))
-        NSApp.activate(ignoringOtherApps: true)
-        if alert.runModal() == .alertFirstButtonReturn {
+        let title = hasPlist ? String(localized: "Found an old vibebuddyd background service") : String(localized: "A daemon is already running on port 7331")
+        let takeOver: Bool
+        if AppUI.atLaunch() == .korekore {
+            takeOver = KorekoreAlert.run(title: title, message: String(localized: "korekore can remove it and take over, so the two don't fight over the box."),
+                                         buttons: [String(localized: "Remove and take over"), String(localized: "Later")]).button == 0
+        } else {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = String(localized: "VibeBuddy now manages its own daemon, and two daemons would fight over the serial port. Remove the old one and take over?")
+            alert.addButton(withTitle: String(localized: "Remove and take over"))
+            alert.addButton(withTitle: String(localized: "Later"))
+            NSApp.activate(ignoringOtherApps: true)
+            takeOver = alert.runModal() == .alertFirstButtonReturn
+        }
+        if takeOver {
             let bootout = Process()
             bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             bootout.arguments = ["bootout", "gui/\(getuid())/\(label)"]
