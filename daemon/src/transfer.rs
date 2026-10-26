@@ -140,6 +140,8 @@ async fn send_from_box(
         }
     };
     let mut next = acked;
+    // Where chunks were last sent again from: once per gap, as every chunk still on its way acks the same offset.
+    let mut resent_from = None;
     let mut pace = tokio::time::interval(PACE);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while acked < image.len() {
@@ -152,8 +154,15 @@ async fn send_from_box(
         if let (name, Some(offset)) = answer(bus, STEP_TIMEOUT).await?
             && name == "xfer.ack"
         {
-            acked = acked.max(offset);
-            progress(acked as f32 / image.len() as f32);
+            if offset > acked {
+                acked = offset;
+                progress(acked as f32 / image.len() as f32);
+            } else if offset == acked && next > acked && resent_from != Some(acked) {
+                // The box still wants this offset although later chunks went: one was lost on the way, a line damaged
+                // on the UART bridge say. Send again from there now, not after STEP_TIMEOUT and a resume.
+                next = acked;
+                resent_from = Some(acked);
+            }
         }
     }
     Ok(())
@@ -223,7 +232,8 @@ mod tests {
     /// Plays the box: takes chunks in order, acknowledges each with the next offset, and on xfer.begin
     /// answers where it got to. `drop_after` chunks in, it drops the link once and loses what was in flight.
     /// `forget_after` chunks in, it restarts once without the link noticing: it forgets the transfer and answers
-    /// `sequence` until the next xfer.begin.
+    /// `sequence` until the next xfer.begin. `damage_after` chunks in, one chunk arrives damaged: the box drops it
+    /// with no answer about the transfer, and acknowledges the chunks after it with the offset it still wants.
     struct FakeBox {
         bus: broadcast::Sender<DeviceMessage>,
         state: Mutex<BoxState>,
@@ -235,6 +245,7 @@ mod tests {
         written: Vec<u8>,
         drop_after: Option<usize>,
         forget_after: Option<usize>,
+        damage_after: Option<usize>,
         forgotten: bool,
     }
 
@@ -254,7 +265,7 @@ mod tests {
                 let _ = self.bus.send(DeviceMessage::Event(event));
             };
             let mut state = self.state.lock().unwrap();
-            let BoxState { next, written, drop_after, forget_after, forgotten } = &mut *state;
+            let BoxState { next, written, drop_after, forget_after, damage_after, forgotten } = &mut *state;
             match value["event"].as_str().unwrap() {
                 "xfer.begin" => {
                     *forgotten = false;
@@ -281,6 +292,14 @@ mod tests {
                         return Ok(());
                     }
                     if let Some(count) = drop_after {
+                        *count -= 1;
+                    }
+                    if *damage_after == Some(0) {
+                        // The real box answers `ERROR invalid_json`, which isn't about the transfer.
+                        *damage_after = None;
+                        return Ok(());
+                    }
+                    if let Some(count) = damage_after {
                         *count -= 1;
                     }
                     let offset = value["offset"].as_u64().unwrap() as usize;
@@ -345,6 +364,17 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(written, image);
         assert_eq!(resumed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_damaged_chunk_is_sent_again_without_resuming() {
+        let image: Vec<u8> = (0..60_000).map(|index| (index * 11) as u8).collect();
+        let started = std::time::Instant::now();
+        let (result, written, resumed) = run(image.clone(), BoxState { damage_after: Some(3), ..BoxState::default() }).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(written, image);
+        assert_eq!(resumed, 0, "sent again at once, not after STEP_TIMEOUT");
+        assert!(started.elapsed() < STEP_TIMEOUT / 2);
     }
 
     #[tokio::test]
