@@ -2,8 +2,8 @@
 //! docs/protocol.md "Firmware and Character packs over the link"). The image goes as `xfer.chunk` lines of at most [`CHUNK_BYTES`], up to [`WINDOW`]
 //! of them unacknowledged; the box acknowledges each with the next offset it expects. When the link drops or
 //! moves (the Relay to the cable, say), the daemon waits for it to come back and asks again with `xfer.begin`,
-//! and the box answers with where it got to. A box that forgot the transfer (it restarted) answers `sequence`, and
-//! the daemon asks again the same way.
+//! and the box answers with where it got to. A box the Relay reports absent counts as a dropped link. A box that
+//! forgot the transfer (it restarted) answers `sequence`, and the daemon asks again the same way.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +38,10 @@ const RESUMES: u32 = 10;
 /// Why sending stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum Stop {
-    /// The link dropped or moved, or the box went quiet: resume from where it got to.
+    /// The link moved, or the box went quiet: resume from where it got to.
     Resume,
+    /// The link dropped, or the Relay says the box is absent: wait for it to come back, then resume.
+    Gone,
     /// The box answered `sequence`: it has no transfer, say after a restart. Ask again too; but answers like this
     /// one that come before `xfer.ready` are for chunks sent before the `xfer.begin`, and change nothing.
     Lost,
@@ -90,7 +92,8 @@ async fn answer_event(bus: &mut broadcast::Receiver<DeviceMessage>, timeout: Dur
             Err(_) => return Err(Stop::Resume),
         };
         match message {
-            DeviceMessage::Disconnected | DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. } | DeviceMessage::ConnectedRelay { .. } => {
+            DeviceMessage::Disconnected => return Err(Stop::Gone),
+            DeviceMessage::Connected { .. } | DeviceMessage::ConnectedNetwork { .. } | DeviceMessage::ConnectedRelay { .. } => {
                 return Err(Stop::Resume);
             }
             DeviceMessage::Event(event) if event.event == "xfer.error" => {
@@ -173,6 +176,8 @@ pub async fn send_image(
     let sha256: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
     let mut resumes = 0;
     loop {
+        // A box that dropped away (it lost power, say, and the Relay says it is absent) won't answer until it is back.
+        let mut gone = false;
         match send_from_box(&transport, &mut bus, kind, &image, &sha256, &progress).await {
             Ok(()) => {
                 send(&transport, Event::named("xfer.end")).await?;
@@ -181,11 +186,13 @@ pub async fn send_image(
                     Ok(other) => return Err(format!("unexpected {} at the end", other.event)),
                     // The box keeps what it has: asking again carries on, and ends again.
                     Err(Stop::Resume | Stop::Lost) => {}
+                    Err(Stop::Gone) => gone = true,
                     Err(Stop::Fail(why)) => return Err(why),
                 }
             }
             Err(Stop::Fail(why)) => return Err(why),
             Err(Stop::Resume | Stop::Lost) => {}
+            Err(Stop::Gone) => gone = true,
         }
         resumes += 1;
         if resumes > RESUMES {
@@ -193,7 +200,7 @@ pub async fn send_image(
         }
         resuming();
         // A link that moved is already back; one that dropped gets a while to come back.
-        let connected = transport_connected(&mut bus).await;
+        let connected = !gone && transport_connected(&mut bus).await;
         if !connected && !reconnected(&mut bus).await {
             return Err("the box didn't come back".to_owned());
         }
@@ -223,7 +230,9 @@ mod tests {
     /// Plays the box: takes chunks in order, acknowledges each with the next offset, and on xfer.begin
     /// answers where it got to. `drop_after` chunks in, it drops the link once and loses what was in flight.
     /// `forget_after` chunks in, it restarts once without the link noticing: it forgets the transfer and answers
-    /// `sequence` until the next xfer.begin.
+    /// `sequence` until the next xfer.begin. `vanish_after` chunks in, it loses power while the daemon moves to the
+    /// Relay: the link comes up, and the Relay's word that the box is absent comes only after the next xfer.begin.
+    /// The box stays silent until `away` is cleared.
     struct FakeBox {
         bus: broadcast::Sender<DeviceMessage>,
         state: Mutex<BoxState>,
@@ -236,6 +245,9 @@ mod tests {
         drop_after: Option<usize>,
         forget_after: Option<usize>,
         forgotten: bool,
+        vanish_after: Option<usize>,
+        away: bool,
+        begins_while_away: usize,
     }
 
     impl Transport for FakeBox {
@@ -254,7 +266,16 @@ mod tests {
                 let _ = self.bus.send(DeviceMessage::Event(event));
             };
             let mut state = self.state.lock().unwrap();
-            let BoxState { next, written, drop_after, forget_after, forgotten } = &mut *state;
+            let BoxState { next, written, drop_after, forget_after, forgotten, vanish_after, away, begins_while_away } = &mut *state;
+            if *away {
+                if value["event"] == "xfer.begin" {
+                    *begins_while_away += 1;
+                    if *begins_while_away == 1 {
+                        let _ = self.bus.send(DeviceMessage::Disconnected);
+                    }
+                }
+                return Ok(());
+            }
             match value["event"].as_str().unwrap() {
                 "xfer.begin" => {
                     *forgotten = false;
@@ -281,6 +302,15 @@ mod tests {
                         return Ok(());
                     }
                     if let Some(count) = drop_after {
+                        *count -= 1;
+                    }
+                    if *vanish_after == Some(0) {
+                        *vanish_after = None;
+                        *away = true;
+                        let _ = self.bus.send(DeviceMessage::ConnectedRelay { url: "wss://relay".to_owned() });
+                        return Ok(());
+                    }
+                    if let Some(count) = vanish_after {
                         *count -= 1;
                     }
                     let offset = value["offset"].as_u64().unwrap() as usize;
@@ -361,6 +391,48 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(written, image);
         assert_eq!(resumed, 0);
+    }
+
+    /// The box vanishes partway through and comes back `back_after` later, if at all.
+    async fn run_away(image: Vec<u8>, back_after: Option<Duration>) -> (Result<(), String>, Vec<u8>, usize, usize) {
+        let (bus, receiver) = broadcast::channel(1024);
+        let state = BoxState { vanish_after: Some(3), ..BoxState::default() };
+        let fake = Arc::new(FakeBox { bus: bus.clone(), state: Mutex::new(state) });
+        if let Some(back_after) = back_after {
+            let fake = fake.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(back_after).await;
+                fake.state.lock().unwrap().away = false;
+                let _ = fake.bus.send(DeviceMessage::ConnectedRelay { url: "wss://relay".to_owned() });
+            });
+        }
+        let resumed = Arc::new(Mutex::new(0));
+        let counter = resumed.clone();
+        let result = send_image(fake.clone(), receiver, "firmware", image, |_| {}, move || *counter.lock().unwrap() += 1).await.map(|_| ());
+        let mut state = fake.state.lock().unwrap();
+        let written = std::mem::take(&mut state.written);
+        let resumed = *resumed.lock().unwrap();
+        (result, written, resumed, state.begins_while_away)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_box_absent_from_the_relay_is_waited_for() {
+        let image: Vec<u8> = (0..30_000).map(|index| (index * 11) as u8).collect();
+        let (result, written, resumed, begins_while_away) = run_away(image.clone(), Some(Duration::from_secs(150))).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(written, image);
+        assert_eq!(begins_while_away, 1, "no asking a box the Relay says is absent");
+        assert_eq!(resumed, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_box_that_stays_absent_from_the_relay_fails_the_transfer() {
+        let image: Vec<u8> = (0..30_000).map(|index| (index * 5) as u8).collect();
+        let started = tokio::time::Instant::now();
+        let (result, _, _, begins_while_away) = run_away(image, None).await;
+        assert_eq!(result, Err("the box didn't come back".to_owned()));
+        assert_eq!(begins_while_away, 1);
+        assert!(started.elapsed() <= RECONNECT_TIMEOUT + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]
