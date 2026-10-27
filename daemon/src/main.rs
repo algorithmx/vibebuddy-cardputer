@@ -471,11 +471,13 @@ async fn publish_device_message(state: &AppState, message: DeviceMessage) {
 /// it, so voice isn't offered there.
 async fn handle_voice_line(state: &AppState, line: &str) -> Option<tokio::task::JoinHandle<()>> {
     let on_bridge = state.device.lock().await.bridge;
-    if line.contains(serial_transport::BUILD_MARKER) && state.voice.available() {
+    let availability = state.voice.availability();
+    if line.contains(serial_transport::BUILD_MARKER) && availability != voice::Availability::Unset {
         if on_bridge {
             info!("voice commands not offered: the box is on the UART bridge, which can't carry its audio; use its native USB port");
         } else {
-            send_event(state, voice::available_event(true));
+            // Off with a reason too, so the box can show it before anyone speaks.
+            send_event(state, voice::available_event(availability));
         }
     }
     if !line.starts_with("VOICE ") {
@@ -495,18 +497,19 @@ async fn wearing(state: &AppState) -> persona::Wearing {
     persona::Wearing::of(id, &*state.written.lock().await)
 }
 
-/// Tells a box that has reported its build whether voice is on now, after the resident session's readiness or the account flipped
-/// (the user's Codex installed or gone, logged in or out). Told `false`, a long K0 gives up the Pomodoro phase as it
-/// did before voice. Never over the UART bridge, where voice is never offered.
+/// Tells a box that has reported its build whether voice is on now, and if not why, after the resident session's
+/// readiness or the account flipped (the user's Codex installed or gone, logged in or out, the service refusing
+/// voice for the day or the day ending). Told `false`, a long K0 gives up the Pomodoro phase as it did before voice.
+/// Never over the UART bridge, where voice is never offered.
 async fn offer_voice_again(state: &AppState) {
     let (booted, on_bridge) = {
         let device = state.device.lock().await;
         (device.connected && device.firmware_build.is_some(), device.bridge)
     };
     if booted && !on_bridge {
-        let on = state.voice.available();
-        info!(on, "voice readiness changed; telling the box whether voice is on");
-        send_event(state, voice::available_event(on));
+        let availability = state.voice.availability();
+        info!(?availability, "voice readiness changed; telling the box whether voice is on");
+        send_event(state, voice::available_event(availability));
     }
 }
 
@@ -520,12 +523,26 @@ fn follow_account(state: &AppState) {
             offer_voice_again(&follower).await;
         }
     });
-    // Today's usage and refusals are only shown.
+    // Today's usage is only shown. A refusal for the day also withdraws voice until the UTC day ends or a read of
+    // the account shows voice again; the day's end changes both without a word from the service.
     let mut usage = state.account.watch_usage();
     let follower = state.clone();
+    let mut refusal = state.account.voice_refusal();
     tokio::spawn(async move {
-        while usage.changed().await.is_ok() {
+        loop {
+            let now = chrono::Utc::now();
+            let day_ends = account::next_utc_day(now) - now;
+            tokio::select! {
+                changed = usage.changed() => if changed.is_err() { break },
+                // A second late, so the clock is surely in the new day.
+                () = tokio::time::sleep(day_ends.to_std().unwrap_or_default() + Duration::from_secs(1)) => {}
+            }
             follower.notify_status();
+            let today = follower.account.voice_refusal();
+            if today != refusal {
+                refusal = today;
+                offer_voice_again(&follower).await;
+            }
         }
     });
     // So is why the Relay turned this computer away.
@@ -2386,25 +2403,92 @@ mod tests {
 
         publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
         publish_device_message(&state, build()).await;
-        assert!(offers().is_empty(), "not offered before the session is found ready");
+        assert_eq!(offers(), [serde_json::json!(false)], "not offered before the session is found ready");
+        assert_eq!(transport.events().last().unwrap().extra["reason"], "not_ready");
 
         // The first check finds Codex installed and logged in.
         follow_resident_readiness(&state, resident.clone());
         settle().await;
-        assert_eq!(offers(), [serde_json::json!(true)]);
+        assert_eq!(offers(), [serde_json::json!(false), serde_json::json!(true)]);
         resident.note(Some(resident::Problem::CodexLoggedOut));
         settle().await;
-        assert_eq!(offers(), [serde_json::json!(true), serde_json::json!(false)], "withdrawn when the user logs out");
+        assert_eq!(offers(), [serde_json::json!(false), serde_json::json!(true), serde_json::json!(false)], "withdrawn when the user logs out");
+        assert_eq!(transport.events().last().unwrap().extra["reason"], "not_ready");
         resident.note(Some(resident::Problem::CodexMissing));
         settle().await;
-        assert_eq!(offers().len(), 2, "still not ready: nothing new to tell");
+        assert_eq!(offers().len(), 3, "still not ready: nothing new to tell");
 
         // Never over the UART bridge, where voice isn't offered at all.
         publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.wchusbserial1".to_owned(), bridge: true, usb_serial: None }).await;
         publish_device_message(&state, build()).await;
         resident.note(None);
         settle().await;
-        assert_eq!(offers().len(), 2);
+        assert_eq!(offers().len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Asks the account why voice is off, as the voice service does.
+    struct AccountRecognizer(Arc<account::Account>);
+
+    impl speech::Recognizer for AccountRecognizer {
+        fn recognize(&self, _wav: &[u8]) -> Result<speech::Transcript, speech::RecognitionError> {
+            Ok(speech::Transcript::default())
+        }
+
+        fn refusal(&self) -> Option<&'static str> {
+            if self.0.token().is_none() {
+                return Some("signed_out");
+            }
+            self.0.voice_refusal()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_for_the_day_withdraws_voice_with_its_reason_until_a_read_shows_voice_again() {
+        let dir = resident::tests::temp_dir("main-refusal-offer");
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = test_state(transport.clone());
+        let resident = Arc::new(resident::tests::resident(&dir, &resident::tests::logged_in(), Arc::default()));
+        resident.note(None);
+        state.account = Arc::new(account::signed_in_for_tests(&dir.join("config"), "tok"));
+        state.voice = Arc::new(voice::Voice::new(Some(Arc::new(AccountRecognizer(state.account.clone()))), Some(resident)));
+        let offers = || {
+            transport
+                .events()
+                .iter()
+                .filter(|event| event.event == "voice.available")
+                .map(|event| (event.extra["on"].clone(), event.extra.get("reason").cloned(), event.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        let settle = || tokio::time::sleep(Duration::from_millis(50));
+        publish_device_message(&state, DeviceMessage::Connected { port: "/dev/cu.x".to_owned(), bridge: false, usb_serial: None }).await;
+        publish_device_message(&state, DeviceMessage::Line("DISPLAY READY BUILD v9 2026-10-01".to_owned())).await;
+        follow_account(&state);
+        assert_eq!(offers(), [(serde_json::json!(true), None, None)]);
+
+        state.account.note_refusal("allowance");
+        settle().await;
+        let (on, reason, message) = offers()[1].clone();
+        assert_eq!((on, reason), (serde_json::json!(false), Some(serde_json::json!("allowance"))));
+        assert_eq!(message, voice::refusal_message("allowance"));
+        // A rebooted box is told again, reason and all.
+        publish_device_message(&state, DeviceMessage::Line("DISPLAY READY BUILD v9 2026-10-01".to_owned())).await;
+        assert_eq!(offers().len(), 3);
+        assert_eq!(offers()[2].1, Some(serde_json::json!("allowance")));
+
+        // Usage that leaves the refusal as it was tells the box nothing new.
+        state.account.read_usage_for_tests(20, 20);
+        settle().await;
+        assert_eq!(offers().len(), 3);
+        // A read that shows commands left (a higher limit) brings voice back.
+        state.account.read_usage_for_tests(20, 100);
+        settle().await;
+        assert_eq!(offers().len(), 4);
+        assert_eq!(offers()[3], (serde_json::json!(true), None, None));
+
+        state.account.forget();
+        settle().await;
+        assert_eq!(offers().last().unwrap().1, Some(serde_json::json!("signed_out")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
