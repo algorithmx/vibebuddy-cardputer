@@ -1739,6 +1739,55 @@ fn without_voice_a_long_k0_still_gives_up_the_phase() {
 }
 
 #[test]
+fn with_voice_off_for_a_reason_a_long_k0_says_why_while_pomodoro_is_idle() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false,"reason":"allowance","message":"Today's voice is used up. It comes back at 08:00."}"#);
+    assert!(firmware.overlay().is_none(), "nothing shows until K0");
+    let lines = hold_k0_talking(&mut firmware, &mut board, 1500);
+    assert!(lines.is_empty(), "nothing recorded, no phase given up: {lines:?}");
+    assert!(board.stream.is_empty() && !board.voice_running);
+    let panel = firmware.overlay().expect("the reason");
+    assert_eq!(panel.title, b"VOICE USED UP");
+    let text: Vec<String> = panel.lines.iter().map(|(row, _, _)| String::from_utf8(row.clone()).unwrap()).collect();
+    assert_eq!(text.join(" "), "Today's voice is used up. It comes back at 08:00.");
+    // It goes after 6 s.
+    board.advance(6_000);
+    firmware.poll(&mut board);
+    assert!(firmware.overlay().is_none());
+
+    // While Pomodoro runs, a long K0 still gives up the phase.
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO FOCUS START", "MODE POMODORO"]);
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+    assert!(firmware.overlay().is_none());
+}
+
+#[test]
+fn a_refusal_after_speaking_shows_its_title_and_the_computers_message() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    hold_k0_talking(&mut firmware, &mut board, 1800);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.error","turn":1,"reason":"global_cap","message":"Voice is paused for everyone today. It comes back at 08:00."}"#);
+    let panel = firmware.overlay().expect("the error");
+    assert_eq!(panel.title, b"VOICE PAUSED");
+    let text: Vec<String> = panel.lines.iter().map(|(row, _, _)| String::from_utf8(row.clone()).unwrap()).collect();
+    assert_eq!(text.join(" "), "Voice is paused for everyone today. It comes back at 08:00.");
+}
+
+#[test]
+fn with_voice_off_and_no_reason_a_long_k0_shows_nothing() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false}"#);
+    assert!(hold_k0_talking(&mut firmware, &mut board, 1500).is_empty());
+    assert!(firmware.overlay().is_none());
+    // Nor after a new link, which forgets the last reason.
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false,"reason":"signed_out"}"#);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+    board.take_lines();
+    assert!(hold_k0_talking(&mut firmware, &mut board, 1500).is_empty());
+    assert!(firmware.overlay().is_none());
+}
+
+#[test]
 fn with_voice_a_long_k0_records_a_turn_and_the_phase_keeps_running() {
     let (mut firmware, mut board, _) = booted(blank_flash());
     assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO FOCUS START", "MODE POMODORO"]);

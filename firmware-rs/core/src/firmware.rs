@@ -864,7 +864,7 @@ impl Firmware {
     fn set_link_lost<B: Board>(&mut self, board: &mut B, lost: bool) {
         if lost && !self.link_lost {
             // Whoever offered voice is gone; the next link offers it again if it can.
-            self.set_voice_available(board, false);
+            self.set_voice_available(board, false, None, None);
         }
         self.link_lost = lost;
         let now = board.now_ms();
@@ -1131,10 +1131,12 @@ impl Firmware {
         }
 
         // While the computer offers voice commands, a long K0 is push-to-talk; giving up a phase is then in
-        // the menu (ADR-0017).
+        // the menu (ADR-0017). With voice off and Pomodoro idle, it shows why voice is off, if the computer said.
         if event == ButtonEvent::K0Long {
             if self.voice.available() {
                 self.start_recording(board, now);
+            } else if self.pomodoro.view(now).is_idle() && self.voice.show_why_off(now) {
+                self.show_overlay(board);
             } else {
                 self.stop_phase(board);
             }
@@ -1330,9 +1332,9 @@ impl Firmware {
         }
     }
 
-    /// `voice.available`, a new link or a lost one.
-    fn set_voice_available<B: Board>(&mut self, board: &mut B, on: bool) {
-        let out = self.voice.set_available(on);
+    /// `voice.available` (with why voice is off, if the computer says), a new link or a lost one.
+    fn set_voice_available<B: Board>(&mut self, board: &mut B, on: bool, reason: Option<&str>, message: Option<&str>) {
+        let out = self.voice.offer(on, reason, message, board.now_ms());
         Self::write_voice(board, out);
         self.stop_voice_mic(board);
         if !on {
@@ -1450,10 +1452,10 @@ impl Firmware {
         self.stop_voice_mic(board);
     }
 
-    /// `voice.heard`, `voice.reply`, `voice.done` and `voice.error` for a turn.
-    fn on_voice_turn<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
+    /// `voice.heard`, `voice.reply`, `voice.done` and `voice.error` for a turn; `message` is the envelope's.
+    fn on_voice_turn<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str, message: Option<&str>) {
         let Some(turn) = number(fields, "turn").filter(|turn| *turn >= 0.0) else { return };
-        let text = string(fields, if event == "voice.error" { "message" } else { "text" });
+        let text = if event == "voice.error" { message } else { string(fields, "text") };
         let now = board.now_ms();
         if self.voice.event(event, turn as u32, text, string(fields, "reason"), now) {
             self.stop_voice_mic(board);
@@ -1879,7 +1881,7 @@ impl Firmware {
             // asking it would never know.
             // A new link starts with voice commands off; the computer offers them after this if it can.
             "device.hello" => {
-                self.set_voice_available(board, false);
+                self.set_voice_available(board, false, None, None);
                 self.announce_state(board);
             }
             // The daily greeting or a welcome back: a line and nothing else. It isn't agent activity,
@@ -1912,8 +1914,12 @@ impl Firmware {
                 }
             }
             // Voice commands (docs/protocol.md): the computer offers them, then answers each turn.
-            "voice.available" => self.set_voice_available(board, fields.get("on") == Some(&Value::Bool(true))),
-            "voice.heard" | "voice.reply" | "voice.done" | "voice.error" => self.on_voice_turn(board, fields, event),
+            "voice.available" => {
+                let on = fields.get("on") == Some(&Value::Bool(true));
+                // `message` is the envelope's own field, not one of the extra ones.
+                self.set_voice_available(board, on, string(fields, "reason"), message.message.as_deref());
+            }
+            "voice.heard" | "voice.reply" | "voice.done" | "voice.error" => self.on_voice_turn(board, fields, event, message.message.as_deref()),
             "voice.audio" => self.on_voice_audio(board, fields),
             _ if event.starts_with("voice.") => self.handle_voice_event(board, fields, event),
             _ if event.starts_with("xfer.") => self.handle_transfer(board, fields, event),
