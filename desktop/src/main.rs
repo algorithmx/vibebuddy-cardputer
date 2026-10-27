@@ -2507,8 +2507,15 @@ impl App {
             .into()
         };
         let today = match (account.refused.as_deref(), &account.today) {
-            (Some("global_cap"), _) => Some(text(tr("Voice is paused for everyone today. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
-            (Some(_), _) => Some(text(tr("Today's voice is used up. It comes back at midnight UTC.", &[])).size(13).style(text::warning)),
+            (Some(refused), _) => {
+                let back = status::voice_comes_back(chrono::Utc::now(), &chrono::Local);
+                let line = if refused == "global_cap" {
+                    tr("Voice is paused for everyone today. It comes back at %@.", &[&back])
+                } else {
+                    tr("Today's voice is used up. It comes back at %@.", &[&back])
+                };
+                Some(text(line).size(13).style(text::warning))
+            }
             (None, Some(usage)) => Some(text(tr("Voice today: %lld of %lld", &[&usage.commands, &usage.commands_limit])).size(13).style(text::secondary)),
             (None, None) => None,
         };

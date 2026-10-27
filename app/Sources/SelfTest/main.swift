@@ -121,6 +121,11 @@ do {
     {"available":true,"signed_in":true,"github_id":1,"today":{"day":"2026-10-24","commands":7,"commands_limit":100},"refused":"allowance"}
     """.utf8))
     check(used.today == AccountUsage(day: "2026-10-24", commands: 7, commandsLimit: 100) && used.refused == "allowance", "today's voice use decodes")
+    // Refused voice comes back at the next 00:00 UTC, in the computer's own time.
+    let afternoon = ISO8601DateFormatter().date(from: "2026-10-27T15:59:00Z")!
+    check(AccountStatus.voiceComesBack(after: afternoon, in: TimeZone(secondsFromGMT: 8 * 3600)!) == "08:00", "voice comes back at 08:00 in UTC+8")
+    check(AccountStatus.voiceComesBack(after: afternoon, in: TimeZone(secondsFromGMT: -5 * 3600)!) == "19:00", "voice comes back at 19:00 in UTC-5")
+    check(AccountStatus.voiceComesBack(after: ISO8601DateFormatter().date(from: "2026-12-31T23:59:59Z")!, in: TimeZone(identifier: "UTC")!) == "00:00", "and at 00:00 in UTC")
     let free = try StatusCoding.decoder().decode(AccountStatus.self, from: Data("""
     {"available":true,"signed_in":true,"plan":{"name":"free"}}
     """.utf8))
