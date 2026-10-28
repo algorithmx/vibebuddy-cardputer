@@ -623,3 +623,6 @@
 "Couldn't delete “%@”: %@" = "删除「%@」失败：%@";
 "Its own lines, in a voice you pick" = "自己的台词，配上你挑的声音";
 "Making “%@”…" = "正在创建「%@」…";
+"The box is on its UART bridge, and its firmware can't carry voice there. Update the firmware, or plug the cable into the box's native USB port." = "盒子接在 UART 桥上，它现在的固件没法在这条线上传语音。更新固件，或把线改插到盒子的原生 USB 口。";
+"The box is on its UART bridge, which didn't hold the speed voice needs. Plug the cable into the box's native USB port, or plug it in again to try once more." = "盒子接在 UART 桥上，这条线没跑到语音需要的速度。把线改插到盒子的原生 USB 口，或重新插一次再试。";
+"Voice needs this computer signed in to VibeBuddy." = "语音要先在这台电脑上登录 VibeBuddy。";

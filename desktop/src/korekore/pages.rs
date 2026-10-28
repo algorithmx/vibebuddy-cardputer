@@ -442,6 +442,15 @@ impl crate::App {
             .spacing(10)
             .align_y(Alignment::Center);
         let key = choice.filter(|choice| *choice != client::BrainChoice::Codex).map(|_| self.key_card());
+        // Anything else that keeps K0 from working: the UART bridge too slow, the account.
+        let voice_off = self.resident_info.as_ref().filter(|_| self.resident_problem.is_none()).and_then(client::ResidentInfo::voice_off_note).map(|detail| {
+            card_with(
+                row![badge(&sprites::KORE_NORMAL, false, theme::INK), note(detail)].spacing(10).align_y(Alignment::Center),
+                theme::PAPER,
+                theme::KORE_PINK_TEXT,
+                theme::STROKE_BASE,
+            )
+        });
         let body: Element<'_, Message> = if let Some(problem) = &self.resident_problem {
             self.voice_needs(problem, choice)
         } else {
@@ -475,6 +484,7 @@ impl crate::App {
         };
         column![header]
             .push(key)
+            .push(voice_off)
             .push(container(body).height(Length::Fill))
             .push(text(tr("last 20 exchanges · newest at the bottom · stays on this computer", &[])).font(PIXEL).size(12).color(theme::MUTED_2))
             .spacing(14)
