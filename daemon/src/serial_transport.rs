@@ -503,7 +503,7 @@ impl Firmware {
             Self::Listening { since: now }
         } else if line.contains(BUILD_MARKER) {
             Self::Ours
-        } else if self != Self::Ours && line.trim().starts_with(BAUD_PREFIX) {
+        } else if self != Self::Ours && rate_line(line).starts_with(BAUD_PREFIX) {
             // Only our firmware says this: it went back to 115200 because what it heard was at another rate (the
             // port reopened while it ran fast), so hello was lost. Listened to enough: ask it again now.
             Self::Listening { since: now.checked_sub(LISTEN_FIRST).unwrap_or(now) }
@@ -557,6 +557,12 @@ fn is_esp_idf_app_log(line: &str) -> bool {
 const BAUD_PREFIX: &str = "BAUD ";
 /// What firmware without the rate switch says to `device.baud`, as to any event it doesn't know.
 const BAUD_UNKNOWN: &str = "EVENT device.baud";
+
+/// A line as the box said it about the rate: without what came before it at the other rate. The box's last bytes at
+/// 921600, read at 115200, are not ASCII text, and they run into its `BAUD 115200` (seen on a box: `��BAUD 115200`).
+fn rate_line(line: &str) -> &str {
+    line.trim_start_matches(|c: char| !c.is_ascii_graphic()).trim_end()
+}
 
 /// Moves a link to another rate; only the serial port over the bridge has one.
 type RateSetter<P> = fn(&mut P, u32) -> std::io::Result<()>;
@@ -1072,8 +1078,11 @@ fn process_device_bytes(
             };
             let line = &line_buffer[..length];
             let text = String::from_utf8_lossy(line);
-            if text.contains(ROM_BANNER) || text.trim().starts_with(BAUD_PREFIX) || text.trim() == BAUD_UNKNOWN {
+            let rate = rate_line(&text);
+            if text.contains(ROM_BANNER) {
                 own.push(text.into_owned());
+            } else if rate.starts_with(BAUD_PREFIX) || rate == BAUD_UNKNOWN {
+                own.push(rate.to_owned());
             }
             process_device_line(line, firmware, event_sender);
             line_buffer.clear();
@@ -1473,6 +1482,18 @@ I (911) muse: board: ALIENTEK ATK-DNESP32S3-BOX\r\n";
         let asked = Firmware::Foreign.after_line("BAUD 115200", now);
         assert!(asked.deadline().is_some_and(|deadline| deadline <= now), "{asked:?}");
         assert_eq!(Firmware::Ours.after_line("BAUD 115200", now), Firmware::Ours);
+    }
+
+    #[test]
+    fn a_rate_line_after_bytes_read_at_the_other_rate_still_counts() {
+        // Seen on a box: its last bytes at 921600, read at 115200, ran into its `BAUD 115200`.
+        let (sender, _receiver) = mpsc::channel(16);
+        let mut buffer = Vec::new();
+        let mut firmware = Firmware::Asked { since: Instant::now() };
+        let rate_lines = process_device_bytes(b"\xfe\xffBAUD 115200\r\n", &mut buffer, &mut firmware, &sender);
+        assert_eq!(rate_lines, ["BAUD 115200"]);
+        assert!(firmware.deadline().is_some_and(|deadline| deadline <= Instant::now()), "asked again at once: {firmware:?}");
+        assert_eq!(rate_line("TITLE CC:UART BAUD 115200"), "TITLE CC:UART BAUD 115200", "only what is not text goes");
     }
 
     thread_local! {

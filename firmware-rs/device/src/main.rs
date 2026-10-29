@@ -658,7 +658,8 @@ async fn main(spawner: Spawner) -> ! {
         if let Some(rate) = back {
             uart_line.clear();
             serial::set_uart_rate(rate);
-            board.transport.write_uart(alloc::format!("BAUD {rate}\n").as_bytes());
+            // A newline first: what the computer read of the box's last bytes at the fast rate ends its own line.
+            board.transport.write_uart(alloc::format!("\nBAUD {rate}\n").as_bytes());
         }
         firmware.poll(&mut board);
         // The microphone's own report on a stream that just ended.
