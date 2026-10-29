@@ -2303,7 +2303,14 @@ impl App {
         };
         // A daemon older than the setting doesn't say it; then there is only Codex.
         let choice = self.resident_info.as_ref().and_then(|info| info.brain_setting);
-        let header = column![header].push(choice.map(|choice| self.agent_setting(choice))).spacing(12);
+        // Anything else that keeps K0 from working: the UART bridge too slow, the account.
+        let voice_off = self
+            .resident_info
+            .as_ref()
+            .filter(|_| self.resident_problem.is_none())
+            .and_then(client::ResidentInfo::voice_off_note)
+            .map(|note| text(note).size(13).style(text::warning));
+        let header = column![header].push(choice.map(|choice| self.agent_setting(choice))).push(voice_off).spacing(12);
         // Voice needs the user's Codex, installed and logged in, or Claude Code with a key: say what's missing first.
         if let Some(problem) = &self.resident_problem {
             let (title, detail) = match problem {
