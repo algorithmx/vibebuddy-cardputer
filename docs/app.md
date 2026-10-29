@@ -154,7 +154,8 @@ this app most needs to know:
 - **Notifications.** The daemon sends the box-gone alert through `notify-send` (`daemon/src/link_alert.rs`), because it
   is the one process that sees the box. The app sends the firmware-available alert, and the daemon-failure alert
   (`desktop/src/outage.rs`): once after 30 seconds without the daemon, again only after it returns, and only while the
-  notify toggle is on, using the last value the daemon reported. A unit the user stopped stays silent.
+  notify toggle is on, using the last value the daemon reported. A unit the user stopped stays silent. In the korekore
+  UI it says to open korekore to restart the daemon or export diagnostics, as the Mac's does.
 - **Tray.** A StatusNotifierItem through `ksni`. Without a tray host the settings window opens about 10 seconds after
   start. The README's Linux section explains why and names the GNOME extension.
 - **K2.** The daemon focuses the agent's window on Hyprland, Sway or X11 (`daemon/src/window_focus.rs`), choosing the

@@ -509,6 +509,7 @@
 "The box has been gone for 30 seconds." = "盒子已经离开 30 秒了。";
 "The box itself" = "盒子本身";
 "The daemon failed to start three times" = "daemon 连续三次没能启动";
+"The daemon stopped and didn't come back" = "daemon 已停止且没有恢复";
 "The original robot" = "最初的机器人";
 "This box runs other firmware. Put korekore on it? Its current firmware will be replaced." = "这个盒子运行的是其他固件。要装上 korekore 吗？它现在的固件会被替换。";
 "Unplug it, then plug in your box. If several devices are plugged in, korekore asks which one is yours." = "拔掉它，再插上你的盒子。如果插着好几个设备，korekore 会问你哪个是你的。";

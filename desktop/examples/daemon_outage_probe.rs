@@ -83,7 +83,7 @@ async fn main() {
                 });
             }
             Some(Effect::Notify(restart)) => {
-                if let Err(error) = outage::notify(restart) {
+                if let Err(error) = outage::notify(restart, std::env::var("VIBEBUDDY_UI").is_ok_and(|ui| ui == "korekore")) {
                     println!("notify failed: {error}");
                 }
             }

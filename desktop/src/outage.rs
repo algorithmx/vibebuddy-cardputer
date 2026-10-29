@@ -153,17 +153,24 @@ pub async fn service() -> Service {
 }
 
 /// The notification, sent with `notify-send` as the firmware one is. It is spawned and not awaited, so a slow
-/// notification server never holds up the app.
-pub fn notify(restart: Restart) -> Result<(), String> {
-    let body = match restart {
-        Restart::Here => tr("The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.", &[]),
-        Restart::Yourself => tr(
-            "The daemon stopped and didn't come back. It didn't run as the vibebuddyd systemd service, so start it again the way you started it.",
-            &[],
+/// notification server never holds up the app. The korekore UI words the one it can restart from as the Mac's does
+/// (canvas: "SYSTEM NOTIFICATIONS"); `korekore` is passed in so the headless probe needn't build that UI.
+pub fn notify(restart: Restart, korekore: bool) -> Result<(), String> {
+    let (title, body) = match restart {
+        Restart::Here if korekore => {
+            (tr("The daemon stopped and didn't come back", &[]), tr("Open korekore to restart it or export diagnostics.", &[]))
+        }
+        Restart::Here => ("VibeBuddy".to_owned(), tr("The daemon stopped and didn't come back. Restart it from the tray icon or on the Advanced tab.", &[])),
+        Restart::Yourself => (
+            "VibeBuddy".to_owned(),
+            tr(
+                "The daemon stopped and didn't come back. It didn't run as the vibebuddyd systemd service, so start it again the way you started it.",
+                &[],
+            ),
         ),
     };
     std::process::Command::new("notify-send")
-        .args(["--app-name=VibeBuddy", "VibeBuddy", body.as_str()])
+        .args(["--app-name=VibeBuddy", title.as_str(), body.as_str()])
         .spawn()
         .map(drop)
         .map_err(|error| format!("cannot run notify-send: {error}"))

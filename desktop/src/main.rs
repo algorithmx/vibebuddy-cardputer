@@ -1228,7 +1228,7 @@ impl App {
             Some(outage::Effect::Wait(after)) => Task::perform(tokio::time::sleep(after), |()| Message::OutageGrace),
             Some(outage::Effect::CheckService) => Task::perform(outage::service(), Message::OutageService),
             Some(outage::Effect::Notify(restart)) => {
-                if let Err(error) = outage::notify(restart) {
+                if let Err(error) = outage::notify(restart, self.korekore) {
                     eprintln!("vibebuddy-desktop: {error}");
                 }
                 Task::none()
