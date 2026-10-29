@@ -707,7 +707,8 @@ async fn take_rate_steps<P: AsyncWrite + Unpin>(
 ) -> std::io::Result<()> {
     for step in steps {
         match step {
-            RateStep::Write(frame) => write_frame(port, &frame, paced).await?,
+            // Short frames on either side of a switch: paced at 115200, which is never too fast.
+            RateStep::Write(frame) => write_frame(port, &frame, paced.then_some(BAUD_RATE)).await?,
             RateStep::SetRate(baud) => {
                 if let Some(set_rate) = set_rate {
                     set_rate(port, baud)?;
@@ -768,7 +769,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
         if let Some(frame) = next {
             // A peer that never reads (e.g. firmware that isn't ours) blocks the write forever; the flasher must still get the port.
             tokio::select! {
-                result = write_frame(port, &frame, paced) => {
+                result = write_frame(port, &frame, paced.then_some(baud.rate)) => {
                     if let Err(error) = result {
                         pending.push_front(frame);
                         warn!(port = %port_name, %error, "link write failed, reconnecting");
@@ -914,27 +915,28 @@ async fn become_foreign(
     let _ = device_event_sender.send(DeviceMessage::ForeignFirmware).await;
 }
 
-/// Bridge ports are written in line-rate chunks; native USB ports get the whole frame at once.
-async fn write_frame<P: AsyncWrite + Unpin>(port: &mut P, frame: &[u8], paced: bool) -> std::io::Result<()> {
-    if !paced {
+/// Bridge ports are written in line-rate chunks, `pace` being the rate the port runs at; native USB ports (None) get
+/// the whole frame at once.
+async fn write_frame<P: AsyncWrite + Unpin>(port: &mut P, frame: &[u8], pace: Option<u32>) -> std::io::Result<()> {
+    let Some(baud) = pace else {
         // No flush: on a serial port it is tcdrain(), a blocking call that waits until the box has taken the bytes.
         // While the box dumps a screenshot it takes nothing, so a heartbeat's flush held this worker for two seconds;
         // nobody read the port meanwhile, the kernel stopped taking the box's output, and the box dropped the rest of
         // the frame (seen on Omarchy, 2026-10-01). The kernel queues the frame either way.
         return port.write_all(frame).await;
-    }
+    };
     for piece in frame.chunks(PACE_PIECE_BYTES) {
         port.write_all(piece).await?;
         port.flush().await?;
-        tokio::time::sleep(piece_delay(piece.len())).await;
+        tokio::time::sleep(piece_delay(piece.len(), baud)).await;
     }
     Ok(())
 }
 
-/// How long this many bytes take at 115200 baud, plus a little headroom. Flashing uses a separate
+/// How long this many bytes take at this baud rate, plus a little headroom. Flashing uses a separate
 /// synchronous serial path with the same formula.
-pub fn piece_delay(bytes: usize) -> Duration {
-    Duration::from_micros(bytes as u64 * 10 * 1_000_000 / u64::from(BAUD_RATE)) + PACE_MARGIN
+pub fn piece_delay(bytes: usize, baud: u32) -> Duration {
+    Duration::from_micros(bytes as u64 * 10 * 1_000_000 / u64::from(baud)) + PACE_MARGIN
 }
 
 /// Over the bridge, write at most this many bytes, then wait for them to clear.
@@ -1191,8 +1193,11 @@ mod tests {
     #[test]
     fn a_piece_waits_for_its_own_wire_time_plus_margin() {
         // 128 bytes × 10 bits / 115200 ≈ 11.1 ms, plus 1 ms headroom.
-        let delay = piece_delay(128);
+        let delay = piece_delay(128, BAUD_RATE);
         assert!(delay >= Duration::from_micros(12_100) && delay <= Duration::from_micros(12_200), "{delay:?}");
+        // At 921600 about 1.4 ms, plus the same headroom.
+        let delay = piece_delay(128, 921_600);
+        assert!(delay >= Duration::from_micros(2_380) && delay <= Duration::from_micros(2_400), "{delay:?}");
     }
 
     #[test]

@@ -283,7 +283,7 @@ Either end goes back to 115200 on its own when the two may no longer agree, sinc
 
 The computer tries at most three times per boot of the box. Flashing over the bridge is unchanged: the ROM flasher opens the port itself at 115200 and resets the box into the ROM bootloader, which runs at 115200 whatever the firmware ran at.
 
-The computer still writes to the bridge in pieces of at most 128 bytes, each followed by its wire time at 115200, whatever the rate (the CH343 drops bytes when pushed faster than its wire). At 921600 each piece arrives in 1.4 ms but fits the box's 128-byte receive FIFO whole, and the next one comes about 11 ms later, as at 115200: the box has as long to empty the FIFO as before, even while it writes flash. Only what the box sends gets faster. On the box, sending is interrupt-driven from a 4 KB buffer, so writing to the UART doesn't hold up the main loop unless the buffer is full; an audio line that doesn't fit is dropped whole.
+The computer still writes to the bridge in pieces of at most 128 bytes, each followed by its wire time at the rate the port runs at, plus 1 ms (the CH343 drops bytes when pushed faster than its wire). At 921600 a piece arrives in 1.4 ms and fits the box's 128-byte receive FIFO whole, and the next one comes about 2.4 ms after the first began: the box empties the FIFO in that time, even while it writes a 256-byte flash page (typically under 1 ms). A line lost anyway costs an `xfer.chunk` sent again, as on any link. The few frames written while the rate changes are paced at 115200. On the box, sending is interrupt-driven from a 4 KB buffer, so writing to the UART doesn't hold up the main loop unless the buffer is full; an audio line that doesn't fit is dropped whole.
 
 ## Stage 1 error output
 
