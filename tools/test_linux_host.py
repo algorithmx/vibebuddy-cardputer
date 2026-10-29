@@ -301,13 +301,10 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(snapshot["config"]["voice"], "test-voice")
         self.assertEqual(self.host.lines("host").count('"event":"xfer.end"'), 1)
 
-    def test_an_unplug_that_restarts_the_box_partway_fails_the_write_and_a_retry_succeeds(self):
-        # What the daemon does today, not what ADR-0016 promises. The cable powers the box, so it restarts before the
-        # replug and forgets the transfer. The daemon then sends the chunks it had in flight, the box answers
-        # `xfer.error` `sequence`, and the daemon gives up instead of starting over with `xfer.begin`. The rest of the
-        # queued chunks keep drawing `sequence`, and the daemon takes any `xfer.error` as the answer to its current
-        # transfer, so a retry started before they stop fails too. Suspected bug in daemon/src/transfer.rs, reported on
-        # #153: when it resumes, assert "done" here instead and drop the wait.
+    def test_an_unplug_that_restarts_the_box_partway_starts_the_write_over(self):
+        # The cable powers the box, so it restarts before the replug and forgets the transfer. It answers the chunks
+        # the daemon had in flight with `xfer.error` `sequence`, which the daemon takes as "the box lost its place": it
+        # asks again with `xfer.begin` and starts over from the offset the box answers (ADR-0016), with no retry.
         self.post("/v1/device/voice-pack", self.big_pack())
         wait_for(lambda: self.host.lines("host").count('"event":"xfer.chunk"') >= 4, "the write under way", timeout=30)
         self.host.disconnect()
@@ -315,12 +312,9 @@ class LinuxHostTests(HostTestCase):
         self.assertEqual(self.host.status()["operation"]["state"], "running", "the write waits for the box")
         self.host.control("reboot")
         self.host.connect()
-        snapshot = self.host.wait_operation("failed", timeout=60)
-        self.assertIn("the box refused the image: sequence", snapshot["operation"]["message"])
-        errors = lambda: self.host.lines("device").count('"event":"xfer.error"')
-        wait_for(lambda: (before := errors()) and (time.sleep(2) or errors() == before), "the stale chunks to stop", timeout=30)
-        self.post("/v1/device/voice-pack", self.pack())
-        self.assertEqual(self.host.wait_operation("done", timeout=30)["config"]["voice"], "test-voice")
+        snapshot = self.host.wait_operation("done", timeout=60)
+        self.assertEqual(snapshot["config"]["voice"], "test-voice")
+        self.assertEqual(self.host.lines("host").count('"event":"xfer.begin"'), 2, "one resume after the restart")
 
     def test_sse_delivers_device_changes_and_config(self):
         request = self.host.opener.open(self.host.base + "/v1/status/stream", timeout=5)
