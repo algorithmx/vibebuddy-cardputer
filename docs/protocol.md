@@ -278,7 +278,7 @@ Every link over the box's CH343 UART bridge starts at 115200 baud, the rate of t
 
 Either end goes back to 115200 on its own when the two may no longer agree, since 115200 is where both start:
 
-- The box, on a byte its UART can't frame (the computer reopened the port at 115200), after 30 s without a line on the UART (the computer sends a heartbeat every 5 s), and just before it restarts (then saying `BAUD 115200` at 921600 first). It says `BAUD 115200` at 115200 after going back. The line the computer sent at the wrong rate is lost.
+- The box, on a byte its UART can't frame or a byte the computer never sends (a NUL, or 0xF5 and above: bytes sent at 115200 mostly frame cleanly at 921600, as 0x00 or 0x80), which means the computer reopened the port at 115200; after 30 s without a line on the UART (the computer sends a heartbeat every 5 s), and just before it restarts (then saying `BAUD 115200` at 921600 first). It says `BAUD 115200` at 115200 after going back. The line the computer sent at the wrong rate is lost.
 - The computer, on reading bytes our firmware never sends (NUL, or bytes that can't be in UTF-8): the box restarted or went back. It then listens again from the start, as on a new link. A `BAUD` line from a box the computer hasn't recognised yet means our firmware lost the computer's hello at the wrong rate: the computer sends hello again at once.
 
 The computer tries at most three times per boot of the box. Flashing over the bridge is unchanged: the ROM flasher opens the port itself at 115200 and resets the box into the ROM bootloader, which runs at 115200 whatever the firmware ran at.

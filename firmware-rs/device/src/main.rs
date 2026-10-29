@@ -566,12 +566,15 @@ async fn main(spawner: Spawner) -> ! {
     // the bridge must not land in the middle of a line arriving over USB.
     let mut uart_line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     loop {
+        // Bytes the computer never sends: at the fast rate, the computer talks at 115200 (see uart_rate::garbled).
+        let mut garbled = 0;
         loop {
             let count = serial::take_uart(&mut input);
             if count == 0 {
                 break;
             }
             for &byte in &input[..count] {
+                garbled += u32::from(uart_rate::garbled(byte));
                 if vibebuddy_firmware_core::firmware::hold_line_byte(&mut uart_line, byte) {
                     // A whole line at a new rate confirms it; said before the line is handled, so the computer
                     // hears it before any answer.
@@ -649,7 +652,7 @@ async fn main(spawner: Spawner) -> ! {
             net::CREDENTIALS.signal(wifi_credentials(&firmware));
         }
         // Back to 115200 when the computer and the box may no longer agree on the UART's rate.
-        let errors = serial::take_uart_errors();
+        let errors = serial::take_uart_errors() + garbled;
         let back = board.uart_rate.receive_errors(errors).or_else(|| board.uart_rate.poll(board.now_ms()));
         if let Some(rate) = back {
             uart_line.clear();

@@ -19,6 +19,13 @@ pub const TRIAL_MS: u32 = 2_000;
 /// sending anything yet; the computer sends a heartbeat every few seconds.
 pub const SILENCE_MS: u32 = 30_000;
 
+/// A byte the computer never sends over the UART, whose lines are UTF-8 text: what bytes sent at 115200 often look
+/// like to a UART at 921600. Mostly they still frame cleanly, as 0x00 or 0x80, so the UART reports no error; the
+/// daemon uses the same test in the other direction.
+pub fn garbled(byte: u8) -> bool {
+    byte == 0 || byte >= 0xf5
+}
+
 #[derive(Debug)]
 pub struct UartRate {
     rate: u32,
@@ -67,9 +74,9 @@ impl UartRate {
         self.trial_since.take().map(|_| self.rate)
     }
 
-    /// The UART received `count` bytes it couldn't frame. Some(115200) when the box should go back to it now: at the
-    /// fast rate even one means the computer may be talking at 115200, as after it reopened the port. Its first line
-    /// at 115200 is lost either way, and the computer asks again.
+    /// The UART received `count` bytes it couldn't frame, or [`garbled`] ones. Some(115200) when the box should go
+    /// back to it now: at the fast rate even one means the computer may be talking at 115200, as after it reopened
+    /// the port. Its first line at 115200 is lost either way, and the computer asks again.
     pub fn receive_errors(&mut self, count: u32) -> Option<u32> {
         (count > 0 && self.rate != SLOW).then(|| self.fall_back())
     }
@@ -144,6 +151,16 @@ mod tests {
         assert_eq!(uart.receive_errors(1), Some(SLOW));
         assert_eq!(uart.rate(), SLOW);
         assert_eq!(uart.receive_errors(100), None, "at 115200 errors change nothing");
+    }
+
+    #[test]
+    fn bytes_that_are_never_text_count_as_garbled() {
+        assert!(garbled(0x00));
+        assert!(garbled(0xf5));
+        assert!(garbled(0xff));
+        for &byte in "{\"event\":\"device.hello\",\"title\":\"语音\"}\n".as_bytes() {
+            assert!(!garbled(byte), "{byte:#04x}");
+        }
     }
 
     #[test]
