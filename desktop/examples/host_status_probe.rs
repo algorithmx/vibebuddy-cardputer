@@ -8,6 +8,10 @@ mod i18n;
 #[path = "../src/status.rs"]
 mod status;
 
+#[allow(dead_code)]
+#[path = "probe_stubs/making.rs"]
+mod making;
+
 use std::io::{BufRead, Write};
 
 // The probe always uses English and never reads/writes the user's saved language.

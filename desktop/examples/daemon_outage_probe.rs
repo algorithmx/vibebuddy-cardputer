@@ -16,6 +16,10 @@ mod outage;
 #[path = "../src/status.rs"]
 mod status;
 
+#[allow(dead_code)]
+#[path = "probe_stubs/making.rs"]
+mod making;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
