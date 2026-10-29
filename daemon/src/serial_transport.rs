@@ -775,7 +775,7 @@ async fn run_session<P: AsyncRead + AsyncWrite + Unpin>(
         if let Some(frame) = next {
             // A peer that never reads (e.g. firmware that isn't ours) blocks the write forever; the flasher must still get the port.
             tokio::select! {
-                result = write_frame(port, &frame, paced.then_some(baud.rate)) => {
+                result = write_frame(port, &frame, paced.then_some(pace_rate(baud.rate))) => {
                     if let Err(error) = result {
                         pending.push_front(frame);
                         warn!(port = %port_name, %error, "link write failed, reconnecting");
@@ -947,6 +947,13 @@ pub fn piece_delay(bytes: usize, baud: u32) -> Duration {
 
 /// Over the bridge, write at most this many bytes, then wait for them to clear.
 pub const PACE_PIECE_BYTES: usize = 128;
+
+/// The rate whose wire time paces writes to the bridge running at `port_rate`. On macOS, that rate. On Linux,
+/// always 115200: paced faster, at 921600 or even at 460800 wire time, writes through `cdc_acm` arrive damaged (on
+/// Omarchy, 2026-10-29: a Character pack had 170 bad lines and took 5:41, against none and 2:09 at 115200).
+fn pace_rate(port_rate: u32) -> u32 {
+    if cfg!(target_os = "macos") { port_rate } else { BAUD_RATE }
+}
 
 /// Only the BOX's UART bridge needs chunking; Espressif's native USB port has its own flow control.
 fn needs_pacing(vid: u16, pid: u16) -> bool {
@@ -1207,6 +1214,13 @@ mod tests {
         // At 921600 about 1.4 ms, plus the same headroom.
         let delay = piece_delay(128, 921_600);
         assert!(delay >= Duration::from_micros(2_380) && delay <= Duration::from_micros(2_400), "{delay:?}");
+    }
+
+    #[test]
+    fn only_macos_paces_at_the_fast_rate() {
+        assert_eq!(pace_rate(BAUD_RATE), BAUD_RATE);
+        let expected = if cfg!(target_os = "macos") { FAST_BAUD_RATE } else { BAUD_RATE };
+        assert_eq!(pace_rate(FAST_BAUD_RATE), expected);
     }
 
     #[test]
