@@ -10,10 +10,20 @@ public struct Status: Codable, Equatable {
     public var config: DaemonConfig
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     public var updates: UpdateStatus?
+    /// Every Activity, newest first, as the box's task cards show them; absent from older daemons.
+    public var activities: [ActivitySummary]?
+
     /// The person's VibeBuddy account (ADR-0018); absent from older daemons, which can't sign in.
     public var account: AccountStatus?
+    /// Which of the user's own keys for spoken replies are set (ADR-0020); absent from older daemons.
+    public var voiceKeys: VoiceKeysStatus?
+    /// The Character being made, or the last one made since the daemon started (ADR-0020); absent when there is none,
+    /// and from older daemons.
+    public var making: MakingStatus?
 
-    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil, account: AccountStatus? = nil) {
+    enum CodingKeys: String, CodingKey { case daemon, device, today, hooks, operation, config, updates, account, voiceKeys = "voice_keys", making, activities }
+
+    public init(daemon: DaemonInfo, device: DeviceState, today: TodaySummary, hooks: HooksSeen, operation: DeviceOperation?, config: DaemonConfig, updates: UpdateStatus? = nil, account: AccountStatus? = nil, voiceKeys: VoiceKeysStatus? = nil, making: MakingStatus? = nil, activities: [ActivitySummary]? = nil) {
         self.daemon = daemon
         self.device = device
         self.today = today
@@ -21,8 +31,41 @@ public struct Status: Codable, Equatable {
         self.operation = operation
         self.config = config
         self.updates = updates
+        self.activities = activities
         self.account = account
+        self.voiceKeys = voiceKeys
+        self.making = making
     }
+}
+
+/// One Activity as the daemon summarises it (daemon/src/activity.rs `ActivitySummary`).
+public struct ActivitySummary: Codable, Equatable, Sendable {
+    /// `codex`, `claude-code`, `github-actions`, or the agent a CLI hook names (`opencode`, `copilot`, `pi`).
+    public var agent: String
+    /// The task card's title, with the prefix that tells agents apart (`CC:`, `CX:`…).
+    public var title: String
+    public var project: String?
+    /// `working` or `needs_input`.
+    public var state: String
+
+    public init(agent: String, title: String, project: String? = nil, state: String) {
+        self.agent = agent
+        self.title = title
+        self.project = project
+        self.state = state
+    }
+}
+
+/// The daemon says only whether each key is set, and whether its provider refused it; a key never comes back.
+public struct VoiceKeysStatus: Codable, Equatable {
+    public struct Key: Codable, Equatable {
+        public var set: Bool
+        public var refused: Bool
+        public init(set: Bool, refused: Bool = false) { self.set = set; self.refused = refused }
+    }
+    public var elevenlabs: Key
+    public var volc: Key
+    public init(elevenlabs: Key, volc: Key) { self.elevenlabs = elevenlabs; self.volc = volc }
 }
 
 /// An account has an email or a GitHub user, never both.
@@ -34,9 +77,52 @@ public struct AccountStatus: Codable, Equatable {
     public var githubID: Int?
     /// Looked up on GitHub when signing in; nil if that lookup failed.
     public var githubLogin: String?
-    enum CodingKeys: String, CodingKey { case available, signedIn = "signed_in", email, githubID = "github_id", githubLogin = "github_login" }
-    public init(available: Bool, signedIn: Bool, email: String? = nil, githubID: Int? = nil, githubLogin: String? = nil) {
+    /// Voice used in the current UTC day, when the daemon knows; absent from daemons before it.
+    public var today: AccountUsage?
+    /// Why the service refused voice today: `allowance` or `global_cap`.
+    public var refused: String?
+    /// The account's plan (ADR-0020), when the daemon knows.
+    public var plan: AccountPlan?
+    enum CodingKeys: String, CodingKey { case available, signedIn = "signed_in", email, githubID = "github_id", githubLogin = "github_login", today, refused, plan }
+    public init(available: Bool, signedIn: Bool, email: String? = nil, githubID: Int? = nil, githubLogin: String? = nil, today: AccountUsage? = nil, refused: String? = nil, plan: AccountPlan? = nil) {
         self.available = available; self.signedIn = signedIn; self.email = email; self.githubID = githubID; self.githubLogin = githubLogin
+        self.today = today; self.refused = refused; self.plan = plan
+    }
+
+    /// When refused voice comes back: the next 00:00 UTC after `now`, when the service's day starts over, as HH:mm
+    /// (24 hours) in `timeZone`, the same time the box shows.
+    public static func voiceComesBack(after now: Date = Date(), in timeZone: TimeZone = .current) -> String {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let midnight = utc.date(byAdding: .day, value: 1, to: utc.startOfDay(for: now))!
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "HH:mm"
+        return formatter.string(from: midnight)
+    }
+}
+
+/// `free`, or `paid` with the billing period's end and its monthly allowance, in characters of our voices.
+public struct AccountPlan: Codable, Equatable {
+    public var name: String
+    public var periodEnd: Date?
+    public var characters: Int?
+    public var charactersLimit: Int?
+    enum CodingKeys: String, CodingKey { case name, periodEnd = "period_end", characters, charactersLimit = "characters_limit" }
+    public init(name: String, periodEnd: Date? = nil, characters: Int? = nil, charactersLimit: Int? = nil) {
+        self.name = name; self.periodEnd = periodEnd; self.characters = characters; self.charactersLimit = charactersLimit
+    }
+    public var paid: Bool { name == "paid" }
+}
+
+public struct AccountUsage: Codable, Equatable {
+    public var day: String
+    public var commands: Int
+    public var commandsLimit: Int
+    enum CodingKeys: String, CodingKey { case day, commands, commandsLimit = "commands_limit" }
+    public init(day: String, commands: Int, commandsLimit: Int) {
+        self.day = day; self.commands = commands; self.commandsLimit = commandsLimit
     }
 }
 
@@ -129,7 +215,11 @@ public struct DeviceState: Codable, Equatable {
     public var wifiSeen: [SeenNetwork]?
     /// The firmware takes updates over any link (ADR-0016): no cable, no download mode. Absent from older daemons.
     public var transfer: Bool?
-    enum CodingKeys: String, CodingKey { case transfer, wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiError = "wifi_error", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
+    /// The last image sent over the link didn't confirm itself, and the box went back (`FIRMWARE ROLLED BACK`).
+    public var rolledBack: Bool?
+    /// Why the Relay won't carry the link (ADR-0020): `signed_out`, `plan` or `unavailable`. Absent from older daemons.
+    public var relayRefused: String?
+    enum CodingKeys: String, CodingKey { case transfer, rolledBack = "rolled_back", relayRefused = "relay_refused", wifiNetwork = "wifi_network", wifiAddress = "wifi_address", wifiError = "wifi_error", wifiSeen = "wifi_seen", relay, busy, connected, port, bridge, network, mode, firmwareBuild = "firmware_build", firmwareVersion = "firmware_version", voice, volume, foreignFirmware = "foreign_firmware", pin, candidates, unsupportedBoard = "unsupported_board", boxKey = "box_key", computerKey = "computer_key", pairedComputers = "paired_computers" }
     public init(connected: Bool, port: String? = nil, bridge: Bool = false, mode: String? = nil, firmwareBuild: String? = nil, firmwareVersion: String? = nil, voice: String? = nil, volume: Int? = nil, foreignFirmware: Bool? = nil) {
         self.connected = connected; self.port = port; self.bridge = bridge; self.mode = mode; self.firmwareBuild = firmwareBuild; self.firmwareVersion = firmwareVersion; self.voice = voice; self.volume = volume
         self.foreignFirmware = foreignFirmware

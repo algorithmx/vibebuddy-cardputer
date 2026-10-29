@@ -299,6 +299,8 @@ Testing on the Omarchy box, `ssh box '...; pkill -f fake_daemon.py; ...'` killed
 
 Over SSH, match by something the shell's own command line can't contain: a PID kept from when you started the process (`cmd & PID=$!`, then `kill $PID`), an exact executable with `pkill -x` on the process name, or put the steps in a script file and run that. After a 255, check what state the box was left in before going on.
 
+It happened twice more, on 2026-10-24 and 2026-10-26. The second time the pattern was written `[t]arget/debug/...` so it couldn't match itself, but the same command also set `B=.../target/debug/vibebuddy-desktop` to launch the app, and that text matched. A bracket only hides the pattern, not every other place the path appears in the command. Anchor the pattern to the start of the process's own command line instead (`pkill -f '^/home/beclab/.../vibebuddy-desktop'`): the shell's command line starts with `bash -c`, so it can never match.
+
 ## Install from up-to-date main, not from whatever the worktree happens to hold
 
 On 2026-10-09 I had dragon run `just install` in a worktree branched before #99, which renamed the bundle to `VibeBuddy.app`. The worktree's `build-app.sh` still installed to `/Applications/Vibe Buddy.app`, so the new build landed next to the app in daily use instead of replacing it, and two copies fought over the box and port 7331.
@@ -348,3 +350,11 @@ Before a firmware change that adds statics or `dma_*_buffer!` macros goes to a b
 The microphone bring-up on 2026-10-13 took four flashes after the stack fix. A four-descriptor ring stalled for good: the task that relinked used descriptors only ran when the main loop yielded, and once the DMA reached the end of the chain it stopped. A linear PSRAM buffer then filled every descriptor and still came back short: the I2S receiver signals an EOF every RXEOF_NUM bytes, each EOF closes the descriptor it lands in, and esp-hal leaves RXEOF_NUM at 0xFFE, so the descriptors came back 4080, 14, 4080, 14. I had read the TRM's formula as counting samples and predicted 4080, 4080, 30; the box showed bytes, as ESP-IDF's driver uses the register.
 
 Count received data by the descriptors' lengths, never by the buffer's size, and on the ESP32-S3 expect a receive descriptor to be cut short by a peripheral EOF. What made each flash count was the diagnostic reporting its own state (descriptors handed back, the first lengths, the I2S and DMA registers) instead of only pass or fail: the second and third flashes each named the next cause outright. Put that in the first build of any bring-up, since each flash of a shared box costs a turn.
+
+## An answer that doesn't say what it answers can't drive a resend
+
+`xfer.*` over the UART bridge failed for four reasons stacked on each other (#198), and each fix only showed the next one on the real box: a 2048-byte line cap that dropped the newline, flash writes long enough to overflow the UART FIFO, a CRC mismatch that ended the transfer, and a daemon that waited 20 s for each lost chunk. Unit tests passed at every step. Only the box, watched through the daemon log, showed what was left.
+
+The daemon fix went wrong twice. The box's `xfer.ack` said only which offset it wanted next, so "the same offset again" could mean a lost chunk, a copy the box already had, or an answer from before the link moved. A rule that guessed sent about 6500 chunks for 980 over the Relay, and a FakeBox that answered at once, with no answers in flight, never showed it. The fix was to have the answer carry what it answers (a `round` the box returns).
+
+Before you build retransmission on acknowledgements, make sure each answer says which send it belongs to. Test with answers that come late, twice, or from before a reconnect, not only with a peer that answers each message at once.

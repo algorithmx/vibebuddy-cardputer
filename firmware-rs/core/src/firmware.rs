@@ -160,6 +160,9 @@ pub trait Board: Screen {
     fn write_stream(&mut self, line: &[u8]) {
         self.write(line);
     }
+    /// `device.baud` from the computer on the cable: say `BAUD SWITCH <rate>` on the UART and move it to that rate,
+    /// on trial ([`crate::uart_rate`]). Boards without a UART bridge ignore it.
+    fn set_uart_rate(&mut self, _rate: u32) {}
     /// Hands a spoken reply's audio to the player ([`crate::spoken_reply`]), which the speaker plays from while
     /// no announcement is playing, through the same output and at the same volume.
     fn reply_audio(&mut self, _audio: ReplyAudio) {}
@@ -365,6 +368,16 @@ fn occasion_label(occasion: Occasion) -> &'static str {
         Occasion::LongSession => "LONG_SESSION",
         Occasion::WelcomeBack => "WELCOME_BACK",
     }
+}
+
+/// Holds a byte from the UART until its line is whole, for [`Firmware::receive`]; true once `byte` ended the line.
+/// It keeps as much as `receive` takes, so a transfer chunk gets through whole and an overlong line still arrives as
+/// overlong. The newline always goes in: without it the line would run into the next.
+pub fn hold_line_byte(line: &mut Vec<u8>, byte: u8) -> bool {
+    if byte == b'\n' || line.len() < LINE_BUFFER_BYTES {
+        line.push(byte);
+    }
+    byte == b'\n'
 }
 
 impl Firmware {
@@ -854,7 +867,7 @@ impl Firmware {
     fn set_link_lost<B: Board>(&mut self, board: &mut B, lost: bool) {
         if lost && !self.link_lost {
             // Whoever offered voice is gone; the next link offers it again if it can.
-            self.set_voice_available(board, false);
+            self.set_voice_available(board, false, None, None);
         }
         self.link_lost = lost;
         let now = board.now_ms();
@@ -1121,10 +1134,12 @@ impl Firmware {
         }
 
         // While the computer offers voice commands, a long K0 is push-to-talk; giving up a phase is then in
-        // the menu (ADR-0017).
+        // the menu (ADR-0017). With voice off and Pomodoro idle, it shows why voice is off, if the computer said.
         if event == ButtonEvent::K0Long {
             if self.voice.available() {
                 self.start_recording(board, now);
+            } else if self.pomodoro.view(now).is_idle() && self.voice.show_why_off(now) {
+                self.show_overlay(board);
             } else {
                 self.stop_phase(board);
             }
@@ -1320,9 +1335,9 @@ impl Firmware {
         }
     }
 
-    /// `voice.available`, a new link or a lost one.
-    fn set_voice_available<B: Board>(&mut self, board: &mut B, on: bool) {
-        let out = self.voice.set_available(on);
+    /// `voice.available` (with why voice is off, if the computer says), a new link or a lost one.
+    fn set_voice_available<B: Board>(&mut self, board: &mut B, on: bool, reason: Option<&str>, message: Option<&str>) {
+        let out = self.voice.offer(on, reason, message, board.now_ms());
         Self::write_voice(board, out);
         self.stop_voice_mic(board);
         if !on {
@@ -1440,10 +1455,10 @@ impl Firmware {
         self.stop_voice_mic(board);
     }
 
-    /// `voice.heard`, `voice.reply`, `voice.done` and `voice.error` for a turn.
-    fn on_voice_turn<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str) {
+    /// `voice.heard`, `voice.reply`, `voice.done` and `voice.error` for a turn; `message` is the envelope's.
+    fn on_voice_turn<B: Board>(&mut self, board: &mut B, fields: &BTreeMap<alloc::string::String, Value>, event: &str, message: Option<&str>) {
         let Some(turn) = number(fields, "turn").filter(|turn| *turn >= 0.0) else { return };
-        let text = string(fields, if event == "voice.error" { "message" } else { "text" });
+        let text = if event == "voice.error" { message } else { string(fields, "text") };
         let now = board.now_ms();
         if self.voice.event(event, turn as u32, text, string(fields, "reason"), now) {
             self.stop_voice_mic(board);
@@ -1869,7 +1884,7 @@ impl Firmware {
             // asking it would never know.
             // A new link starts with voice commands off; the computer offers them after this if it can.
             "device.hello" => {
-                self.set_voice_available(board, false);
+                self.set_voice_available(board, false, None, None);
                 self.announce_state(board);
             }
             // The daily greeting or a welcome back: a line and nothing else. It isn't agent activity,
@@ -1902,14 +1917,18 @@ impl Firmware {
                 }
             }
             // Voice commands (docs/protocol.md): the computer offers them, then answers each turn.
-            "voice.available" => self.set_voice_available(board, fields.get("on") == Some(&Value::Bool(true))),
-            "voice.heard" | "voice.reply" | "voice.done" | "voice.error" => self.on_voice_turn(board, fields, event),
+            "voice.available" => {
+                let on = fields.get("on") == Some(&Value::Bool(true));
+                // `message` is the envelope's own field, not one of the extra ones.
+                self.set_voice_available(board, on, string(fields, "reason"), message.message.as_deref());
+            }
+            "voice.heard" | "voice.reply" | "voice.done" | "voice.error" => self.on_voice_turn(board, fields, event, message.message.as_deref()),
             "voice.audio" => self.on_voice_audio(board, fields),
             _ if event.starts_with("voice.") => self.handle_voice_event(board, fields, event),
             _ if event.starts_with("xfer.") => self.handle_transfer(board, fields, event),
             // Pairing is the computer at the other end of the cable telling the box who it is (ADR-0012).
             // Only over the cable: whoever is at the box decides who may link and which network it joins.
-            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" | "device.relay.set"
+            "device.pair" | "device.unpair" | "device.pairs" | "device.wifi.set" | "device.wifi.forget" | "device.wifi.scan" | "device.relay.set" | "device.baud"
                 if self.remote =>
             {
                 Self::write_literal(board, "ERROR cable_only\n");
@@ -1921,6 +1940,14 @@ impl Firmware {
             "device.relay.set" => self.handle_relay(board, fields),
             // The radio belongs to the device layer, which reports what it hears as `WIFI SEEN` lines.
             "device.wifi.scan" => self.scan_requested = true,
+            // The UART bridge's speed (docs/protocol.md, "Link speed on the UART bridge"). The check only has to
+            // arrive whole at the new rate, which the device layer sees; it is not agent activity.
+            "device.baud" => {
+                if let Some(rate) = number(fields, "rate").filter(|rate| *rate > 0.0) {
+                    board.set_uart_rate(rate as u32);
+                }
+            }
+            "device.baud.check" => {}
             // Microphone bring-up (docs/firmware-bringup.md): a diagnostic like the screenshot, so not agent
             // activity. Over the cable only: a recording is hundreds of lines.
             "device.mic.record" if self.remote => Self::write_literal(board, "ERROR cable_only\n"),
@@ -2163,13 +2190,17 @@ impl Firmware {
                     return self.after_transfer(board);
                 };
                 let mut bytes = alloc::vec![0u8; transfer::CHUNK_BYTES + 3];
-                let Some(length) = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes) else {
-                    self.transfer.cancel();
-                    Self::transfer_error(board, transfer::Error::BadMessage);
-                    return self.after_transfer(board);
-                };
+                // Base64 the UART bridge damaged decodes to nothing, and the chunk is asked for again.
+                let length = crate::voice_pack::decode_base64(data.as_bytes(), &mut bytes).unwrap_or(0);
                 match self.transfer.chunk(board.flash(), offset as u32, &bytes[..length], crc as u32) {
-                    Ok(next) => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    // The computer's round goes back with the answer: it tells answers to chunks sent again apart.
+                    Ok(next) => match number(fields, "round") {
+                        Some(round) => {
+                            let line = text!(96, "{{\"version\":1,\"event\":\"xfer.ack\",\"offset\":{},\"round\":{}}}\n", next, round as u64);
+                            board.write(line.as_bytes());
+                        }
+                        None => Self::transfer_reply(board, "xfer.ack", Some(next)),
+                    },
                     Err(failure) => Self::transfer_error(board, failure),
                 }
             }

@@ -16,9 +16,31 @@ pub struct Status {
     pub config: Config,
     /// What the update manifest offers (ADR-0010); absent from older daemons.
     pub updates: Option<Updates>,
+    /// Every Activity, newest first, as the box's task cards show them; empty from older daemons.
+    pub activities: Vec<Activity>,
     /// The VibeBuddy account this computer is signed in to (ADR-0018); older daemons don't say, which reads as not
     /// available.
     pub account: Account,
+    /// Which of the user's own keys for spoken replies are set (ADR-0020); absent from older daemons.
+    pub voice_keys: Option<VoiceKeys>,
+    /// The Character being made, or the last one made since the daemon started (ADR-0020); absent when there is none,
+    /// and from older daemons.
+    pub making: Option<crate::making::Making>,
+}
+
+/// The daemon says only whether each key is set, and whether its provider refused it; a key never comes back.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiceKeys {
+    pub elevenlabs: VoiceKey,
+    pub volc: VoiceKey,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct VoiceKey {
+    pub set: bool,
+    pub refused: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -32,6 +54,81 @@ pub struct Account {
     pub github_id: Option<u64>,
     /// Looked up on GitHub when signing in; the service keeps only the id.
     pub github_login: Option<String>,
+    /// Voice used in the current UTC day, when the daemon knows.
+    pub today: Option<Usage>,
+    /// Why the service refused voice today: `allowance` or `global_cap`.
+    pub refused: Option<String>,
+    /// The account's plan (ADR-0020), when the daemon knows.
+    pub plan: Option<Plan>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Plan {
+    /// `free` or `paid`.
+    pub name: String,
+    /// When the billing period ends and the plan renews, RFC 3339; the counts and this come only on the Paid plan.
+    pub period_end: Option<String>,
+    pub characters: Option<u64>,
+    pub characters_limit: Option<u64>,
+}
+
+impl Plan {
+    pub fn paid(&self) -> bool {
+        self.name == "paid"
+    }
+
+    /// "This month: 12,300 of 100,000 characters · renews 24 Nov", on the Paid plan only.
+    pub fn month_line(&self) -> Option<String> {
+        let (Some(used), Some(limit), Some(end)) = (self.characters, self.characters_limit, self.period_end.as_deref()) else { return None };
+        let end = chrono::DateTime::parse_from_rfc3339(end).ok()?.with_timezone(&chrono::Local);
+        let renews = if crate::i18n::is_chinese() { end.format("%-m月%-d日") } else { end.format("%-d %b") }.to_string();
+        self.paid().then(|| tr("This month: %@ of %@ characters · renews %@", &[&grouped(used), &grouped(limit), &renews]))
+    }
+}
+
+/// When refused voice comes back: the next 00:00 UTC after `now`, when the service's day starts over, as `HH:MM`
+/// (24 hours) in `zone`, the same time the box shows.
+pub fn voice_comes_back<Zone: chrono::TimeZone>(now: chrono::DateTime<chrono::Utc>, zone: &Zone) -> String
+where
+    Zone::Offset: std::fmt::Display,
+{
+    let midnight = (now.date_naive() + chrono::Days::new(1)).and_time(chrono::NaiveTime::MIN).and_utc();
+    midnight.with_timezone(zone).format("%H:%M").to_string()
+}
+
+/// `12300` as "12,300".
+fn grouped(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Usage {
+    pub day: String,
+    pub commands: u64,
+    pub commands_limit: u64,
+}
+
+/// One Activity as the daemon summarises it (daemon/src/activity.rs `ActivitySummary`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Activity {
+    /// `codex`, `claude-code`, `github-actions`, or the agent a CLI hook names (`opencode`, `copilot`, `pi`).
+    pub agent: String,
+    /// The task card's title, with the prefix that tells agents apart (`CC:`, `CX:`…).
+    pub title: String,
+    pub project: Option<String>,
+    /// `working` or `needs_input`.
+    pub state: String,
 }
 
 /// The daemon's view of updates; which firmware to offer is its call, as on the Mac.
@@ -185,6 +282,8 @@ pub struct Device {
     pub box_key: Option<String>,
     /// The firmware takes updates over any link (ADR-0016): no cable, no download mode.
     pub transfer: bool,
+    /// The last image sent over the link didn't confirm itself, and the box went back (`FIRMWARE ROLLED BACK`).
+    pub rolled_back: bool,
     /// This computer's key, to tell it apart in `paired_computers`.
     pub computer_key: Option<String>,
     pub paired_computers: Vec<PairedComputer>,
@@ -195,6 +294,8 @@ pub struct Device {
     pub wifi_error: Option<String>,
     /// What the box heard on its last scan, strongest first.
     pub wifi_seen: Vec<SeenNetwork>,
+    /// Why the Relay won't carry the link (ADR-0020): `signed_out`, `plan` or `unavailable`.
+    pub relay_refused: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -242,6 +343,15 @@ impl Device {
             (Some(version), Some(build)) => Some(format!("{version} · {build}")),
             (version, build) => version.clone().or_else(|| build.clone()),
         }
+    }
+
+    /// What the link section says about the Relay turning this computer away.
+    pub fn relay_refusal(&self) -> Option<String> {
+        Some(match self.relay_refused.as_deref()? {
+            "signed_out" => tr("Sign in to use the Relay.", &[]),
+            "plan" => tr("The Relay needs the Paid plan.", &[]),
+            _ => tr("The Relay can't check the account right now. VibeBuddy tries again later.", &[]),
+        })
     }
 }
 
@@ -455,6 +565,13 @@ mod tests {
     }
 
     #[test]
+    fn the_relays_refusal_is_explained() {
+        let device: Device = serde_json::from_str(r#"{"connected":false,"relay_refused":"plan"}"#).expect("device");
+        assert_eq!(device.relay_refusal().as_deref(), Some("The Relay needs the Paid plan."));
+        assert_eq!(Device::default().relay_refusal(), None);
+    }
+
+    #[test]
     fn the_account_reads_as_not_available_from_an_older_daemon() {
         let status: Status = serde_json::from_str(LIVE).expect("status");
         assert_eq!(status.account, Account::default());
@@ -465,6 +582,49 @@ mod tests {
         .expect("account");
         assert!(account.available && account.signed_in);
         assert_eq!((account.github_id, account.github_login.as_deref(), account.email), (Some(60097), Some("octocat"), None));
+        let used: Account = serde_json::from_str(r#"{"signed_in":true,"today":{"day":"2026-10-24","commands":7,"commands_limit":100},"refused":"global_cap"}"#).expect("account");
+        assert_eq!(used.today, Some(Usage { day: "2026-10-24".to_owned(), commands: 7, commands_limit: 100 }));
+        assert_eq!(used.refused.as_deref(), Some("global_cap"));
+        assert_eq!(used.plan, None);
+    }
+
+    #[test]
+    fn refused_voice_comes_back_at_the_next_midnight_utc_in_local_time() {
+        let at = |text: &str| chrono::DateTime::parse_from_rfc3339(text).unwrap().with_timezone(&chrono::Utc);
+        let zone = |hours: i32| chrono::FixedOffset::east_opt(hours * 3600).unwrap();
+        assert_eq!(voice_comes_back(at("2026-10-27T15:59:00Z"), &zone(8)), "08:00");
+        assert_eq!(voice_comes_back(at("2026-10-27T15:59:00Z"), &zone(-5)), "19:00");
+        assert_eq!(voice_comes_back(at("2026-12-31T23:59:59Z"), &chrono::Utc), "00:00");
+    }
+
+    #[test]
+    fn the_plan_decodes_and_only_the_paid_plan_has_a_month() {
+        let free: Account = serde_json::from_str(r#"{"signed_in":true,"plan":{"name":"free"}}"#).expect("account");
+        let free = free.plan.expect("plan");
+        assert!(!free.paid());
+        assert_eq!(free.month_line(), None);
+        let paid: Plan = serde_json::from_str(r#"{"name":"paid","period_end":"2026-11-24T12:00:00.000Z","characters":12300,"characters_limit":100000}"#).expect("plan");
+        assert!(paid.paid());
+        let line = paid.month_line().expect("a month");
+        assert!(line.starts_with("This month: 12,300 of 100,000 characters · renews ") && line.ends_with(" Nov"), "{line}");
+        assert_eq!((grouped(0), grouped(999), grouped(1000), grouped(1234567)), ("0".to_owned(), "999".to_owned(), "1,000".to_owned(), "1,234,567".to_owned()));
+    }
+
+    #[test]
+    fn own_keys_read_as_absent_from_an_older_daemon() {
+        let status: Status = serde_json::from_str(LIVE).expect("status");
+        assert_eq!(status.voice_keys, None);
+        let keys: VoiceKeys = serde_json::from_str(r#"{"elevenlabs": {"set": true, "refused": true}, "volc": {"set": false, "refused": false}}"#).expect("keys");
+        assert_eq!(keys, VoiceKeys { elevenlabs: VoiceKey { set: true, refused: true }, volc: VoiceKey::default() });
+    }
+
+    #[test]
+    fn the_character_being_made_reads_and_is_absent_from_an_older_daemon() {
+        let status: Status = serde_json::from_str(LIVE).expect("status");
+        assert_eq!(status.making, None);
+        let status: Status = serde_json::from_str(r#"{"making":{"id":"owl-1a2b3c4d","name":"Owl","state":"making","done":3,"total":12,"reason":null,"error":null}}"#).expect("status");
+        let making = status.making.expect("making");
+        assert!(making.running() && making.id == "owl-1a2b3c4d" && making.progress() == 0.25, "{making:?}");
     }
 
     #[test]

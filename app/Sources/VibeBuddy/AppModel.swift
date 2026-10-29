@@ -21,6 +21,10 @@ final class AppModel: ObservableObject {
     /// The daemon runs the experimental resident session, so the Conversation tab shows. Asked each time the daemon
     /// comes up, since only its environment at start decides; kept while it is down, so the tab can say so.
     @Published private(set) var residentEnabled = false
+    /// The Characters made on this computer, and the voices one can be made with (ADR-0020); asked when the daemon
+    /// comes up and whenever a job changes state.
+    @Published private(set) var madeCharacters: [MadeCharacter] = []
+    @Published private(set) var characterVoices: [CharacterVoice] = []
 
     let client = DaemonClient()
     let supervisor = DaemonSupervisor()
@@ -40,6 +44,8 @@ final class AppModel: ObservableObject {
     private static let pendingVoiceKey = "pendingVoice"
     /// The last firmware version a notification was posted for, so each new one is announced once.
     private static let notifiedFirmwareKey = "notifiedFirmware"
+    /// The korekore UI words its notifications its own way (ADR-0021, canvas: "SYSTEM NOTIFICATIONS").
+    private static let korekore = AppUI.atLaunch() == .korekore
 
     init() {
         preview.onFinish = { [weak self] in self?.previewingVoice = nil }
@@ -51,9 +57,15 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             self.daemonAlive = false
             self.refreshMenu()
-            // Default to on only until the daemon has reported a preference.
+            // The status is gone by now, so this reads the preference remembered from the last one; default to on
+            // until a daemon has reported it.
             if self.notifyLink {
-                Notifier.notify(title: "VibeBuddy", body: String(localized: "The daemon failed to start three times in a row. Click the menu bar icon to restart it."))
+                if Self.korekore {
+                    Notifier.notify(title: String(localized: "The daemon failed to start three times"),
+                                    body: String(localized: "Open korekore to restart it or export diagnostics."))
+                } else {
+                    Notifier.notify(title: "VibeBuddy", body: String(localized: "The daemon failed to start three times in a row. Click the menu bar icon to restart it."))
+                }
             }
         }
         refreshHookStates()
@@ -69,7 +81,9 @@ final class AppModel: ObservableObject {
             // as changed and silently disabled them, and the box announced nothing from Codex for four hours. This one ignores the
             // link-notification switch: the app itself made the change, so a person has to finish the job.
             Notifier.notify(title: String(localized: "Codex hook config updated"),
-                            body: String(localized: "VibeBuddy rewrote ~/.codex/hooks.json. Codex silently disables hooks that change: type /hooks in Codex and re-trust them so the box keeps getting Codex events."))
+                            body: Self.korekore
+                                ? String(localized: "Trust korekore's hooks again with /hooks in Codex.")
+                                : String(localized: "VibeBuddy rewrote ~/.codex/hooks.json. Codex silently disables hooks that change: type /hooks in Codex and re-trust them so the box keeps getting Codex events."))
         }
         refreshHookStates()
         if managesDaemon { supervisor.start() }
@@ -102,6 +116,9 @@ final class AppModel: ObservableObject {
 
     private func apply(_ status: Status) {
         if !daemonAlive { refreshResident() }
+        if !daemonAlive || status.making?.id != self.status?.making?.id || status.making?.state != self.status?.making?.state {
+            refreshMadeCharacters()
+        }
         self.status = status
         notifyLink = status.config.notifyLink
         daemonAlive = true
@@ -122,6 +139,22 @@ final class AppModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+    /// Debug builds only: shows a sample status without a daemon, for the korekore page snapshots.
+    func showSample(_ status: Status) {
+        self.status = status
+        daemonAlive = true
+        refreshMenu()
+    }
+    #endif
+
+    func refreshMadeCharacters() {
+        Task {
+            if let made = try? await client.madeCharacters() { madeCharacters = made }
+            if characterVoices.isEmpty, let voices = try? await client.characterVoices() { characterVoices = voices }
+        }
+    }
+
     private func refreshForeignFirmware() {
         let foreign = status.map { Firmware.foreign($0.device) } ?? false
         if foreign != foreignFirmware { foreignFirmware = foreign }
@@ -137,7 +170,7 @@ final class AppModel: ObservableObject {
               UserDefaults.standard.string(forKey: Self.notifiedFirmwareKey) != offer.version else { return }
         UserDefaults.standard.set(offer.version, forKey: Self.notifiedFirmwareKey)
         Notifier.notify(title: String(localized: "Box firmware \(offer.version) is available"),
-                        body: String(localized: "Open Settings → Device to update the box."))
+                        body: Self.korekore ? String(localized: "Update it from Settings › Device.") : String(localized: "Open Settings → Device to update the box."))
     }
 
     /// Notify once after the link has been down for 30 seconds (debounced); reset when it's plugged back in.
@@ -151,7 +184,9 @@ final class AppModel: ObservableObject {
         if linkLostSince == nil { linkLostSince = Date() }
         if !linkNotified, let since = linkLostSince, Date().timeIntervalSince(since) >= 30 {
             linkNotified = true
-            Notifier.notify(title: String(localized: "Box disconnected"), body: String(localized: "VibeBuddy hasn't seen the box for 30 seconds. Check the USB cable."))
+            Notifier.notify(title: String(localized: "Box disconnected"),
+                            body: Self.korekore ? String(localized: "The box has been gone for 30 seconds.")
+                                : String(localized: "VibeBuddy hasn't seen the box for 30 seconds. Check the USB cable."))
         }
     }
 
@@ -250,6 +285,8 @@ final class AppModel: ObservableObject {
         guard let current = status?.device.voice else { return }
         if VoiceCatalogEntry.language(ofVoice: current) == language, current != "builtin" {
             writeVoice(current)
+        } else if let made = madeCharacters.first(where: { $0.id == current }), made.complete, self.language(of: made) == language {
+            writeMadeCharacter(made)
         } else if current == "custom", let saved = savedCustomCharacter, VoiceCatalogEntry.language(ofVoice: saved.lender) == language {
             writeCustomCharacter(look: saved.look, lender: saved.lender)
         }
@@ -310,6 +347,70 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(lender, forKey: Self.customLenderKey)
         writePack(pack, lender: lender, address: VoiceCatalogEntry.language(ofVoice: lender).flatMap(formOfAddress))
         return true
+    }
+
+    // MARK: Making a Character
+
+    /// The language a made Character speaks: its voice's, else its base preset's.
+    func language(of made: MadeCharacter) -> VoiceLanguage? {
+        characterVoices.first { $0.id == made.voice }?.voiceLanguage ?? VoiceCatalogEntry.language(ofVoice: made.base)
+    }
+
+    func characterVoice(_ id: String) -> CharacterVoice? { characterVoices.first { $0.id == id } }
+
+    /// The look a made Character wears: the one the user brought for it, else its base preset's.
+    func look(of made: MadeCharacter) -> Data? {
+        (try? Data(contentsOf: Resources.madeCharacterDirectory(made.id).appendingPathComponent("look.bin")))
+            ?? Resources.voicePack(made.base)?.look
+    }
+
+    /// Starts making a Character (`look` is the user's, or nil for the base's); nil when the daemon took it, else why not.
+    func makeCharacter(_ request: CharacterRequest, look: Data?) async -> String? {
+        do {
+            let started = try await client.makeCharacter(request)
+            if let look {
+                let directory = Resources.madeCharacterDirectory(started.id)
+                try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try? look.write(to: directory.appendingPathComponent("look.bin"))
+            }
+            refreshMadeCharacters()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Makes the rest of a Character whose job stopped: the same request again, with its id.
+    func resumeCharacter(_ id: String) {
+        let manifest = Resources.madeCharacterDirectory(id).appendingPathComponent("manifest.json")
+        guard let data = try? Data(contentsOf: manifest), var request = try? JSONDecoder().decode(CharacterRequest.self, from: data) else {
+            lastError = String(localized: "Couldn't read what was asked for this Character.")
+            return
+        }
+        request.id = id
+        Task { if let problem = await makeCharacter(request, look: nil) { lastError = problem } }
+    }
+
+    /// Deletes a made Character, its packs and look with it; the caller asks first.
+    func deleteMadeCharacter(_ made: MadeCharacter) {
+        Task {
+            do { try await client.deleteCharacter(made.id) } catch { lastError = String(localized: "Couldn't delete “\(made.name)”: \(error.localizedDescription)") }
+            refreshMadeCharacters()
+        }
+    }
+
+    /// Writes a made Character to the box: the daemon's pack of its lines, said with the form of address picked for its
+    /// language, wearing its look. Works on any plan: nothing is synthesized again.
+    func writeMadeCharacter(_ made: MadeCharacter) {
+        let directory = Resources.madeCharacterDirectory(made.id)
+        let form = language(of: made).flatMap(formOfAddress)
+        let variant = form.flatMap { try? Data(contentsOf: directory.appendingPathComponent("address").appendingPathComponent("\($0).bin")) }
+        guard let pack = try? Data(contentsOf: directory.appendingPathComponent("pack.bin")),
+              let data = VoicePack.made(pack, variant: variant, look: look(of: made), id: made.id) else {
+            lastError = String(localized: "“\(made.name)” isn't finished yet.")
+            return
+        }
+        writePack(data, address: form)
     }
 
     func togglePreview(_ id: String) {

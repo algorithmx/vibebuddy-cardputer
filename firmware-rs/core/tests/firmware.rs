@@ -8,7 +8,7 @@ use vibebuddy_firmware_core::audio::{Codec, Prompt, Sound};
 use vibebuddy_firmware_core::buttons::Levels;
 use vibebuddy_firmware_core::canvas::FRAME_BYTES;
 use vibebuddy_firmware_core::display::Screen;
-use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError};
+use vibebuddy_firmware_core::firmware::{AudioStatus, Board, Firmware, FrameAction, VolumeError, hold_line_byte};
 use vibebuddy_firmware_core::noise::Sealer;
 use vibebuddy_firmware_core::spoken_reply::{ReplyAudio, ReplyPlayer};
 use vibebuddy_firmware_core::storage::{Flash, FlashError};
@@ -91,6 +91,8 @@ struct FakeBoard {
     peer_full: bool,
     /// Restarts asked for.
     restarts: usize,
+    /// UART rates asked for with `device.baud`.
+    uart_rates: Vec<u32>,
     /// Registers of the chips on I2C, by (address, register), and what was written.
     i2c: std::collections::BTreeMap<(u8, u8), u8>,
     i2c_writes: Vec<(u8, u8, u8)>,
@@ -132,6 +134,7 @@ impl FakeBoard {
             relay_peer: false,
             peer_full: false,
             restarts: 0,
+            uart_rates: Vec::new(),
             i2c: [((0x18, 0xFD), 0x83), ((0x18, 0xFE), 0x11), ((0x18, 0x16), 0x24)].into(),
             i2c_writes: Vec::new(),
             mic_input: true,
@@ -194,6 +197,9 @@ impl Board for FakeBoard {
     }
     fn restart(&mut self) {
         self.restarts += 1;
+    }
+    fn set_uart_rate(&mut self, rate: u32) {
+        self.uart_rates.push(rate);
     }
     fn now_ms(&self) -> u32 {
         self.now.get()
@@ -1097,6 +1103,22 @@ mod lan {
     }
 
     #[test]
+    fn the_uart_rate_is_asked_for_over_the_cable_only_and_quietly() {
+        let (mut firmware, mut board) = paired_box();
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.baud","rate":921600}"#).is_empty());
+        assert_eq!(board.uart_rates, [921_600]);
+        // The check only has to arrive; it isn't agent activity, so no `EVENT` line.
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.baud.check"}"#).is_empty());
+        assert!(send(&mut firmware, &mut board, r#"{"version":1,"event":"device.baud"}"#).is_empty(), "no rate, nothing to do");
+        assert_eq!(board.uart_rates, [921_600]);
+        board.advance(USB_QUIET_MS);
+        let mut sealer = link_up(&mut firmware, &mut board, 1);
+        say(&mut firmware, &mut board, 1, &mut sealer, r#"{"version":1,"event":"device.baud","rate":921600}"#);
+        assert_eq!(board.take_lines(), ["ERROR cable_only"]);
+        assert_eq!(board.uart_rates, [921_600]);
+    }
+
+    #[test]
     fn the_wifi_network_is_set_over_the_cable_and_kept() {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let lines = send(&mut firmware, &mut board, r#"{"version":1,"event":"device.wifi.set","ssid":"Home","password":"secret"}"#);
@@ -1431,6 +1453,39 @@ mod transfer {
         assert_eq!(reply(&send(&mut firmware, &mut board, &line))["offset"], CHUNK_BYTES as u64);
     }
 
+    /// Over the UART bridge the main loop holds bytes until their line is whole. It once kept only 2048 of them and
+    /// lost the newline, so every chunk ran into the next and the box answered `input_too_large` (2026-10-26).
+    #[test]
+    fn a_full_chunk_over_the_uart_is_held_whole() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; CHUNK_BYTES * 2];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let sha: String = Sha256::digest(&image).iter().map(|byte| format!("{byte:02x}")).collect();
+        begin_transfer(&mut firmware, &mut board, &format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":{},"sha256":"{sha}"}}"#, image.len()));
+        let uart = |firmware: &mut Firmware, board: &mut FakeBoard, bytes: &[u8]| {
+            let mut held = Vec::new();
+            for &byte in bytes {
+                if hold_line_byte(&mut held, byte) {
+                    firmware.receive(board, &held);
+                    held.clear();
+                }
+            }
+            board.take_lines()
+        };
+        let too_long = format!("{}\n", "x".repeat(5000));
+        assert_eq!(uart(&mut firmware, &mut board, too_long.as_bytes()), ["ERROR input_too_large"]);
+        let mut lines = Vec::new();
+        for (index, piece) in image.chunks(CHUNK_BYTES).enumerate() {
+            lines.extend_from_slice(
+                format!(r#"{{"version":1,"event":"xfer.chunk","offset":{},"crc":{},"data":"{}"}}"#, index * CHUNK_BYTES, crc32(0, piece), base64(piece)).as_bytes(),
+            );
+            lines.push(b'\n');
+        }
+        let acks: Vec<Value> = uart(&mut firmware, &mut board, &lines).iter().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(acks.iter().map(|ack| ack["offset"].as_u64().unwrap()).collect::<Vec<_>>(), [CHUNK_BYTES as u64, 2 * CHUNK_BYTES as u64]);
+    }
+
     /// Sends a whole image of `kind` over xfer.*; returns what the box said to xfer.end.
     fn send_over_xfer(firmware: &mut Firmware, board: &mut FakeBoard, kind: &str, image: &[u8], sha: &str) -> Vec<String> {
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"{kind}","size":{},"sha256":"{sha}"}}"#, image.len());
@@ -1559,10 +1614,29 @@ mod transfer {
         let (mut firmware, mut board, _) = booted(blank_flash());
         let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
         begin_transfer(&mut firmware, &mut board, &begin);
-        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&[0xE9; 100]));
-        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "crc"}));
+        let line = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":{},"data":"{}"}}"#, crc32(0, &[0x55; 100]), base64(&[0x55; 100]));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &line)), serde_json::json!({"version": 1, "event": "xfer.error", "code": "bad_image"}));
         assert_eq!(reply(&send(&mut firmware, &mut board, r#"{"version":1,"event":"xfer.end"}"#))["code"], "sequence");
         assert_eq!(board.restarts, 0);
+    }
+
+    /// The UART bridge changes bytes on the way: a chunk that fails its CRC, or whose base64 doesn't decode, is asked
+    /// for again with the offset the box still expects, and the transfer carries on.
+    #[test]
+    fn a_damaged_chunk_is_asked_for_again() {
+        let (mut firmware, mut board, _) = booted(blank_flash());
+        let mut image = vec![0xA5u8; 100];
+        image[0] = 0xE9;
+        image[12..14].copy_from_slice(&[9, 0]);
+        let begin = format!(r#"{{"version":1,"event":"xfer.begin","kind":"firmware","size":100,"sha256":"{}"}}"#, "00".repeat(32));
+        begin_transfer(&mut firmware, &mut board, &begin);
+        let ack = |offset: u64| serde_json::json!({"version": 1, "event": "xfer.ack", "offset": offset});
+        let bad_crc = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_crc)), ack(0));
+        let bad_base64 = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"crc":1,"data":"{}"}}"#, "!".repeat(136));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &bad_base64)), ack(0));
+        let good = format!(r#"{{"version":1,"event":"xfer.chunk","offset":0,"round":7,"crc":{},"data":"{}"}}"#, crc32(0, &image), base64(&image));
+        assert_eq!(reply(&send(&mut firmware, &mut board, &good)), serde_json::json!({"version": 1, "event": "xfer.ack", "offset": 100, "round": 7}), "the round comes back");
     }
 }
 /// Polls until `MIC END` and returns every line.
@@ -1684,6 +1758,55 @@ fn without_voice_a_long_k0_still_gives_up_the_phase() {
     send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false}"#);
     press(&mut firmware, &mut board, Key::K0, 50);
     assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+}
+
+#[test]
+fn with_voice_off_for_a_reason_a_long_k0_says_why_while_pomodoro_is_idle() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false,"reason":"allowance","message":"Today's voice is used up. It comes back at 08:00."}"#);
+    assert!(firmware.overlay().is_none(), "nothing shows until K0");
+    let lines = hold_k0_talking(&mut firmware, &mut board, 1500);
+    assert!(lines.is_empty(), "nothing recorded, no phase given up: {lines:?}");
+    assert!(board.stream.is_empty() && !board.voice_running);
+    let panel = firmware.overlay().expect("the reason");
+    assert_eq!(panel.title, b"VOICE USED UP");
+    let text: Vec<String> = panel.lines.iter().map(|(row, _, _)| String::from_utf8(row.clone()).unwrap()).collect();
+    assert_eq!(text.join(" "), "Today's voice is used up. It comes back at 08:00.");
+    // It goes after 6 s.
+    board.advance(6_000);
+    firmware.poll(&mut board);
+    assert!(firmware.overlay().is_none());
+
+    // While Pomodoro runs, a long K0 still gives up the phase.
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 50), ["POMODORO FOCUS START", "MODE POMODORO"]);
+    assert_eq!(press(&mut firmware, &mut board, Key::K0, 1100), ["POMODORO STOPPED"]);
+    assert!(firmware.overlay().is_none());
+}
+
+#[test]
+fn a_refusal_after_speaking_shows_its_title_and_the_computers_message() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, VOICE_ON);
+    hold_k0_talking(&mut firmware, &mut board, 1800);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.error","turn":1,"reason":"global_cap","message":"Voice is paused for everyone today. It comes back at 08:00."}"#);
+    let panel = firmware.overlay().expect("the error");
+    assert_eq!(panel.title, b"VOICE PAUSED");
+    let text: Vec<String> = panel.lines.iter().map(|(row, _, _)| String::from_utf8(row.clone()).unwrap()).collect();
+    assert_eq!(text.join(" "), "Voice is paused for everyone today. It comes back at 08:00.");
+}
+
+#[test]
+fn with_voice_off_and_no_reason_a_long_k0_shows_nothing() {
+    let (mut firmware, mut board, _) = booted(blank_flash());
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false}"#);
+    assert!(hold_k0_talking(&mut firmware, &mut board, 1500).is_empty());
+    assert!(firmware.overlay().is_none());
+    // Nor after a new link, which forgets the last reason.
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"voice.available","on":false,"reason":"signed_out"}"#);
+    send(&mut firmware, &mut board, r#"{"version":1,"event":"device.hello"}"#);
+    board.take_lines();
+    assert!(hold_k0_talking(&mut firmware, &mut board, 1500).is_empty());
+    assert!(firmware.overlay().is_none());
 }
 
 #[test]
