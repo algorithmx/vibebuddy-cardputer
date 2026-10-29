@@ -19,11 +19,36 @@ pub const TRIAL_MS: u32 = 2_000;
 /// sending anything yet; the computer sends a heartbeat every few seconds.
 pub const SILENCE_MS: u32 = 30_000;
 
-/// A byte the computer never sends over the UART, whose lines are UTF-8 text: what bytes sent at 115200 often look
-/// like to a UART at 921600. Mostly they still frame cleanly, as 0x00 or 0x80, so the UART reports no error; the
-/// daemon uses the same test in the other direction.
-pub fn garbled(byte: u8) -> bool {
-    byte == 0 || byte >= 0xf5
+/// Finds bytes the computer never sends over the UART, whose lines are UTF-8 text: what bytes sent at 115200 look
+/// like to a UART at 921600. They still frame cleanly, mostly as 0x80, so the UART reports no error. A 0x80 is text
+/// only inside a multi-byte character, so the check follows the UTF-8 sequence across bytes.
+#[derive(Debug, Default)]
+pub struct TextCheck {
+    /// Continuation bytes (0x80..=0xBF) the last lead byte still calls for.
+    pending: u8,
+}
+
+impl TextCheck {
+    pub const fn new() -> Self {
+        Self { pending: 0 }
+    }
+
+    /// The next byte from the UART: true when no UTF-8 text holds it here.
+    pub fn garbled(&mut self, byte: u8) -> bool {
+        let pending = core::mem::take(&mut self.pending);
+        match byte {
+            0x80..=0xbf => {
+                self.pending = pending.saturating_sub(1);
+                return pending == 0;
+            }
+            0x00 | 0xc0 | 0xc1 | 0xf5..=0xff => return true,
+            0xc2..=0xdf => self.pending = 1,
+            0xe0..=0xef => self.pending = 2,
+            0xf0..=0xf4 => self.pending = 3,
+            _ => {}
+        }
+        pending != 0
+    }
 }
 
 #[derive(Debug)]
@@ -74,7 +99,7 @@ impl UartRate {
         self.trial_since.take().map(|_| self.rate)
     }
 
-    /// The UART received `count` bytes it couldn't frame, or [`garbled`] ones. Some(115200) when the box should go
+    /// The UART received `count` bytes it couldn't frame, or ones [`TextCheck`] finds garbled. Some(115200) when the box should go
     /// back to it now: at the fast rate even one means the computer may be talking at 115200, as after it reopened
     /// the port. Its first line at 115200 is lost either way, and the computer asks again.
     pub fn receive_errors(&mut self, count: u32) -> Option<u32> {
@@ -154,13 +179,33 @@ mod tests {
     }
 
     #[test]
-    fn bytes_that_are_never_text_count_as_garbled() {
-        assert!(garbled(0x00));
-        assert!(garbled(0xf5));
-        assert!(garbled(0xff));
-        for &byte in "{\"event\":\"device.hello\",\"title\":\"语音\"}\n".as_bytes() {
-            assert!(!garbled(byte), "{byte:#04x}");
+    fn text_is_not_garbled() {
+        let mut check = TextCheck::new();
+        for &byte in "{\"event\":\"device.hello\",\"title\":\"语音 😀 é\"}\n".as_bytes() {
+            assert!(!check.garbled(byte), "{byte:#04x}");
         }
+    }
+
+    #[test]
+    fn bytes_sent_at_115200_read_at_921600_are_garbled() {
+        // What a box at 921600 read when the daemon restarted and said hello at 115200.
+        let mut check = TextCheck::new();
+        check.garbled(b'\n');
+        assert!(check.garbled(0x80), "a continuation byte no lead byte called for");
+        let mut check = TextCheck::new();
+        assert!(check.garbled(0x00));
+        assert!(check.garbled(0xc0));
+        assert!(check.garbled(0xf5));
+        assert!(check.garbled(0xff));
+    }
+
+    #[test]
+    fn a_character_cut_short_is_garbled() {
+        let mut check = TextCheck::new();
+        assert!(!check.garbled(0xe8));
+        assert!(!check.garbled(0xaf));
+        assert!(check.garbled(b'a'), "two continuation bytes called for, one came");
+        assert!(!check.garbled(b'b'), "the check starts again after it");
     }
 
     #[test]
